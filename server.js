@@ -13,7 +13,6 @@
 //   npm install express ws dotenv
 //   (מומלץ Node 18+ כדי ש-fetch יהיה זמין גלובלית)
 //
-//
 // Twilio Voice Webhook ->  POST /twilio-voice  (TwiML)
 // Twilio Media Streams -> wss://<domain>/twilio-media-stream
 //
@@ -63,7 +62,6 @@ const MB_CLOSING_SCRIPT =
 const MB_GENERAL_PROMPT = process.env.MB_GENERAL_PROMPT || '';
 const MB_BUSINESS_PROMPT = process.env.MB_BUSINESS_PROMPT || '';
 
-// אפשר להשאיר את זה לשימוש עתידי / לוגים, אבל הוא כבר לא מכתיב טקסט בקוד
 const MB_LANGUAGES = (process.env.MB_LANGUAGES || 'he,en,ru,ar')
   .split(',')
   .map((s) => s.trim())
@@ -72,6 +70,18 @@ const MB_LANGUAGES = (process.env.MB_LANGUAGES || 'he,en,ru,ar')
 const MB_SPEECH_SPEED = envNumber('MB_SPEECH_SPEED', 1.15);
 
 const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
+
+// ---------- TTS provider (OpenAI / ElevenLabs) ----------
+const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'openai').toLowerCase();
+
+// ElevenLabs ENV
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || '';
+const ELEVEN_VOICE_ID =
+  process.env.ELEVEN_VOICE_ID || process.env.VOICE_ID || '';
+const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'Eleven V3';
+const ELEVEN_OUTPUT_FORMAT =
+  process.env.ELEVEN_OUTPUT_FORMAT || 'ulaw_8000';
+const ELEVEN_OPTIMIZE_LATENCY = envNumber('ELEVEN_OPTIMIZE_LATENCY', 3);
 
 // ניהול נכון של MAX_OUTPUT_TOKENS – תמיד מספר או "inf"
 const MAX_OUTPUT_TOKENS_ENV = process.env.MAX_OUTPUT_TOKENS;
@@ -104,7 +114,7 @@ const MB_VAD_SUFFIX_MS = envNumber('MB_VAD_SUFFIX_MS', 200); // קטע שקט נ
 
 // Idle / Duration
 const MB_IDLE_WARNING_MS = envNumber('MB_IDLE_WARNING_MS', 40000); // 40 שניות
-const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 90000);  // 90 שניות
+const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 90000); // 90 שניות
 
 // מגבלת זמן שיחה – ברירת מחדל 5 דקות
 const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 5 * 60 * 1000);
@@ -123,8 +133,12 @@ const MB_ENABLE_LEAD_CAPTURE = envBool('MB_ENABLE_LEAD_CAPTURE', false);
 const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || '';
 
 // PARSING חכם ללידים
-const MB_ENABLE_SMART_LEAD_PARSING = envBool('MB_ENABLE_SMART_LEAD_PARSING', true);
-const MB_LEAD_PARSING_MODEL = process.env.MB_LEAD_PARSING_MODEL || 'gpt-4.1-mini';
+const MB_ENABLE_SMART_LEAD_PARSING = envBool(
+  'MB_ENABLE_SMART_LEAD_PARSING',
+  true
+);
+const MB_LEAD_PARSING_MODEL =
+  process.env.MB_LEAD_PARSING_MODEL || 'gpt-4.1-mini';
 
 // Debug
 const MB_DEBUG = envBool('MB_DEBUG', false);
@@ -138,6 +152,9 @@ console.log(
   `[CONFIG] MB_ALLOW_BARGE_IN=${MB_ALLOW_BARGE_IN}, MB_NO_BARGE_TAIL_MS=${MB_NO_BARGE_TAIL_MS} ms, MB_LANGUAGES=${MB_LANGUAGES.join(
     ','
   )}`
+);
+console.log(
+  `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${ELEVEN_VOICE_ID ? 'SET' : 'EMPTY'}`
 );
 
 // -----------------------------
@@ -156,15 +173,22 @@ const MB_DYNAMIC_KB_MIN_INTERVAL_MS = envNumber(
 async function refreshDynamicBusinessPrompt(tag = 'DynamicKB') {
   if (!MB_DYNAMIC_KB_URL) {
     if (MB_DEBUG) {
-      console.log(`[DEBUG][${tag}] MB_DYNAMIC_KB_URL is empty – skip refresh.`);
+      console.log(
+        `[DEBUG][${tag}] MB_DYNAMIC_KB_URL is empty – skip refresh.`
+      );
     }
     return;
   }
 
   const now = Date.now();
-  if (tag !== 'Startup' && now - lastDynamicKbRefreshAt < MB_DYNAMIC_KB_MIN_INTERVAL_MS) {
+  if (
+    tag !== 'Startup' &&
+    now - lastDynamicKbRefreshAt < MB_DYNAMIC_KB_MIN_INTERVAL_MS
+  ) {
     console.log(
-      `[INFO][${tag}] Skipping dynamic KB refresh – refreshed ${now - lastDynamicKbRefreshAt} ms ago (min interval ${MB_DYNAMIC_KB_MIN_INTERVAL_MS} ms).`
+      `[INFO][${tag}] Skipping dynamic KB refresh – refreshed ${
+        now - lastDynamicKbRefreshAt
+      } ms ago (min interval ${MB_DYNAMIC_KB_MIN_INTERVAL_MS} ms).`
     );
     return;
   }
@@ -172,13 +196,17 @@ async function refreshDynamicBusinessPrompt(tag = 'DynamicKB') {
   try {
     const res = await fetch(MB_DYNAMIC_KB_URL);
     if (!res.ok) {
-      console.error(`[ERROR][${tag}] Failed to fetch dynamic KB. HTTP ${res.status}`);
+      console.error(
+        `[ERROR][${tag}] Failed to fetch dynamic KB. HTTP ${res.status}`
+      );
       return;
     }
     const text = (await res.text()).trim();
     dynamicBusinessPrompt = text;
     lastDynamicKbRefreshAt = Date.now();
-    console.log(`[INFO][${tag}] Dynamic KB loaded. length=${text.length}`);
+    console.log(
+      `[INFO][${tag}] Dynamic KB loaded. length=${text.length}`
+    );
   } catch (err) {
     console.error(`[ERROR][${tag}] Error fetching dynamic KB`, err);
   }
@@ -222,24 +250,23 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
   }
 
   function normalize972(digits) {
-    if (digits.startsWith('972') && (digits.length === 11 || digits.length === 12)) {
-      // גם לנייד (12) וגם לנייח (11) – משאירים את המספר אחרי 972 ומוסיפים 0
+    if (
+      digits.startsWith('972') &&
+      (digits.length === 11 || digits.length === 12)
+    ) {
       return '0' + digits.slice(3);
     }
     return digits;
   }
 
   function isValidIsraeliPhone(digits) {
-    if (!/^0\d{8,9}$/.test(digits)) return false; // 9 או 10 ספרות, מתחיל ב-0
+    if (!/^0\d{8,9}$/.test(digits)) return false;
     const prefix2 = digits.slice(0, 2);
 
     if (digits.length === 9) {
-      // נייחים קלאסיים
       return ['02', '03', '04', '07', '08', '09'].includes(prefix2);
     } else {
-      // 10 ספרות – ניידים/07 וכדומה
       if (prefix2 === '05' || prefix2 === '07') return true;
-      // ליתר ביטחון נאפשר גם 02/03/04/08/09 עם 10 ספרות
       if (['02', '03', '04', '07', '08', '09'].includes(prefix2)) return true;
       return false;
     }
@@ -265,12 +292,6 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
 // -----------------------------
 // System instructions builder
 // -----------------------------
-//
-// 🔥 מכאן ואילך – כל הטקסט של הפרומפט מגיע מה-ENV בלבד:
-// MB_GENERAL_PROMPT + (אופציונלי) MB_BUSINESS_PROMPT + dynamicBusinessPrompt.
-// אין יותר "פרומפט ענק" קשיח בתוך הקוד.
-//
-// חוקים קבועים למודל – כדי שלא ידבר על רעשי רקע ושלא יסיים שיחה לבד לפי מילים
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים (גבוהים מהפרומפט העסקי):
 1. אל תתייחסי למוזיקה, רעשים או איכות הקו, גם אם את מזהה אותם. התייחסי רק לתוכן מילולי שנשמע כמו דיבור מכוון אלייך. אם לא הבנת משפט – אמרי בקצרה משהו כמו: "לא שמעתי טוב, אפשר לחזור על זה?" בלי לתאר את הרעש.
@@ -299,7 +320,6 @@ function buildSystemInstructions() {
     instructions += (instructions ? '\n\n' : '') + dynamicKb;
   }
 
-  // אם לא הוגדר שום דבר ב-ENV – שיהיה משהו מינימלי בלבד
   if (!instructions) {
     instructions = `
 אתם עוזר קולי בזמן אמת בשם "${BOT_NAME}" עבור שירות "${BUSINESS_NAME}".
@@ -307,7 +327,6 @@ function buildSystemInstructions() {
 `.trim();
   }
 
-  // מוסיפים תמיד את חוקי ההתנהגות הקבועים
   instructions += '\n\n' + EXTRA_BEHAVIOR_RULES;
 
   return instructions;
@@ -327,7 +346,6 @@ app.post('/twilio-voice', (req, res) => {
     process.env.MB_TWILIO_STREAM_URL ||
     `wss://${host.replace(/^https?:\/\//, '')}/twilio-media-stream`;
 
-  // {{trigger.call.From}} של טוויליו = req.body.From כאן
   const caller = req.body.From || '';
 
   const twiml = `
@@ -420,25 +438,32 @@ async function extractLeadFromConversation(conversationLog) {
 ${conversationText}
 `.trim();
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: MB_LEAD_PARSING_MODEL,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ]
-      })
-    });
+    const response = await fetch(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: MB_LEAD_PARSING_MODEL,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ]
+        })
+      }
+    );
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
-      logError(tag, `OpenAI lead parsing HTTP ${response.status}`, text);
+      logError(
+        tag,
+        `OpenAI lead parsing HTTP ${response.status}`,
+        text
+      );
       return null;
     }
 
@@ -494,7 +519,9 @@ async function hangupTwilioCall(callSid, tag = 'Call') {
       headers: {
         Authorization:
           'Basic ' +
-          Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
+          Buffer.from(
+            `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+          ).toString('base64'),
         'Content-Type': 'application/x-www-form-urlencoded'
       },
       body
@@ -534,13 +561,19 @@ async function fetchCallerNumberFromTwilio(callSid, tag = 'Call') {
       headers: {
         Authorization:
           'Basic ' +
-          Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
+          Buffer.from(
+            `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+          ).toString('base64')
       }
     });
 
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      logError(tag, `fetchCallerNumberFromTwilio HTTP ${res.status}`, txt);
+      logError(
+        tag,
+        `fetchCallerNumberFromTwilio HTTP ${res.status}`,
+        txt
+      );
       return null;
     }
 
@@ -553,7 +586,11 @@ async function fetchCallerNumberFromTwilio(callSid, tag = 'Call') {
     );
     return fromRaw;
   } catch (err) {
-    logError(tag, 'fetchCallerNumberFromTwilio: error fetching from Twilio', err);
+    logError(
+      tag,
+      'fetchCallerNumberFromTwilio: error fetching from Twilio',
+      err
+    );
     return null;
   }
 }
@@ -595,42 +632,140 @@ wss.on('connection', (connection, req) => {
   let idleHangupScheduled = false;
   let maxCallTimeout = null;
   let maxCallWarningTimeout = null;
-  let pendingHangup = null;    // { reason, closingMessage }
+  let pendingHangup = null; // { reason, closingMessage }
   let openAiReady = false;
   let twilioClosed = false;
   let openAiClosed = false;
   let callEnded = false;
 
-  // מצב דיבור של הבוט (לצורך barge-in)
   let botSpeaking = false;
-
-  // האם יש response פעיל במודל
   let hasActiveResponse = false;
-
-  // דגל: האם זה עדיין "התור של הבוט"
   let botTurnActive = false;
-
-  // טיימסטמפ עד מתי אסור להקשיב ללקוח (זנב קצר אחרי סיום דיבור)
   let noListenUntilTs = 0;
 
-  // האם הלקוח כבר דיבר פעם אחת (לשימוש עתידי, כרגע barge-in רך)
   let userHasSpoken = false;
 
-  // האם וובהוק לידים כבר נשלח בשיחה הזו
   let leadWebhookSent = false;
+
+  // -----------------------------
+  // Helper: TTS via ElevenLabs
+  // -----------------------------
+  async function playTtsWithEleven(text) {
+    if (!text || !text.trim()) return;
+    if (TTS_PROVIDER !== 'eleven') return;
+    if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+      logError(
+        tag,
+        'ElevenLabs TTS requested but ELEVEN_API_KEY or ELEVEN_VOICE_ID is missing.'
+      );
+      return;
+    }
+    if (!streamSid) {
+      logDebug(
+        tag,
+        'ElevenLabs TTS requested but streamSid is not set yet.'
+      );
+      return;
+    }
+    if (connection.readyState !== WebSocket.OPEN) {
+      logDebug(
+        tag,
+        'ElevenLabs TTS requested but Twilio WS is not open.'
+      );
+      return;
+    }
+
+    try {
+      logInfo(tag, 'Sending text to ElevenLabs TTS.', {
+        length: text.length
+      });
+
+      const res = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
+        {
+          method: 'POST',
+          headers: {
+            'xi-api-key': ELEVEN_API_KEY,
+            'Content-Type': 'application/json',
+            Accept: 'audio/mulaw;codec=pcm;bit=8;rate=8000'
+          },
+          body: JSON.stringify({
+            text,
+            model_id: ELEVEN_TTS_MODEL,
+            output_format: ELEVEN_OUTPUT_FORMAT,
+            optimize_latency: ELEVEN_OPTIMIZE_LATENCY
+          })
+        }
+      );
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        logError(
+          tag,
+          `ElevenLabs TTS HTTP ${res.status}`,
+          txt.slice(0, 500)
+        );
+        return;
+      }
+
+      const arrBuf = await res.arrayBuffer();
+      const audioBuffer = Buffer.from(arrBuf);
+      logInfo(
+        tag,
+        `ElevenLabs TTS audio received. length=${audioBuffer.length} bytes`
+      );
+
+      botSpeaking = true;
+
+      const chunkSize = 320; // בערך ~40ms ב-8kHz
+      const chunkDelayMs = 20;
+
+      for (
+        let i = 0;
+        i < audioBuffer.length &&
+        !callEnded &&
+        connection.readyState === WebSocket.OPEN;
+        i += chunkSize
+      ) {
+        const chunk = audioBuffer.subarray(i, i + chunkSize);
+        const b64 = chunk.toString('base64');
+        const twilioMsg = {
+          event: 'media',
+          streamSid,
+          media: { payload: b64 }
+        };
+        connection.send(JSON.stringify(twilioMsg));
+
+        // האטה קלה כדי לשמור על קצב נורמלי
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) =>
+          setTimeout(resolve, chunkDelayMs)
+        );
+      }
+
+      botSpeaking = false;
+      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+    } catch (err) {
+      botSpeaking = false;
+      logError(tag, 'ElevenLabs TTS error', err);
+    }
+  }
 
   // -----------------------------
   // Helper: שליחת טקסט למודל עם הגנה על response כפול
   // -----------------------------
   function sendModelPrompt(text, purpose) {
     if (openAiWs.readyState !== WebSocket.OPEN) {
-      logDebug(tag, `Cannot send model prompt (${purpose || 'no-tag'}) – WS not open.`);
+      logDebug(
+        tag,
+        `Cannot send model prompt (${purpose || 'no-tag'}) – WS not open.`
+      );
       return;
     }
     if (hasActiveResponse) {
       logDebug(
         tag,
-        `Skipping model prompt (${purpose || 'no-tag'}) – conversation already has active response.`
+        `Skipping model prompt (${purpose || 'no-tag'}) – active response in progress.`
       );
       return;
     }
@@ -646,36 +781,42 @@ wss.on('connection', (connection, req) => {
     openAiWs.send(JSON.stringify(item));
     openAiWs.send(JSON.stringify({ type: 'response.create' }));
     hasActiveResponse = true;
-    botTurnActive = true;   // מרגע זה – זה "התור של הבוט"
+    botTurnActive = true;
     logInfo(tag, `Sending model prompt (${purpose || 'no-tag'})`);
   }
 
-  // -----------------------------
-  // Helper: האם הלקוח הזכיר מזוהה
-  // -----------------------------
   function conversationMentionsCallerId() {
-    const patterns = [/מזוהה/, /למספר שממנו/, /למספר שממנו אני מתקשר/, /למספר שממנו התקשרתי/];
+    const patterns = [
+      /מזוהה/,
+      /למספר שממנו/,
+      /למספר שממנו אני מתקשר/,
+      /למספר שממנו התקשרתי/
+    ];
     return conversationLog.some(
-      (m) => m.from === 'user' && patterns.some((re) => re.test(m.text || ''))
+      (m) =>
+        m.from === 'user' &&
+        patterns.some((re) => re.test(m.text || ''))
     );
   }
 
   // -----------------------------
-  // Helper: שליחת וובהוק לידים – פעם אחת בלבד, ורק אם זה ליד מלא
+  // Lead webhook – פעם אחת בלבד
   // -----------------------------
   async function sendLeadWebhook(reason, closingMessage) {
     if (!MB_ENABLE_LEAD_CAPTURE || !MB_WEBHOOK_URL) {
-      logDebug(tag, 'Lead capture disabled or no MB_WEBHOOK_URL – skipping webhook.');
+      logDebug(
+        tag,
+        'Lead capture disabled or no MB_WEBHOOK_URL – skipping webhook.'
+      );
       return;
     }
 
     if (leadWebhookSent) {
-      logDebug(tag, 'Lead webhook already sent for this call – skipping.');
+      logDebug(tag, 'Lead webhook already sent – skipping.');
       return;
     }
 
     try {
-      // אם משום מה callerNumber ריק – נשלוף אותו מטוויליו לפי callSid (אותו From של {{trigger.call.From}})
       if (!callerNumber && callSid) {
         const resolved = await fetchCallerNumberFromTwilio(callSid, tag);
         if (resolved) {
@@ -684,13 +825,14 @@ wss.on('connection', (connection, req) => {
       }
 
       let parsedLead = await extractLeadFromConversation(conversationLog);
-
       if (!parsedLead || typeof parsedLead !== 'object') {
-        logInfo(tag, 'No parsed lead object – skipping webhook (לא ליד מלא).');
+        logInfo(
+          tag,
+          'No parsed lead object – skipping webhook (לא ליד מלא).'
+        );
         return;
       }
 
-      // כלל: אם אין טלפון מה-LLM – תמיד ננסה להשלים אותו מהמזוהה.
       if (!parsedLead.phone_number && callerNumber) {
         parsedLead.phone_number = callerNumber;
 
@@ -704,23 +846,22 @@ wss.on('connection', (connection, req) => {
           suffixNote;
       }
 
-      // נורמליזציה של מספר הטלפון שנאסף
       const normalizedPhone = normalizePhoneNumber(
         parsedLead.phone_number,
         callerNumber
       );
       parsedLead.phone_number = normalizedPhone;
 
-      // חשוב: גם caller_id_raw וגם CALLERID יהיו בלי +972, בפורמט 0XXXXXXXXX/0XXXXXXXX
       const callerDigits = normalizePhoneNumber(null, callerNumber);
 
-      const callerIdRaw = callerDigits || (callerNumber ? String(callerNumber).replace(/\D/g, '') : null);
+      const callerIdRaw =
+        callerDigits ||
+        (callerNumber ? String(callerNumber).replace(/\D/g, '') : null);
       const callerIdNormalized = callerDigits || callerIdRaw;
 
       parsedLead.caller_id_raw = callerIdRaw;
       parsedLead.caller_id_normalized = callerIdNormalized;
 
-      // חובה: business_name תמיד מלא
       if (
         !parsedLead.business_name ||
         typeof parsedLead.business_name !== 'string' ||
@@ -729,32 +870,26 @@ wss.on('connection', (connection, req) => {
         parsedLead.business_name = 'לא רלוונטי';
       }
 
-      // ❗ לוגיקה: כל ליד אמיתי עם טלפון → וובהוק
       const isFullLead =
-        parsedLead.is_lead === true &&
-        !!parsedLead.phone_number;
+        parsedLead.is_lead === true && !!parsedLead.phone_number;
 
-      // 👉 שולחים וובהוק רק אם זה "ליד מלא" (יש טלפון והוא באמת ליד).
       if (!isFullLead) {
-        logInfo(tag, 'Parsed lead is NOT full lead – webhook will NOT be sent.', {
-          is_lead: parsedLead.is_lead,
-          lead_type: parsedLead.lead_type,
-          phone_number: parsedLead.phone_number
-        });
+        logInfo(
+          tag,
+          'Parsed lead is NOT full lead – webhook will NOT be sent.',
+          {
+            is_lead: parsedLead.is_lead,
+            lead_type: parsedLead.lead_type,
+            phone_number: parsedLead.phone_number
+          }
+        );
         return;
       }
 
-      // phone_number = מספר לחזרה בפועל
       const finalPhoneNumber =
-        parsedLead.phone_number ||
-        callerIdNormalized ||
-        callerIdRaw;
+        parsedLead.phone_number || callerIdNormalized || callerIdRaw;
 
-      // CALLERID = תמיד המזוהה בפורמט ישראלי (ללא +972)
-      const finalCallerId =
-        callerIdNormalized ||
-        callerIdRaw ||
-        null;
+      const finalCallerId = callerIdNormalized || callerIdRaw || null;
 
       const payload = {
         streamSid,
@@ -763,7 +898,6 @@ wss.on('connection', (connection, req) => {
         callerIdRaw,
         callerIdNormalized,
 
-        // שני הפרמטרים שביקשת במפורש:
         phone_number: finalPhoneNumber,
         CALLERID: finalCallerId,
 
@@ -785,7 +919,6 @@ wss.on('connection', (connection, req) => {
         CALLERID: finalCallerId
       });
 
-      // חוק: פעם אחת בלבד לכל שיחה
       leadWebhookSent = true;
 
       const res = await fetch(MB_WEBHOOK_URL, {
@@ -795,9 +928,16 @@ wss.on('connection', (connection, req) => {
       });
 
       if (!res.ok) {
-        logError(tag, `Lead webhook HTTP ${res.status}`, await res.text());
+        logError(
+          tag,
+          `Lead webhook HTTP ${res.status}`,
+          await res.text()
+        );
       } else {
-        logInfo(tag, `Lead webhook delivered successfully. status=${res.status}`);
+        logInfo(
+          tag,
+          `Lead webhook delivered successfully. status=${res.status}`
+        );
       }
     } catch (err) {
       logError(tag, 'Error sending lead webhook', err);
@@ -805,7 +945,7 @@ wss.on('connection', (connection, req) => {
   }
 
   // -----------------------------
-  // Helper: סיום שיחה מרוכז – ניתוק אחרי סגיר
+  // Helper: סיום שיחה מרוכז
   // -----------------------------
   function endCall(reason, closingMessage) {
     if (callEnded) {
@@ -821,26 +961,29 @@ wss.on('connection', (connection, req) => {
     if (maxCallTimeout) clearTimeout(maxCallTimeout);
     if (maxCallWarningTimeout) clearTimeout(maxCallWarningTimeout);
 
-    // לא מחכים ל-webhook – שולחים בפייר אנד פורגט (אם יש ליד מלא)
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL) {
-      sendLeadWebhook(reason, closingMessage || MB_CLOSING_SCRIPT).catch((err) =>
-        logError(tag, 'sendLeadWebhook fire-and-forget error', err)
+      sendLeadWebhook(
+        reason,
+        closingMessage || MB_CLOSING_SCRIPT
+      ).catch((err) =>
+        logError(
+          tag,
+          'sendLeadWebhook fire-and-forget error',
+          err
+        )
       );
     }
 
-    // ריענון KB דינאמי אחרי סיום שיחה
     if (MB_DYNAMIC_KB_URL) {
       refreshDynamicBusinessPrompt('PostCall').catch((err) =>
         logError(tag, 'DynamicKB post-call refresh failed', err)
       );
     }
 
-    // ניתוק אקטיבי בטוויליו (סיום שיחה פיזית)
     if (callSid) {
       hangupTwilioCall(callSid, tag).catch(() => {});
     }
 
-    // סוגרים OpenAI ו-Twilio WS
     if (!openAiClosed && openAiWs.readyState === WebSocket.OPEN) {
       openAiClosed = true;
       openAiWs.close();
@@ -857,9 +1000,6 @@ wss.on('connection', (connection, req) => {
     noListenUntilTs = 0;
   }
 
-  // -----------------------------
-  // Helper: תזמון סיום שיחה אחרי סגיר – לגרסאות שבהן אנחנו מבקשים מהמודל לומר את משפט הסיום
-  // -----------------------------
   function scheduleEndCall(reason, closingMessage) {
     if (callEnded) return;
 
@@ -870,10 +1010,12 @@ wss.on('connection', (connection, req) => {
       return;
     }
 
-    logInfo(tag, `scheduleEndCall invoked. reason="${reason}", closingMessage="${msg}"`);
+    logInfo(
+      tag,
+      `scheduleEndCall invoked. reason="${reason}", closingMessage="${msg}"`
+    );
     pendingHangup = { reason, closingMessage: msg };
 
-    // שולחים לבוט לומר את משפט הסגירה
     if (openAiWs.readyState === WebSocket.OPEN) {
       sendModelPrompt(
         `סיימי את השיחה עם הלקוח במשפט הבא בלבד, בלי להוסיף שום משפט נוסף: "${msg}"`,
@@ -881,7 +1023,6 @@ wss.on('connection', (connection, req) => {
       );
       logInfo(tag, `Closing message sent to model: ${msg}`);
     } else {
-      // אם אין חיבור למודל – מנתקים מיד בלי לחכות
       const ph = pendingHangup;
       pendingHangup = null;
       endCall(ph.reason, ph.closingMessage);
@@ -889,17 +1030,20 @@ wss.on('connection', (connection, req) => {
     }
 
     const rawGrace =
-      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
+      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0
+        ? MB_HANGUP_GRACE_MS
+        : 3000;
 
-    // לא מאפשרים ערכים קיצוניים – תמיד בין 2 ל-8 שניות
     const graceMs = Math.max(2000, Math.min(rawGrace, 8000));
 
-    // fallback: אם משום מה לא קיבלנו response.audio.done / response.completed
     setTimeout(() => {
       if (callEnded || !pendingHangup) return;
       const ph = pendingHangup;
       pendingHangup = null;
-      logInfo(tag, `Hangup grace reached (${graceMs} ms), forcing endCall.`);
+      logInfo(
+        tag,
+        `Hangup grace reached (${graceMs} ms), forcing endCall.`
+      );
       endCall(ph.reason, ph.closingMessage);
     }, graceMs);
 
@@ -909,27 +1053,32 @@ wss.on('connection', (connection, req) => {
     );
   }
 
-  // -----------------------------
-  // Helper: תזמון ניתוק כאשר הבוט כבר אמר את משפט הסיום (לפי MB_CLOSING_SCRIPT בלבד)
-  // -----------------------------
   function scheduleHangupAfterBotClosing(reason) {
     if (callEnded) return;
     if (pendingHangup) {
-      logDebug(tag, 'Hangup already scheduled, skipping bot-closing duplicate.');
+      logDebug(
+        tag,
+        'Hangup already scheduled, skipping bot-closing duplicate.'
+      );
       return;
     }
 
     const msg = MB_CLOSING_SCRIPT;
     pendingHangup = { reason, closingMessage: msg };
     const rawGrace =
-      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
+      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0
+        ? MB_HANGUP_GRACE_MS
+        : 3000;
     const graceMs = Math.max(2000, Math.min(rawGrace, 8000));
 
     setTimeout(() => {
       if (callEnded || !pendingHangup) return;
       const ph = pendingHangup;
       pendingHangup = null;
-      logInfo(tag, `Hangup grace (bot closing) reached (${graceMs} ms), forcing endCall.`);
+      logInfo(
+        tag,
+        `Hangup grace (bot closing) reached (${graceMs} ms), forcing endCall.`
+      );
       endCall(ph.reason, ph.closingMessage);
     }, graceMs);
 
@@ -939,27 +1088,23 @@ wss.on('connection', (connection, req) => {
     );
   }
 
-  // -----------------------------
-  // Helper: בדיקת משפט סיום של הבוט – **רק** לפי MB_CLOSING_SCRIPT מה-ENV
-  // -----------------------------
   function checkBotClosing(botText) {
     if (!botText || !NORMALIZED_CLOSING_SCRIPT) return;
     const norm = normalizeForClosing(botText);
     if (!norm) return;
 
-    // ננתק רק אם משפט הסיום המוגדר ב-ENV מופיע בצורה ברורה בטקסט
     if (
       norm.includes(NORMALIZED_CLOSING_SCRIPT) ||
       NORMALIZED_CLOSING_SCRIPT.includes(norm)
     ) {
-      logInfo(tag, `Detected configured bot closing phrase in output: "${botText}"`);
+      logInfo(
+        tag,
+        `Detected configured bot closing phrase in output: "${botText}"`
+      );
       scheduleHangupAfterBotClosing('bot_closing_config');
     }
   }
 
-  // -----------------------------
-  // Helper: הודעת "אתם עדיין איתי?"
-  // -----------------------------
   function sendIdleWarningIfNeeded() {
     if (idleWarningSent || callEnded) return;
     idleWarningSent = true;
@@ -981,24 +1126,30 @@ wss.on('connection', (connection, req) => {
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
+    const session = {
+      model: 'gpt-4o-realtime-preview-2024-12-17',
+      modalities: ['audio', 'text'],
+      input_audio_format: 'g711_ulaw',
+      input_audio_transcription: { model: 'whisper-1' },
+      turn_detection: {
+        type: 'server_vad',
+        threshold: MB_VAD_THRESHOLD,
+        silence_duration_ms: effectiveSilenceMs,
+        prefix_padding_ms: MB_VAD_PREFIX_MS
+      },
+      max_response_output_tokens: MAX_OUTPUT_TOKENS,
+      instructions
+    };
+
+    // אם אנחנו עובדים עם OpenAI TTS – נגדיר voice + output_audio_format
+    if (TTS_PROVIDER !== 'eleven') {
+      session.voice = OPENAI_VOICE;
+      session.output_audio_format = 'g711_ulaw';
+    }
+
     const sessionUpdate = {
       type: 'session.update',
-      session: {
-        model: 'gpt-4o-realtime-preview-2024-12-17',
-        modalities: ['audio', 'text'],
-        voice: OPENAI_VOICE,
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        input_audio_transcription: { model: 'whisper-1' },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: MB_VAD_THRESHOLD,
-          silence_duration_ms: effectiveSilenceMs,
-          prefix_padding_ms: MB_VAD_PREFIX_MS
-        },
-        max_response_output_tokens: MAX_OUTPUT_TOKENS,
-        instructions
-      }
+      session
     };
 
     logDebug(tag, 'Sending session.update to OpenAI.', sessionUpdate);
@@ -1024,7 +1175,6 @@ wss.on('connection', (connection, req) => {
 
     switch (type) {
       case 'response.created':
-        // כל response חדש – מתחיל "תור" של הבוט
         currentBotText = '';
         hasActiveResponse = true;
         botTurnActive = true;
@@ -1052,13 +1202,25 @@ wss.on('connection', (connection, req) => {
           conversationLog.push({ from: 'bot', text });
           logInfo('Bot', text);
           checkBotClosing(text);
+
+          // אם אנחנו על Eleven – זה המקום לייצר אודיו
+          if (TTS_PROVIDER === 'eleven') {
+            playTtsWithEleven(text).catch((err) =>
+              logError(tag, 'playTtsWithEleven error', err)
+            );
+          }
         }
         currentBotText = '';
         break;
       }
 
-      // אודיו לבוט → לטוויליו
+      // אודיו מהמודל → לטוויליו (רק כשמשתמשים ב-TTS של OpenAI)
       case 'response.audio.delta': {
+        if (TTS_PROVIDER === 'eleven') {
+          // כשעובדים עם Eleven – מתעלמים מהאודיו של OpenAI
+          break;
+        }
+
         const b64 = msg.delta;
         if (!b64 || !streamSid) break;
         botSpeaking = true;
@@ -1078,12 +1240,17 @@ wss.on('connection', (connection, req) => {
       }
 
       case 'response.audio.done': {
-        botSpeaking = false;
+        if (TTS_PROVIDER !== 'eleven') {
+          botSpeaking = false;
+        }
         botTurnActive = false;
         if (pendingHangup && !callEnded) {
           const ph = pendingHangup;
           pendingHangup = null;
-          logInfo(tag, 'Closing audio finished, ending call now.');
+          logInfo(
+            tag,
+            'Closing audio finished, ending call now (audio.done).'
+          );
           endCall(ph.reason, ph.closingMessage);
         }
         break;
@@ -1096,7 +1263,10 @@ wss.on('connection', (connection, req) => {
         if (pendingHangup && !callEnded) {
           const ph = pendingHangup;
           pendingHangup = null;
-          logInfo(tag, 'Response completed for closing, ending call now.');
+          logInfo(
+            tag,
+            'Response completed for closing, ending call now.'
+          );
           endCall(ph.reason, ph.closingMessage);
         }
         break;
@@ -1106,7 +1276,9 @@ wss.on('connection', (connection, req) => {
         const transcriptRaw = msg.transcript || '';
         let t = transcriptRaw.trim();
         if (t) {
-          t = t.replace(/\s+/g, ' ').replace(/\s+([,.:;!?])/g, '$1');
+          t = t
+            .replace(/\s+/g, ' ')
+            .replace(/\s+([,.:;!?])/g, '$1');
           conversationLog.push({ from: 'user', text: t });
           logInfo('User', t);
           userHasSpoken = true;
@@ -1177,17 +1349,27 @@ wss.on('connection', (connection, req) => {
         const now = Date.now();
         const sinceMedia = now - lastMediaTs;
 
-        if (!idleWarningSent && sinceMedia >= MB_IDLE_WARNING_MS && !callEnded) {
+        if (
+          !idleWarningSent &&
+          sinceMedia >= MB_IDLE_WARNING_MS &&
+          !callEnded
+        ) {
           sendIdleWarningIfNeeded();
         }
-        if (!idleHangupScheduled && sinceMedia >= MB_IDLE_HANGUP_MS && !callEnded) {
+        if (
+          !idleHangupScheduled &&
+          sinceMedia >= MB_IDLE_HANGUP_MS &&
+          !callEnded
+        ) {
           idleHangupScheduled = true;
-          logInfo(tag, 'Idle timeout reached, scheduling endCall.');
+          logInfo(
+            tag,
+            'Idle timeout reached, scheduling endCall.'
+          );
           scheduleEndCall('idle_timeout', MB_CLOSING_SCRIPT);
         }
       }, 1000);
 
-      // Max call duration + התראה לפני
       if (MB_MAX_CALL_MS > 0) {
         if (
           MB_MAX_WARN_BEFORE_MS > 0 &&
@@ -1204,7 +1386,10 @@ wss.on('connection', (connection, req) => {
         }
 
         maxCallTimeout = setTimeout(() => {
-          logInfo(tag, 'Max call duration reached, scheduling endCall.');
+          logInfo(
+            tag,
+            'Max call duration reached, scheduling endCall.'
+          );
           scheduleEndCall('max_call_duration', MB_CLOSING_SCRIPT);
         }, MB_MAX_CALL_MS);
       }
@@ -1217,7 +1402,6 @@ wss.on('connection', (connection, req) => {
 
       const now = Date.now();
 
-      // מצב ללא barge-in: לא שומעים את הלקוח בזמן שהבוט מדבר / בזנב
       if (!MB_ALLOW_BARGE_IN) {
         if (botTurnActive || botSpeaking || now < noListenUntilTs) {
           logDebug(
@@ -1228,8 +1412,6 @@ wss.on('connection', (connection, req) => {
           return;
         }
       }
-      // מצב MB_ALLOW_BARGE_IN=true – לא מבטלים תגובה, לא שולחים response.cancel.
-      // פשוט מעבירים את האודיו למודל; הוא יזהה תור חדש לבד לפי ה-VAD.
 
       const oaMsg = {
         type: 'input_audio_buffer.append',
@@ -1266,10 +1448,10 @@ wss.on('connection', (connection, req) => {
 // Start server
 // -----------------------------
 server.listen(PORT, () => {
-  console.log(`✅ BluBinet Realtime Voice Bot running on port ${PORT}`);
-  // ריענון KB דינאמי פעם אחת בהפעלה
+  console.log(
+    `✅ BluBinet Realtime Voice Bot running on port ${PORT} (TTS_PROVIDER=${TTS_PROVIDER})`
+  );
   refreshDynamicBusinessPrompt('Startup').catch((err) =>
     console.error('[ERROR][DynamicKB] initial load failed', err)
   );
-  // אין יותר setInterval – מעכשיו ריענון KB קורה רק אחרי שיחות (PostCall + Throttling)
 });
