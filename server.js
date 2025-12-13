@@ -5,13 +5,11 @@
 // LLM: OpenAI Responses API (default) OR IVRIT (fallback via ENV)
 // TTS: ElevenLabs streamed to Twilio as ulaw_8000 20ms frames
 //
-// Fixes in this version:
-// ✅ FIX: Twilio sends media continuously (even silence) -> DO NOT treat that as "user speaking"
-// ✅ Use OpenAI VAD events: input_audio_buffer.speech_started / speech_stopped
-// ✅ FIX: Do NOT skip reply playback incorrectly (no more "User started speaking during LLM -> skip")
-// ✅ Proper turn queue: if user speaks again while LLM running -> cancel old reply and answer newest
-// ✅ Remove aggressive "clear" that could cut opening/tts
-// ✅ Keep fast opening cache + chunked reply + ACK
+// Quality fixes in this version:
+// ✅ Reply split is MAX 2 chunks (not 4) -> far fewer pops/clicks
+// ✅ Insert real ulaw silence padding between chunks (prevents audible “jumps”)
+// ✅ Keep ACK + fast opening cache
+// ✅ Keep VAD based on OpenAI events (no false “user speaking” from Twilio silence)
 //
 // Requirements:
 //   npm i express ws dotenv
@@ -67,7 +65,7 @@ const IVRIT_LLM_METHOD = envStr('IVRIT_LLM_METHOD', 'POST').toUpperCase();
 const IVRIT_LLM_HEADER_KEY = envStr('IVRIT_LLM_HEADER_KEY', '');
 const IVRIT_LLM_HEADER_VALUE = envStr('IVRIT_LLM_HEADER_VALUE', '');
 
-// Basic bot identity
+// Identity
 const BOT_NAME = envStr('MB_BOT_NAME', 'נטע');
 const BUSINESS_NAME = envStr('MB_BUSINESS_NAME', 'BluBinet');
 
@@ -92,12 +90,12 @@ const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 10 * 60 * 1000);
 const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
 const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
 
-// Twilio credentials (optional hangup)
+// Twilio hangup (optional)
 const TWILIO_ACCOUNT_SID = envStr('TWILIO_ACCOUNT_SID', '');
 const TWILIO_AUTH_TOKEN = envStr('TWILIO_AUTH_TOKEN', '');
 
 // Logging
-const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase(); // debug|info|warn|error
+const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase();
 
 // -----------------------------
 // ElevenLabs TTS config
@@ -123,9 +121,11 @@ const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
 const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
 
 // Chunking + ACK
-const MB_CHUNK_MAX_CHARS = envNumber('MB_CHUNK_MAX_CHARS', 60);
+// ✅ Quality: max 2 chunks
+const MB_CHUNK_FIRST_MAX_CHARS = envNumber('MB_CHUNK_FIRST_MAX_CHARS', 70);
 const MB_CHUNK_MIN_CHARS = envNumber('MB_CHUNK_MIN_CHARS', 18);
-const MB_CHUNK_GAP_MS = envNumber('MB_CHUNK_GAP_MS', 140);
+// ✅ Insert real silence between chunks (instead of "gap")
+const MB_CHUNK_SILENCE_MS = envNumber('MB_CHUNK_SILENCE_MS', 120);
 
 const MB_ACK_ENABLED = envBool('MB_ACK_ENABLED', true);
 const MB_ACK_TEXT = envStr('MB_ACK_TEXT', 'מעולה, רגע...');
@@ -150,8 +150,8 @@ function log(lvl, tag, msg, extra, meta = {}) {
   else console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`);
 }
 const logDebug = (tag, msg, extra, meta) => log('debug', tag, msg, extra, meta);
-const logInfo = (tag, msg, extra, meta) => log('info', tag, msg, extra, meta);
-const logWarn = (tag, msg, extra, meta) => log('warn', tag, msg, extra, meta);
+const logInfo  = (tag, msg, extra, meta) => log('info',  tag, msg, extra, meta);
+const logWarn  = (tag, msg, extra, meta) => log('warn',  tag, msg, extra, meta);
 const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 
 // -----------------------------
@@ -184,7 +184,18 @@ function buildSystemInstructions() {
 }
 
 // -----------------------------
-// Audio sender (Twilio expects 20ms frames at 8k ulaw = 160 bytes)
+// ulaw silence helper
+// Twilio g711_ulaw "silence" commonly is 0xFF
+// 20ms frame @ 8k = 160 bytes
+// -----------------------------
+function ulawSilence(ms) {
+  const frames = Math.max(1, Math.ceil(ms / 20));
+  const bytes = frames * 160;
+  return Buffer.alloc(bytes, 0xff);
+}
+
+// -----------------------------
+// Audio sender (20ms frames, 160 bytes ulaw)
 // -----------------------------
 function createAudioSender(connection, meta) {
   const state = {
@@ -209,7 +220,6 @@ function createAudioSender(connection, meta) {
   }
 
   function clearTwilioPlayback() {
-    // Clear Twilio playback buffer (when barge-in enabled)
     if (!state.streamSid) return;
     if (connection.readyState !== WebSocket.OPEN) return;
     try {
@@ -261,7 +271,7 @@ function createAudioSender(connection, meta) {
 }
 
 // -----------------------------
-// ElevenLabs URL builder (v3 restriction)
+// ElevenLabs URL builder
 // -----------------------------
 function buildElevenUrl() {
   const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}/stream`;
@@ -338,7 +348,6 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortFn) {
     }
 
     const reader = res.body.getReader();
-
     while (true) {
       if (abortFn && abortFn()) {
         try { reader.cancel().catch(() => {}); } catch {}
@@ -410,7 +419,7 @@ async function warmupOpeningCache() {
 }
 
 // -----------------------------
-// LLM: OpenAI Responses API
+// LLM: OpenAI Responses
 // -----------------------------
 function extractOpenAiText(respJson) {
   try {
@@ -478,7 +487,7 @@ async function callOpenAiResponses({ system, userText, meta }) {
 }
 
 // -----------------------------
-// LLM: IVRIT (fallback by ENV)
+// LLM: IVRIT (fallback)
 // -----------------------------
 async function callIvrit({ system, userText, meta }) {
   const t0 = Date.now();
@@ -520,50 +529,41 @@ async function callIvrit({ system, userText, meta }) {
 }
 
 // -----------------------------
-// Reply chunking
+// ✅ Quality split: MAX 2 chunks
+// First chunk: short intro (<= MB_CHUNK_FIRST_MAX_CHARS) based on punctuation.
+// Second chunk: rest (single TTS call).
 // -----------------------------
-function splitToChunks(text, maxChars, minChars) {
-  const t = String(text || '').trim();
+function splitToTwoChunks(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
   if (!t) return [];
 
-  const norm = t.replace(/\s+/g, ' ').trim();
-  const parts = norm
-    .split(/(?<=[\.\!\?\u05F3\u05F4\u061F])\s+/)
-    .map((p) => p.trim())
-    .filter(Boolean);
+  // Try split at first sentence end near the limit
+  const limit = MB_CHUNK_FIRST_MAX_CHARS;
+  if (t.length <= limit) return [t];
 
-  const chunks = [];
-  let cur = '';
-
-  function pushCur() {
-    const c = cur.trim();
-    if (c) chunks.push(c);
-    cur = '';
+  const candidates = [];
+  const regex = /[.!?\u05F3\u05F4\u061F]/g;
+  let m;
+  while ((m = regex.exec(t)) !== null) {
+    const idx = m.index + 1;
+    if (idx >= MB_CHUNK_MIN_CHARS && idx <= limit + 20) candidates.push(idx);
   }
 
-  for (const p of (parts.length ? parts : [norm])) {
-    if (p.length > maxChars) {
-      const words = p.split(' ');
-      for (const w of words) {
-        if (!cur) cur = w;
-        else if ((cur + ' ' + w).length <= maxChars) cur += ' ' + w;
-        else { pushCur(); cur = w; }
-      }
-      pushCur();
-      continue;
-    }
-
-    if (!cur) cur = p;
-    else if ((cur + ' ' + p).length <= maxChars) cur += ' ' + p;
-    else { pushCur(); cur = p; }
+  let cut = null;
+  if (candidates.length) {
+    // choose candidate closest to limit
+    cut = candidates.reduce((best, x) => (Math.abs(x - limit) < Math.abs(best - limit) ? x : best), candidates[0]);
+  } else {
+    // fallback: cut at last space before limit
+    const space = t.lastIndexOf(' ', limit);
+    cut = space > MB_CHUNK_MIN_CHARS ? space : limit;
   }
-  pushCur();
 
-  if (chunks.length >= 2 && chunks[0].length < minChars) {
-    chunks[1] = `${chunks[0]} ${chunks[1]}`.trim();
-    chunks.shift();
-  }
-  return chunks;
+  const first = t.slice(0, cut).trim();
+  const rest = t.slice(cut).trim();
+
+  if (!rest) return [first];
+  return [first, rest];
 }
 
 // -----------------------------
@@ -649,10 +649,10 @@ wss.on('connection', (connection) => {
   let idleInterval = null;
   let maxCallTimeout = null;
 
-  // VAD state (real speech events from OpenAI)
+  // VAD state
   let userIsSpeaking = false;
 
-  // Speech generation control (cancel old speech when new turn arrives)
+  // Speech generation control
   let speechGen = 0;
   let botSpeaking = false;
   let noListenUntilTs = 0;
@@ -660,7 +660,7 @@ wss.on('connection', (connection) => {
   // LLM turn queue
   let turnCounter = 0;
   let llmBusy = false;
-  let pendingTurn = null; // { turnId, text }
+  let pendingTurn = null; // newest only
 
   const conversationLog = [];
 
@@ -688,7 +688,6 @@ wss.on('connection', (connection) => {
   function shouldAbortSpeech(myGen) {
     if (callEnded) return true;
     if (myGen !== speechGen) return true;
-    // If barge-in enabled, abort speech when user actually speaks (VAD)
     if (MB_ALLOW_BARGE_IN && userIsSpeaking) return true;
     return false;
   }
@@ -702,26 +701,27 @@ wss.on('connection', (connection) => {
     const r = await elevenTtsStreamToSender(t, reason, sender, meta, () => shouldAbortSpeech(myGen));
     botSpeaking = false;
 
-    // tail: if barge-in disabled, ignore input for short time after bot speech
     noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
     return r;
   }
 
-  async function speakChunked(text, baseReason, myGen) {
+  async function speakTwoChunks(text, baseReason, myGen) {
     const reply = String(text || '').trim();
     if (!reply) return;
 
-    const chunks = splitToChunks(reply, MB_CHUNK_MAX_CHARS, MB_CHUNK_MIN_CHARS);
-    logInfo('Chunking', 'Split reply', { chunks: chunks.length, maxChars: MB_CHUNK_MAX_CHARS }, meta);
+    const chunks = splitToTwoChunks(reply);
+    logInfo('Chunking', 'Split reply (max2)', { chunks: chunks.length, firstMax: MB_CHUNK_FIRST_MAX_CHARS, silenceMs: MB_CHUNK_SILENCE_MS }, meta);
 
-    for (let i = 0; i < chunks.length; i++) {
-      if (shouldAbortSpeech(myGen)) {
-        logWarn('Chunking', 'Stopped chunk playback', { atChunk: i + 1 }, meta);
-        return;
-      }
-      await speakText(chunks[i], `${baseReason}:chunk_${i + 1}/${chunks.length}`, myGen);
-      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, MB_CHUNK_GAP_MS));
-    }
+    // Chunk 1
+    await speakText(chunks[0], `${baseReason}:part1`, myGen);
+
+    if (chunks.length === 1) return;
+
+    // ✅ Add real ulaw silence between parts (prevents “pop” perception)
+    sender.enqueue(ulawSilence(MB_CHUNK_SILENCE_MS));
+
+    // Chunk 2 (single call for the rest -> much cleaner)
+    await speakText(chunks[1], `${baseReason}:part2`, myGen);
   }
 
   async function runLlmForTurn(turnId, userText) {
@@ -729,15 +729,11 @@ wss.on('connection', (connection) => {
     if (!t) return;
 
     llmBusy = true;
-
-    // Start a new bot speech generation for this turn (cancels old ones)
     const myGen = ++speechGen;
 
-    // Store user
     conversationLog.push({ from: 'user', text: t });
     logInfo('User', t, undefined, meta);
 
-    // Immediate ACK (does not cancel anything, just speaks now)
     if (MB_ACK_ENABLED && MB_ACK_TEXT) {
       conversationLog.push({ from: 'bot', text: MB_ACK_TEXT });
       logInfo('ACK', 'Speaking immediate ack', { text: MB_ACK_TEXT }, meta);
@@ -745,9 +741,6 @@ wss.on('connection', (connection) => {
     }
 
     const system = buildSystemInstructions();
-
-    // Choose IVRIT if set, else OpenAI. If IVRIT fails -> fallback OpenAI.
-    logInfo('LLM', 'Processing user text', { trigger: 'transcript_completed', textLen: t.length, turnId }, meta);
 
     let llmRes;
     if (IVRIT_LLM_URL) {
@@ -760,7 +753,6 @@ wss.on('connection', (connection) => {
       llmRes = await callOpenAiResponses({ system, userText: t, meta });
     }
 
-    // If a newer turn arrived while we were working, drop this reply and handle the newest
     if (pendingTurn && pendingTurn.turnId > turnId) {
       logWarn('LLM', 'Newer user turn exists -> skip old reply', { oldTurn: turnId, newTurn: pendingTurn.turnId }, meta);
       llmBusy = false;
@@ -772,7 +764,7 @@ wss.on('connection', (connection) => {
       const fallback = 'לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?';
       conversationLog.push({ from: 'bot', text: fallback });
       logInfo('Bot', fallback, undefined, meta);
-      await speakChunked(fallback, 'fallback', myGen);
+      await speakTwoChunks(fallback, 'fallback', myGen);
       llmBusy = false;
       return;
     }
@@ -780,7 +772,7 @@ wss.on('connection', (connection) => {
     conversationLog.push({ from: 'bot', text: reply });
     logInfo('Bot', reply, undefined, meta);
 
-    await speakChunked(reply, 'llm_reply', myGen);
+    await speakTwoChunks(reply, 'llm_reply', myGen);
 
     llmBusy = false;
   }
@@ -789,7 +781,6 @@ wss.on('connection', (connection) => {
     turnCounter++;
     const turnId = turnCounter;
 
-    // Always keep only the newest pending turn (reduces backlog delay)
     if (llmBusy) {
       pendingTurn = { turnId, text };
       logInfo('LLM', 'Queued newer user turn (LLM busy)', { turnId, textLen: text.length }, meta);
@@ -798,7 +789,6 @@ wss.on('connection', (connection) => {
 
     pendingTurn = null;
     runLlmForTurn(turnId, text).then(() => {
-      // After finishing, if something new queued during run -> handle it now
       if (!callEnded && pendingTurn && !llmBusy) {
         const pt = pendingTurn;
         pendingTurn = null;
@@ -810,7 +800,7 @@ wss.on('connection', (connection) => {
     });
   }
 
-  // ---- OpenAI WS (VAD + transcription)
+  // ---- OpenAI Realtime WS (VAD + transcription)
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
@@ -852,7 +842,6 @@ wss.on('connection', (connection) => {
     if (!callEnded) endCall('openai_ws_error');
   });
 
-  // Dedup transcripts
   let lastTranscript = '';
   let lastTranscriptAt = 0;
 
@@ -860,12 +849,10 @@ wss.on('connection', (connection) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // VAD events (THIS is the correct "user speaking" signal)
     if (msg.type === 'input_audio_buffer.speech_started') {
       userIsSpeaking = true;
       logDebug('VAD', 'speech_started', undefined, meta);
 
-      // If barge-in allowed and bot is speaking -> clear playback & cancel speech
       if (MB_ALLOW_BARGE_IN && botSpeaking) {
         speechGen++;
         sender.clearQueueOnly();
@@ -914,7 +901,7 @@ wss.on('connection', (connection) => {
 
       logInfo('Call', `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}`, undefined, meta);
 
-      // Opening now
+      // Opening
       conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
 
       if (TTS_PROVIDER === 'eleven') {
@@ -957,19 +944,13 @@ wss.on('connection', (connection) => {
       lastMediaTs = Date.now();
       const payload = msg.media?.payload;
       if (!payload) return;
-
       if (openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
 
-      // If barge-in disabled, ignore audio during bot speech tail
+      // If barge-in disabled, ignore input while bot speaking/tail (to avoid echo triggers)
       if (!MB_ALLOW_BARGE_IN) {
-        if (botSpeaking || now < noListenUntilTs) {
-          // Still feed audio to OpenAI? NO — we *do* feed so VAD can know user speaks,
-          // but we keep it disabled here to reduce false triggers from echo.
-          // If you want real-time barge-in detection while disabled, switch this to "do feed".
-          return;
-        }
+        if (botSpeaking || now < noListenUntilTs) return;
       }
 
       openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
