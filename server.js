@@ -1,14 +1,16 @@
 // server.js
 //
 // BluBinet Realtime Voice Bot – "נטע"
-// Twilio Media Streams <-> OpenAI Realtime (LLM + Whisper transcription)
+// Twilio Media Streams <-> OpenAI Realtime (Whisper transcription + TEXT LLM only)
 // TTS via ElevenLabs (streamed to Twilio as ulaw_8000 20ms frames)
 //
-// Fixes in this version:
-// 1) ALWAYS produce audible bot replies: use output_text if available, otherwise fallback to audio_transcript.done
-// 2) Response watchdog: if response "stuck" > MB_RESPONSE_TIMEOUT_MS, release lock and continue
-// 3) Rich OpenAI event logs (optional via MB_LOG_LEVEL=debug)
-// 4) Keep fast opening via cached Eleven audio
+// Goals:
+// - Fast opening via cached Eleven audio
+// - OpenAI used for: input audio -> transcription + text response ONLY
+// - Eleven used for ALL speech output
+// - Stable locks: prevent stuck "active response" situations
+// - Always log enough to debug
+//
 
 require('dotenv').config();
 const express = require('express');
@@ -42,7 +44,6 @@ function rid() {
 // Core ENV config
 // -----------------------------
 const PORT = envNumber('PORT', 3000);
-
 const DOMAIN = envStr('DOMAIN', '');
 const MB_TWILIO_STREAM_URL = envStr('MB_TWILIO_STREAM_URL', '');
 
@@ -55,6 +56,10 @@ const BUSINESS_NAME = envStr('MB_BUSINESS_NAME', 'BluBinet');
 const MB_OPENING_SCRIPT = envStr(
   'MB_OPENING_SCRIPT',
   'צהריים טובים, הגעתם ל־BluBinet. שמי נטע, איך אפשר לעזור לכם היום?'
+);
+const MB_CLOSING_SCRIPT = envStr(
+  'MB_CLOSING_SCRIPT',
+  'תודה שדיברתם עם BluBinet. נציג יחזור אליכם בהקדם. יום נעים!'
 );
 
 const MB_GENERAL_PROMPT = envStr('MB_GENERAL_PROMPT', '');
@@ -77,9 +82,6 @@ const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 10 * 60 * 1000);
 // Barge-in
 const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
 const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
-
-// Response watchdog (prevents "stuck active response")
-const MB_RESPONSE_TIMEOUT_MS = envNumber('MB_RESPONSE_TIMEOUT_MS', 9000);
 
 // Logging
 const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase(); // debug|info|warn|error
@@ -108,6 +110,9 @@ const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
 // Cached opening
 const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
 
+// Response watchdog
+const MB_RESPONSE_WATCHDOG_MS = envNumber('MB_RESPONSE_WATCHDOG_MS', 6500); // if no OpenAI reply events -> retry
+
 // -----------------------------
 // Guardrails
 // -----------------------------
@@ -121,13 +126,13 @@ console.log(`[CONFIG] PORT=${PORT}`);
 console.log(`[CONFIG] MODEL=${OPENAI_REALTIME_MODEL}`);
 console.log(`[CONFIG] MB_ALLOW_BARGE_IN=${MB_ALLOW_BARGE_IN}, MB_NO_BARGE_TAIL_MS=${MB_NO_BARGE_TAIL_MS}`);
 console.log(`[CONFIG] VAD threshold=${MB_VAD_THRESHOLD} silence_ms=${MB_VAD_SILENCE_MS} prefix_ms=${MB_VAD_PREFIX_MS}`);
-console.log(`[CONFIG] MB_RESPONSE_TIMEOUT_MS=${MB_RESPONSE_TIMEOUT_MS}`);
 console.log(`[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}`);
 console.log(
   `[CONFIG] ELEVEN voice_id=${ELEVEN_VOICE_ID ? 'SET' : 'NOT_SET'} model=${ELEVEN_MODEL} lang=${ELEVEN_LANGUAGE} fmt=${ELEVEN_OUTPUT_FORMAT} optLatency=${ELEVEN_OPTIMIZE_STREAMING_LATENCY}`
 );
 console.log(`[CONFIG] MB_CACHE_OPENING_AUDIO=${MB_CACHE_OPENING_AUDIO}`);
 console.log(`[CONFIG] MB_LANGUAGES=${MB_LANGUAGES.join(',')}`);
+console.log(`[CONFIG] MB_RESPONSE_WATCHDOG_MS=${MB_RESPONSE_WATCHDOG_MS}`);
 
 // -----------------------------
 // Logging helpers
@@ -149,8 +154,8 @@ function log(lvl, tag, msg, extra, meta = {}) {
   else console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`);
 }
 const logDebug = (tag, msg, extra, meta) => log('debug', tag, msg, extra, meta);
-const logInfo = (tag, msg, extra, meta) => log('info', tag, msg, extra, meta);
-const logWarn = (tag, msg, extra, meta) => log('warn', tag, msg, extra, meta);
+const logInfo  = (tag, msg, extra, meta) => log('info',  tag, msg, extra, meta);
+const logWarn  = (tag, msg, extra, meta) => log('warn',  tag, msg, extra, meta);
 const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 
 // -----------------------------
@@ -159,9 +164,9 @@ const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים:
 1) דברו בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
-2) אם לא הבנתם: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
-3) תשובות קצרות 1–3 משפטים, וסיימו בשאלה שמקדמת הבנה/איסוף צורך.
-4) אל תסיימו שיחה מיוזמתכם.
+2) אל תתייחסי לרעש/איכות קו. אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
+3) תשובות קצרות 1–3 משפטים, וסיימי בשאלה שמקדמת הבנה/איסוף צורך.
+4) אל תסיימי שיחה מיוזמתך.
 `.trim();
 
 function buildSystemInstructions() {
@@ -291,19 +296,14 @@ async function elevenTtsStreamToSender(text, reason, sender, meta) {
     }
   };
 
-  logInfo(
-    'ElevenTTS',
-    'Streaming text to ElevenLabs TTS.',
-    {
-      length: cleaned.length,
-      model: ELEVEN_MODEL,
-      language: ELEVEN_LANGUAGE,
-      format: ELEVEN_OUTPUT_FORMAT,
-      reason,
-      url_has_opt_latency: url.includes('optimize_streaming_latency')
-    },
-    meta
-  );
+  logInfo('ElevenTTS', 'Streaming text to ElevenLabs TTS.', {
+    length: cleaned.length,
+    model: ELEVEN_MODEL,
+    language: ELEVEN_LANGUAGE,
+    format: ELEVEN_OUTPUT_FORMAT,
+    reason,
+    url_has_opt_latency: url.includes('optimize_streaming_latency')
+  }, meta);
 
   try {
     const res = await fetch(url, {
@@ -411,10 +411,17 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+// tiny http logger (optional)
+app.use((req, res, next) => {
+  const id = crypto.randomBytes(4).toString('hex');
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+  logInfo('HTTP', `--> [${id}] ${req.method} ${req.url} ip=${ip}`);
+  res.on('finish', () => logInfo('HTTP', `<-- [${id}] ${req.method} ${req.url} status=${res.statusCode}`));
+  next();
+});
+
 app.get('/', (req, res) => res.status(200).send('OK'));
 
-// NOTE: If your Twilio webhook is GET, change to app.get as well.
-// You said "הכול בסדר" so leaving as-is.
 app.post('/twilio-voice', (req, res) => {
   const host = (DOMAIN || req.headers.host || '').replace(/^https?:\/\//, '');
   const wsUrl = MB_TWILIO_STREAM_URL || `wss://${host}/twilio-media-stream`;
@@ -457,15 +464,10 @@ wss.on('connection', (connection) => {
   let callEnded = false;
   let lastMediaTs = Date.now();
 
-  // Realtime state
+  // response state
   let hasActiveResponse = false;
-  let botTurnActive = false;
   let botSpeaking = false;
   let noListenUntilTs = 0;
-
-  // response watchdog
-  let activeResponseSince = 0;
-  let watchdogTimer = null;
 
   const pendingUserTexts = [];
   let lastTranscript = '';
@@ -473,26 +475,21 @@ wss.on('connection', (connection) => {
 
   const conversationLog = [];
 
+  // timers
   let idleInterval = null;
   let maxCallTimeout = null;
+
+  // openai response watchdog
+  let responseWatchdog = null;
+  let responseHasAnyEvent = false;
 
   function cleanupTimers() {
     if (idleInterval) clearInterval(idleInterval);
     idleInterval = null;
     if (maxCallTimeout) clearTimeout(maxCallTimeout);
     maxCallTimeout = null;
-    if (watchdogTimer) clearInterval(watchdogTimer);
-    watchdogTimer = null;
-  }
-
-  function releaseResponseLock(reason) {
-    if (!hasActiveResponse) return;
-    logWarn('Call', 'Releasing stuck response lock', { reason }, meta);
-    hasActiveResponse = false;
-    botTurnActive = false;
-    botSpeaking = false;
-    activeResponseSince = 0;
-    flushQueue(`released:${reason}`);
+    if (responseWatchdog) clearTimeout(responseWatchdog);
+    responseWatchdog = null;
   }
 
   function endCall(reason) {
@@ -505,8 +502,70 @@ wss.on('connection', (connection) => {
     logInfo('Call', 'Final conversation log:', conversationLog, meta);
 
     try { sender.stop(); } catch {}
-    try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
+    try { if (openAiWs && openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
     try { if (connection.readyState === WebSocket.OPEN) connection.close(); } catch {}
+  }
+
+  function startResponseWatchdog(label) {
+    responseHasAnyEvent = false;
+    if (responseWatchdog) clearTimeout(responseWatchdog);
+    responseWatchdog = setTimeout(() => {
+      if (callEnded) return;
+      if (!hasActiveResponse) return;
+
+      // If OpenAI didn't emit ANY response events, the request got stuck.
+      if (!responseHasAnyEvent) {
+        logWarn('Call', 'Releasing stuck response lock', { reason: `timeout_${MB_RESPONSE_WATCHDOG_MS}ms`, label }, meta);
+        hasActiveResponse = false;
+        // Try again: request a fresh response on the existing conversation context
+        try {
+          if (openAiWs.readyState === WebSocket.OPEN) {
+            openAiWs.send(JSON.stringify({ type: 'response.create', response: { modalities: ['text'] } }));
+            hasActiveResponse = true;
+            startResponseWatchdog('retry_after_stuck');
+            logInfo('Call', 'response.create sent', { reason: `retry_after_stuck:${label}` }, meta);
+          }
+        } catch (e) {
+          logWarn('Call', 'retry response.create failed', e, meta);
+          hasActiveResponse = false;
+        }
+      }
+    }, MB_RESPONSE_WATCHDOG_MS);
+  }
+
+  function sendUserTextToModel(text, reason) {
+    const t = String(text || '').trim();
+    if (!t) return;
+
+    if (openAiWs.readyState !== WebSocket.OPEN) {
+      logWarn('OpenAI', 'WS not open; queue user text', { reason }, meta);
+      pendingUserTexts.push(t);
+      return;
+    }
+
+    // user message
+    openAiWs.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: t }] }
+    }));
+
+    // request TEXT response explicitly (we do Eleven for audio)
+    openAiWs.send(JSON.stringify({
+      type: 'response.create',
+      response: { modalities: ['text'] }
+    }));
+
+    hasActiveResponse = true;
+    startResponseWatchdog(reason);
+    logInfo('Call', 'response.create sent', { reason }, meta);
+  }
+
+  function flushQueue(trigger) {
+    if (callEnded) return;
+    if (hasActiveResponse) return;
+    if (!pendingUserTexts.length) return;
+    const next = pendingUserTexts.shift();
+    sendUserTextToModel(next, `queued:${trigger}`);
   }
 
   // ---- OpenAI WS
@@ -520,67 +579,19 @@ wss.on('connection', (connection) => {
     }
   );
 
-  function sendUserTextToModel(text, reason) {
-    const t = String(text || '').trim();
-    if (!t) return;
-
-    if (openAiWs.readyState !== WebSocket.OPEN) {
-      logWarn('OpenAI', 'WS not open; queue user text', { reason }, meta);
-      pendingUserTexts.push(t);
-      return;
-    }
-
-    openAiWs.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: t }] }
-    }));
-
-    // Ask explicitly for TEXT output (we do external TTS)
-    openAiWs.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        modalities: ['text']
-      }
-    }));
-
-    hasActiveResponse = true;
-    botTurnActive = true;
-    activeResponseSince = Date.now();
-
-    logInfo('Call', 'response.create sent', { reason }, meta);
-  }
-
-  function flushQueue(trigger) {
-    if (callEnded) return;
-    if (hasActiveResponse) return;
-    if (!pendingUserTexts.length) return;
-    const next = pendingUserTexts.shift();
-    sendUserTextToModel(next, `queued:${trigger}`);
-  }
-
-  // Watchdog interval (prevents "no completed event" lock)
-  watchdogTimer = setInterval(() => {
-    if (callEnded) return;
-    if (!hasActiveResponse) return;
-    if (!activeResponseSince) return;
-    const age = Date.now() - activeResponseSince;
-    if (age > MB_RESPONSE_TIMEOUT_MS) {
-      releaseResponseLock(`timeout_${age}ms`);
-    }
-  }, 250);
-
   openAiWs.on('open', () => {
     logInfo('Call', 'Connected to OpenAI Realtime API.', undefined, meta);
 
     const instructions = buildSystemInstructions();
 
+    // KEY CHANGE:
+    // modalities: ['text'] so we ALWAYS get output_text events (and avoid silent audio-only responses).
     openAiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         model: OPENAI_REALTIME_MODEL,
-        modalities: ['text'], // IMPORTANT: text output only
+        modalities: ['text'],
         input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
@@ -605,26 +616,8 @@ wss.on('connection', (connection) => {
     if (!callEnded) endCall('openai_ws_error');
   });
 
-  // We will accept bot text from either:
-  // A) response.output_text.*  (preferred)
-  // B) response.audio_transcript.* (fallback when output_text is not present)
+  // accumulate bot text from output_text deltas
   let currentBotText = '';
-  let currentAudioTranscript = '';
-
-  async function speakBotText(text, source) {
-    const t = String(text || '').trim();
-    if (!t) return;
-
-    conversationLog.push({ from: 'bot', text: t });
-    logInfo('Bot', t, { source }, meta);
-
-    if (TTS_PROVIDER === 'eleven') {
-      botSpeaking = true;
-      await elevenTtsStreamToSender(t, `model_reply:${source}`, sender, meta);
-      botSpeaking = false;
-      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
-    }
-  }
 
   openAiWs.on('message', async (data) => {
     let msg;
@@ -632,66 +625,47 @@ wss.on('connection', (connection) => {
 
     const type = msg.type;
 
-    // Debug event trace (optional)
-    if (MB_LOG_LEVEL === 'debug') {
-      if (type && !type.includes('input_audio_buffer')) {
-        logDebug('OpenAI', 'evt', { type }, meta);
-      }
-    }
+    // For debugging, you can turn MB_LOG_LEVEL=debug and see raw types:
+    logDebug('OpenAI', 'event', { type }, meta);
+
+    // Any response event => watchdog saw activity
+    if (type && String(type).startsWith('response.')) responseHasAnyEvent = true;
 
     if (type === 'response.created') {
-      hasActiveResponse = true;
-      botTurnActive = true;
-      botSpeaking = false;
-      activeResponseSince = Date.now();
-      currentBotText = '';
-      currentAudioTranscript = '';
+      // ok, response is alive
       return;
     }
 
-    // Preferred path
     if (type === 'response.output_text.delta') {
       const d = msg.delta || '';
       if (d) currentBotText += d;
       return;
     }
 
-    // Fallback path (some runs will only provide this)
-    if (type === 'response.audio_transcript.delta') {
-      const d = msg.delta || '';
-      if (d) currentAudioTranscript += d;
-      return;
-    }
-
     if (type === 'response.output_text.done') {
       const text = String(currentBotText || '').trim();
       currentBotText = '';
+
       if (text) {
-        await speakBotText(text, 'output_text');
+        conversationLog.push({ from: 'bot', text });
+        logInfo('Bot', text, undefined, meta);
+
+        // speak via Eleven
+        if (TTS_PROVIDER === 'eleven') {
+          botSpeaking = true;
+          await elevenTtsStreamToSender(text, 'model_reply', sender, meta);
+          botSpeaking = false;
+          noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+        }
       }
       return;
     }
 
-    if (type === 'response.audio_transcript.done') {
-      // If output_text was empty, use transcript as the bot's text
-      const transcript = String(msg.transcript || currentAudioTranscript || '').trim();
-      currentAudioTranscript = '';
-
-      if (!transcript) return;
-
-      // Only speak transcript if we did NOT already speak output_text for this response
-      if (!currentBotText || !String(currentBotText).trim()) {
-        await speakBotText(transcript, 'audio_transcript');
-      }
-      return;
-    }
-
-    if (type === 'response.completed' || type === 'response.audio.done') {
+    if (type === 'response.completed') {
       hasActiveResponse = false;
-      botTurnActive = false;
       botSpeaking = false;
-      activeResponseSince = 0;
       noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+      if (responseWatchdog) { clearTimeout(responseWatchdog); responseWatchdog = null; }
       flushQueue('response_completed');
       return;
     }
@@ -722,8 +696,11 @@ wss.on('connection', (connection) => {
       const code = msg?.error?.code;
       logWarn('OpenAI', 'OpenAI error event', { code, message: msg?.error?.message }, meta);
 
-      // recover: release lock and continue
-      releaseResponseLock(code || 'unknown_error');
+      // recover
+      hasActiveResponse = false;
+      botSpeaking = false;
+      if (responseWatchdog) { clearTimeout(responseWatchdog); responseWatchdog = null; }
+      flushQueue('error_recover');
       return;
     }
   });
@@ -742,7 +719,7 @@ wss.on('connection', (connection) => {
 
       logInfo('Call', `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}`, undefined, meta);
 
-      // PLAY OPENING IMMEDIATELY:
+      // PLAY OPENING IMMEDIATELY
       conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
 
       if (TTS_PROVIDER === 'eleven') {
@@ -755,7 +732,7 @@ wss.on('connection', (connection) => {
         }
       }
 
-      // Idle timer
+      // idle timer
       if (idleInterval) clearInterval(idleInterval);
       idleInterval = setInterval(() => {
         if (callEnded) {
@@ -770,7 +747,7 @@ wss.on('connection', (connection) => {
         }
       }, 1000);
 
-      // Max duration
+      // max call duration
       if (MB_MAX_CALL_MS > 0) {
         if (maxCallTimeout) clearTimeout(maxCallTimeout);
         maxCallTimeout = setTimeout(() => {
@@ -790,13 +767,12 @@ wss.on('connection', (connection) => {
 
       const now = Date.now();
 
+      // if barge-in disabled: don't feed audio while bot is speaking / tail period
       if (!MB_ALLOW_BARGE_IN) {
-        if (botTurnActive || botSpeaking || now < noListenUntilTs) {
-          return;
-        }
+        if (botSpeaking || now < noListenUntilTs) return;
       }
 
-      // feed audio to OpenAI
+      // send audio to OpenAI
       openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
       return;
     }
