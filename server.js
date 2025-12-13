@@ -3,36 +3,14 @@
 // BluBinet Realtime Voice Bot – "נטע"
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// מטרות:
-// - עברית כברירת מחדל, לשון רבים, טון קצר וחם.
-// - TTS דרך ElevenLabs (Streaming) בפורמט ulaw_8000 (מתאים ל-Twilio Media Streams).
-// - פתיח מיידי דרך Eleven (בלי לחכות ל-OpenAI) כדי להוריד דיליי.
-// - שליטה מלאה דרך ENV בכל מה שאפשר.
-// - לוגים תמידיים וברורים (כולל rid לכל שיחה).
-// - Fallback אוטומטי ל-Alloy רק אם Eleven נופל, כדי שלא יהיה "שקט".
+// תיקונים (2025-12-13):
+// 1) מניעת response.create כפול (conversation_already_has_active_response)
+// 2) לא להגיד "לא שמעתי טוב" מוקדם מדי — מחכים לתמלול שיגיע
+// 3) cancel לתשובה פעילה אם המשתמש מתחיל לדבר באמצע
+// 4) שיפור דיליי ע"י debounce תזמון תגובה אחרי תמלול/סוף דיבור
 //
-// תיקון קריטי (13/12):
-// - חייבים להצמיד sender.streamSid אחרי אירוע start של Twilio.
-//   אחרת אודיו מ-Eleven מתקבל אבל לא נשלח ל-Twilio => "אין קול".
-//
-// ENV מינימלי:
-// - PORT=1000
-// - OPENAI_API_KEY=...
-// - OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview-2024-12-17
-// - TWILIO_ACCOUNT_SID=...
-// - TWILIO_AUTH_TOKEN=...
-// - TTS_PROVIDER=eleven
-// - ELEVEN_API_KEY=...            (או ELEVENLABS_API_KEY)
-// - VOICE_ID=...                  (או ELEVEN_VOICE_ID)
-// - ELEVENLABS_MODEL_ID=eleven_v3
-// - ELEVENLABS_OUTPUT_FORMAT=ulaw_8000
-// - ELEVENLABS_LANGUAGE=he
-//
-// בדיקות:
-// - GET /health
-// - GET /twilio-voice (דפדפן) -> OK
-// - Twilio Voice Webhook -> POST /twilio-voice
-// - Media Stream -> wss://<domain>/twilio-media-stream
+// Twilio Voice Webhook ->  POST /twilio-voice  (TwiML)
+// Twilio Media Streams -> wss://<domain>/twilio-media-stream
 
 require("dotenv").config();
 
@@ -67,7 +45,6 @@ function log(level, tag, msg, extra) {
     console.log(base);
   }
 }
-
 process.on("unhandledRejection", (err) => log("error", "Process", "unhandledRejection", err));
 process.on("uncaughtException", (err) => log("error", "Process", "uncaughtException", err));
 
@@ -137,25 +114,29 @@ const ELEVEN_MODEL_ID = (process.env.ELEVENLABS_MODEL_ID || process.env.ELEVEN_T
 const ELEVEN_OUTPUT_FORMAT =
   (process.env.ELEVENLABS_OUTPUT_FORMAT || process.env.ELEVEN_OUTPUT_FORMAT || "ulaw_8000").trim();
 const ELEVEN_LANGUAGE = (process.env.ELEVENLABS_LANGUAGE || process.env.ELEVEN_LANGUAGE || "he").trim();
-const ELEVEN_TIMEOUT_MS = Number(process.env.ELEVENLABS_TIMEOUT_MS || 4000);
+const ELEVEN_TIMEOUT_MS = Number(process.env.ELEVENLABS_TIMEOUT_MS || 4500);
 
 const ELEVEN_STYLE = clamp01(Number(process.env.ELEVENLABS_STYLE || 0.15));
 const ELEVEN_USE_BOOST = String(process.env.ELEVENLABS_USE_BOOST || "1") === "1";
-const ELEVEN_STABILITY_RAW = Number(process.env.ELEVENLABS_STABILITY || 0.5);
-const ELEVEN_STABILITY = snapStability(ELEVEN_STABILITY_RAW);
+const ELEVEN_STABILITY = snapStability(Number(process.env.ELEVENLABS_STABILITY || 0.5));
 const ELEVEN_SIMILARITY = clamp01(Number(process.env.ELEVENLABS_SIMILARITY || 0.8));
-const ELEVEN_SPEED = clamp(0.7, 1.2, Number(process.env.ELEVENLABS_SPEED || process.env.MB_SPEECH_SPEED || 1.0));
+const ELEVEN_SPEED = clamp(0.8, 1.1, Number(process.env.ELEVENLABS_SPEED || process.env.MB_SPEECH_SPEED || 1.0));
 
 const MB_ALLOW_BARGE_IN = String(process.env.MB_ALLOW_BARGE_IN || "true") === "true";
-const MB_NO_BARGE_TAIL_MS = Number(process.env.MB_NO_BARGE_TAIL_MS || 900);
+const MB_NO_BARGE_TAIL_MS = Number(process.env.MB_NO_BARGE_TAIL_MS || 700);
 
+// כדי להוריד latency — דיפולטים יותר אגרסיביים (עדיין אפשר לשלוט ב-ENV)
 const MB_VAD_THRESHOLD = clamp(0.1, 0.9, Number(process.env.MB_VAD_THRESHOLD || 0.55));
-const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 220);
-const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 520);
+const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 180);
+const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 360);
 
 const MB_MAX_CALL_MS = Number(process.env.MB_MAX_CALL_MS || 8 * 60 * 1000);
 const MB_SILENCE_HANGUP_MS = Number(process.env.MB_SILENCE_HANGUP_MS || 20 * 1000);
 const MB_HANGUP_GRACE_MS = Number(process.env.MB_HANGUP_GRACE_MS || 3000);
+
+// תזמוני “אל תמהר להגיד לא שמעתי טוב”
+const MB_TRANSCRIPT_GRACE_MS = Number(process.env.MB_TRANSCRIPT_GRACE_MS || 900); // לחכות לתמלול
+const MB_RESPONSE_DEBOUNCE_MS = Number(process.env.MB_RESPONSE_DEBOUNCE_MS || 220); // תגובה מהירה אחרי תמלול
 
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "BluBinet";
 const OPENING_SUFFIX = process.env.OPENING_SUFFIX || "";
@@ -163,8 +144,8 @@ const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || "";
 
-log("info", "CONFIG", `MB_HANGUP_GRACE_MS=${MB_HANGUP_GRACE_MS} ms`);
 log("info", "CONFIG", `MB_ALLOW_BARGE_IN=${MB_ALLOW_BARGE_IN}, MB_NO_BARGE_TAIL_MS=${MB_NO_BARGE_TAIL_MS} ms`);
+log("info", "CONFIG", `VAD threshold=${MB_VAD_THRESHOLD}, prefix=${MB_VAD_PREFIX_MS}, silence=${MB_VAD_SILENCE_MS}`);
 log(
   "info",
   "CONFIG",
@@ -175,7 +156,6 @@ log(
 // HTTP server + WebSocket server (Twilio Media Streams)
 // =========================
 const server = http.createServer(app);
-
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (ws) => {
@@ -237,13 +217,17 @@ function createCallState({ ws, rid }) {
 
     conversationLog: [],
     lastUserText: null,
-    lastActivityAt: Date.now(),
+    lastTranscriptAt: 0,
+
+    responseInFlight: false,
+    pendingResponseTimer: null,
+    pendingNoUserTimer: null,
+
     silenceTimer: null,
     maxCallTimer: null,
     graceTimer: null,
 
     isSpeaking: false,
-    speakingSince: 0,
     hadAnyAudio: false,
     ended: false,
     usedFallbackAlloy: false,
@@ -260,7 +244,7 @@ async function handleTwilioMessage(state, msg) {
     state.callSid = msg.start.callSid;
     state.caller = msg.start.customParameters?.caller || null;
 
-    // ✅ קריטי: להצמיד streamSid ל-sender כדי שייצא קול
+    // קריטי: להצמיד streamSid ל-sender כדי שייצא קול
     state.sender.streamSid = state.streamSid;
     log("info", "AudioSender", "Bound sender.streamSid", { rid, streamSid: state.streamSid });
 
@@ -287,11 +271,9 @@ async function handleTwilioMessage(state, msg) {
   }
 
   if (msg.event === "media") {
-    state.lastActivityAt = Date.now();
     armSilenceTimer(state);
 
-    if (!MB_ALLOW_BARGE_IN && state.isSpeaking) return;
-
+    // barge-in: אם המשתמש מתחיל לדבר בזמן שהבוט דיבר — נבטל תשובה פעילה
     if (state.openAiWs && state.openAiWs.readyState === WebSocket.OPEN) {
       state.openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
     }
@@ -322,7 +304,8 @@ async function connectOpenAiRealtime(state) {
   openAiWs.on("open", () => {
     log("info", "Call", "Connected to OpenAI Realtime API.", { rid });
 
-    const modalities = TTS_PROVIDER === "eleven" ? ["text"] : ["text", "audio"];
+    // אנחנו עושים TTS חיצוני (Eleven) => text-only
+    const modalities = ["text"];
     const instructions = buildMasterPrompt();
 
     openAiWs.send(
@@ -357,21 +340,75 @@ async function connectOpenAiRealtime(state) {
 
     if (evt?.type && shouldLog("debug")) log("debug", "OpenAI", `event=${evt.type}`, { rid });
 
-    if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      const text = (evt.transcript || "").trim();
-      if (text) {
-        state.lastUserText = text;
-        pushLog(state, "user", text);
-        log("info", "User", text, { rid });
+    // המשתמש התחיל לדבר — אם יש תשובה פעילה, נבטל כדי לא להיתקע
+    if (evt.type === "input_audio_buffer.speech_started") {
+      if (state.responseInFlight) {
+        log("warn", "OpenAI", "User started speaking while response in flight -> response.cancel", { rid });
+        try {
+          state.openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+        } catch {}
       }
       return;
     }
 
-    if (evt.type === "input_audio_buffer.speech_stopped") {
-      await createModelResponse(state);
+    // תמלול הושלם
+    if (evt.type === "conversation.item.input_audio_transcription.completed") {
+      const text = (evt.transcript || "").trim();
+      if (text) {
+        state.lastUserText = text;
+        state.lastTranscriptAt = Date.now();
+        pushLog(state, "user", text);
+        log("info", "User", text, { rid });
+
+        // אם היה טיימר של "אין תמלול" — מבטלים אותו
+        if (state.pendingNoUserTimer) {
+          clearTimeout(state.pendingNoUserTimer);
+          state.pendingNoUserTimer = null;
+        }
+
+        // מתזמנים תגובה מהר (debounce)
+        scheduleResponse(state, "transcript_completed");
+      }
       return;
     }
 
+    // סוף דיבור לפי VAD
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      // מחכים טיפה לתמלול שיגיע לפני “לא שמעתי טוב”
+      if (state.pendingNoUserTimer) clearTimeout(state.pendingNoUserTimer);
+
+      state.pendingNoUserTimer = setTimeout(async () => {
+        state.pendingNoUserTimer = null;
+
+        const recentlyTranscribed = Date.now() - (state.lastTranscriptAt || 0) < MB_TRANSCRIPT_GRACE_MS;
+        if (recentlyTranscribed) {
+          scheduleResponse(state, "speech_stopped_recent_transcript");
+          return;
+        }
+
+        // אם באמת אין תמלול — רק אז "לא שמעתי טוב"
+        const t = "לֹא שָׁמַעְנוּ טוֹב, אֶפְשָׁר לַחְזֹר עַל זֶה?";
+        await speakNow(state, t, { reason: "no_user_text" });
+        pushLog(state, "bot", "לא שמעתי טוב, אפשר לחזור על זה?");
+      }, MB_TRANSCRIPT_GRACE_MS);
+
+      // בנוסף — אם כבר יש lastUserText טרי, נשלח תגובה מהר
+      const isFresh = Date.now() - (state.lastTranscriptAt || 0) < 1500;
+      if (isFresh) scheduleResponse(state, "speech_stopped_fresh");
+      return;
+    }
+
+    // ניהול מצב "יש תשובה פעילה"
+    if (evt.type === "response.created") {
+      state.responseInFlight = true;
+      return;
+    }
+    if (evt.type === "response.done") {
+      state.responseInFlight = false;
+      return;
+    }
+
+    // טקסט תשובה
     if (evt.type === "response.output_text.delta") {
       state._textBuf = (state._textBuf || "") + (evt.delta || "");
       return;
@@ -389,16 +426,12 @@ async function connectOpenAiRealtime(state) {
       return;
     }
 
-    if (evt.type === "response.audio.delta") {
-      if (!evt.delta) return;
-      const audioBytes = Buffer.from(evt.delta, "base64");
-      state.sender.enqueue(audioBytes);
-      state.hadAnyAudio = true;
-      return;
-    }
-
     if (evt.type === "error") {
       log("error", "OpenAI", "OpenAI error event", { rid, evt });
+      // אם זה השגיאה שראית — פשוט נוריד דגל כדי שהמערכת תוכל להתאושש
+      if (evt?.error?.code === "conversation_already_has_active_response") {
+        state.responseInFlight = true; // נשאיר true עד response.done / או עד reset
+      }
     }
   });
 
@@ -406,32 +439,50 @@ async function connectOpenAiRealtime(state) {
   openAiWs.on("error", (err) => log("error", "OpenAI", "OpenAI WS error", { rid, err: String(err) }));
 }
 
-async function createModelResponse(state) {
-  const { rid } = state;
+function scheduleResponse(state, reason) {
   if (!state.openAiWs || state.openAiWs.readyState !== WebSocket.OPEN) return;
   if (!state.openAiReady) return;
 
+  if (state.pendingResponseTimer) clearTimeout(state.pendingResponseTimer);
+
+  state.pendingResponseTimer = setTimeout(() => {
+    state.pendingResponseTimer = null;
+    createModelResponse(state, reason).catch(() => {});
+  }, MB_RESPONSE_DEBOUNCE_MS);
+}
+
+async function createModelResponse(state, reason) {
+  const { rid } = state;
+
+  if (!state.openAiWs || state.openAiWs.readyState !== WebSocket.OPEN) return;
+  if (!state.openAiReady) return;
+
+  // ✅ Gate: לא שולחים response.create אם כבר יש תשובה פעילה
+  if (state.responseInFlight) {
+    log("warn", "Call", "Skip response.create (response already in flight)", { rid, reason });
+    return;
+  }
+
+  // חייב להיות לנו טקסט משתמש
   if (!state.lastUserText) {
-    const t = "לֹא שָׁמַעְנוּ טוֹב, אֶפְשָׁר לַחְזֹר עַל זֶה?";
-    await speakNow(state, t, { reason: "no_user_text" });
-    pushLog(state, "bot", "לא שמעתי טוב, אפשר לחזור על זה?");
+    log("warn", "Call", "No lastUserText at createModelResponse — skipping", { rid, reason });
     return;
   }
 
   state.openAiWs.send(JSON.stringify({ type: "response.create", response: { max_output_tokens: 220 } }));
-  log("info", "Call", "response.create sent", { rid });
+  state.responseInFlight = true;
+  log("info", "Call", "response.create sent", { rid, reason });
 }
 
 async function speakNow(state, text, meta = {}) {
   const { rid } = state;
   state.isSpeaking = true;
-  state.speakingSince = Date.now();
 
   try {
     if (TTS_PROVIDER === "eleven") {
       await elevenSpeakStreamToTwilio(state, text, meta);
     } else {
-      await enableOpenAiAudioAndSpeak(state, text);
+      await openAiFallbackSpeak(state, text);
     }
   } catch (err) {
     log("error", "TTS", "speakNow failed", { rid, err: String(err) });
@@ -439,7 +490,7 @@ async function speakNow(state, text, meta = {}) {
     if (!state.usedFallbackAlloy) {
       state.usedFallbackAlloy = true;
       log("warn", "TTS", "Falling back to OpenAI audio (Alloy) to avoid silence", { rid });
-      await enableOpenAiAudioAndSpeak(state, text);
+      await openAiFallbackSpeak(state, text);
     }
   } finally {
     setTimeout(() => {
@@ -519,7 +570,8 @@ async function elevenSpeakStreamToTwilio(state, text, meta = {}) {
   log("info", "ElevenTTS", `ElevenLabs TTS audio received total=${total} bytes`, { rid });
 }
 
-async function enableOpenAiAudioAndSpeak(state, text) {
+// fallback אמיתי בלבד (אם Eleven נכשל)
+async function openAiFallbackSpeak(state, text) {
   const { rid } = state;
   if (!state.openAiWs || state.openAiWs.readyState !== WebSocket.OPEN) throw new Error("OpenAI WS not open");
 
@@ -537,16 +589,12 @@ async function enableOpenAiAudioAndSpeak(state, text) {
   state.openAiWs.send(
     JSON.stringify({
       type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: `תקריאו בדיוק את הטקסט הבא: ${text}` }],
-      },
+      item: { type: "message", role: "user", content: [{ type: "input_text", text: `תקריאו בדיוק את הטקסט הבא: ${text}` }] },
     })
   );
 
-  state.openAiWs.send(JSON.stringify({ type: "response.create", response: { max_output_tokens: 50 } }));
-  log("warn", "OpenAI", "Enabled audio fallback (Alloy) and requested spoken output", { rid });
+  state.openAiWs.send(JSON.stringify({ type: "response.create", response: { max_output_tokens: 80 } }));
+  log("warn", "OpenAI", "Fallback audio requested (Alloy)", { rid });
 }
 
 async function safeEndCall(state, reason) {
@@ -558,6 +606,8 @@ async function safeEndCall(state, reason) {
 
   clearTimeout(state.silenceTimer);
   clearTimeout(state.maxCallTimer);
+  if (state.pendingResponseTimer) clearTimeout(state.pendingResponseTimer);
+  if (state.pendingNoUserTimer) clearTimeout(state.pendingNoUserTimer);
 
   try {
     if (state.openAiWs && state.openAiWs.readyState === WebSocket.OPEN) state.openAiWs.close();
@@ -587,8 +637,7 @@ async function safeEndCall(state, reason) {
 }
 
 // =========================
-// Twilio outgoing audio sender (ulaw 8k)
-// sends 20ms frames (320 bytes) in real-time
+// Twilio outgoing audio sender (ulaw 8k) 20ms frames
 // =========================
 function createUlawSender({ twilioWs, rid }) {
   const FRAME_BYTES = 320; // 20ms
@@ -616,7 +665,6 @@ function createUlawSender({ twilioWs, rid }) {
       if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return;
 
       if (!sender.streamSid) {
-        // ✅ כדי שלא יהיה “שקט בלי סיבה”
         log("warn", "AudioSender", "Cannot send audio: sender.streamSid is not set yet", { rid });
         return;
       }
@@ -651,7 +699,6 @@ function createUlawSender({ twilioWs, rid }) {
             media: { payload },
           })
         );
-
         if (shouldLog("debug")) log("debug", "AudioSender", "Sent media frame (20ms)", { rid, bytes: FRAME_BYTES });
       } catch (e) {
         log("error", "AudioSender", "Failed sending media frame", { rid, err: String(e) });
@@ -689,7 +736,7 @@ function buildMasterPrompt() {
     `"אנחנו BluBinet, חברה שמספקת מרכזיות ענן ופתרונות טלפוניה חכמה לעסקים – עם ניתוב שיחות, IVR, מספרים וירטואליים והקלטות". ` +
     `אם מבקשים עוד פרטים – מוסיפים עוד משפט קצר בלבד. ` +
     `מטרת השיחה: להבין צורך, להסביר בקצרה, ולהציע המשך טיפול/יצירת קשר. ` +
-    `אם לא שמעתם טוב – מבקשים לחזור. ` +
+    `אם לא שמעתם טוב – מבקשים לחזור, אבל לא למהר לפני שהתמלול מגיע. ` +
     `שומרים על תשובות קצרות כדי להפחית דיליי.`
   );
 }
