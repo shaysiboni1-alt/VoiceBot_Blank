@@ -1,158 +1,159 @@
 // server.js
 //
 // BluBinet Realtime Voice Bot – "נטע"
-// Twilio Media Streams <-> OpenAI Realtime (Whisper transcription + VAD events)
-// LLM: OpenAI Responses API (default) OR IVRIT (fallback via ENV)
-// TTS: ElevenLabs streamed to Twilio as ulaw_8000 20ms frames
+// Twilio Media Streams <-> OpenAI Realtime (Whisper transcription via WS)
+// LLM: IVRIT (optional) -> fallback OpenAI Responses API
+// TTS: ElevenLabs -> Twilio as g711_ulaw 8kHz
 //
-// Quality fixes in this version:
-// ✅ Reply split is MAX 2 chunks (not 4) -> far fewer pops/clicks
-// ✅ Insert real ulaw silence padding between chunks (prevents audible “jumps”)
-// ✅ Keep ACK + fast opening cache
-// ✅ Keep VAD based on OpenAI events (no false “user speaking” from Twilio silence)
+// Audio quality fixes (IMPORTANT):
+// - Always send EXACT 160 bytes per 20ms frame (pad with 0xFF ulaw silence)
+// - Prebuffer before playback to avoid underruns (jitter protection)
+// - Tail silence padding to avoid last-syllable cut
 //
-// Requirements:
-//   npm i express ws dotenv
-//   Node 18+ (global fetch)
 
-require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const crypto = require('crypto');
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const crypto = require("crypto");
 
 // -----------------------------
 // ENV helpers
 // -----------------------------
 function envNumber(name, def) {
   const raw = process.env[name];
-  if (raw === undefined || raw === null || raw === '') return def;
+  if (raw === undefined || raw === null || raw === "") return def;
   const n = Number(raw);
   return Number.isFinite(n) ? n : def;
 }
 function envBool(name, def = false) {
-  const raw = String(process.env[name] || '').toLowerCase().trim();
+  const raw = String(process.env[name] || "").toLowerCase().trim();
   if (!raw) return def;
-  return ['1', 'true', 'yes', 'on'].includes(raw);
+  return ["1", "true", "yes", "on"].includes(raw);
 }
-function envStr(name, def = '') {
+function envStr(name, def = "") {
   const raw = process.env[name];
-  return raw === undefined || raw === null || raw === '' ? def : String(raw);
+  return raw === undefined || raw === null || raw === "" ? def : String(raw);
 }
-function rid() {
-  return crypto.randomBytes(4).toString('hex');
+function makeRid() {
+  return crypto.randomBytes(4).toString("hex");
 }
 
 // -----------------------------
 // Core ENV config
 // -----------------------------
-const PORT = envNumber('PORT', 3000);
+const PORT = envNumber("PORT", 3000);
 
-const DOMAIN = envStr('DOMAIN', '');
-const MB_TWILIO_STREAM_URL = envStr('MB_TWILIO_STREAM_URL', '');
+const DOMAIN = envStr("DOMAIN", "");
+const MB_TWILIO_STREAM_URL = envStr("MB_TWILIO_STREAM_URL", "");
 
-const OPENAI_API_KEY = envStr('OPENAI_API_KEY', '');
-const OPENAI_REALTIME_MODEL = envStr('OPENAI_REALTIME_MODEL', 'gpt-4o-realtime-preview-2024-12-17');
+const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
+const OPENAI_REALTIME_MODEL = envStr("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17");
+const OPENAI_LLM_MODEL = envStr("OPENAI_LLM_MODEL", "gpt-4o-mini");
 
-// LLM (OpenAI Responses)
-const OPENAI_LLM_MODEL = envStr('OPENAI_LLM_MODEL', 'gpt-4o-mini');
-const OPENAI_LLM_TIMEOUT_MS = envNumber('OPENAI_LLM_TIMEOUT_MS', 12000);
+const IVRIT_LLM_URL = envStr("IVRIT_LLM_URL", ""); // optional endpoint -> expects {text:"..."}
 
-// IVRIT LLM (fallback)
-const IVRIT_LLM_URL = envStr('IVRIT_LLM_URL', '');
-const IVRIT_LLM_TIMEOUT_MS = envNumber('IVRIT_LLM_TIMEOUT_MS', 12000);
-const IVRIT_LLM_METHOD = envStr('IVRIT_LLM_METHOD', 'POST').toUpperCase();
-const IVRIT_LLM_HEADER_KEY = envStr('IVRIT_LLM_HEADER_KEY', '');
-const IVRIT_LLM_HEADER_VALUE = envStr('IVRIT_LLM_HEADER_VALUE', '');
-
-// Identity
-const BOT_NAME = envStr('MB_BOT_NAME', 'נטע');
-const BUSINESS_NAME = envStr('MB_BUSINESS_NAME', 'BluBinet');
+const BOT_NAME = envStr("MB_BOT_NAME", "נטע");
+const BUSINESS_NAME = envStr("MB_BUSINESS_NAME", "BluBinet");
 
 const MB_OPENING_SCRIPT = envStr(
-  'MB_OPENING_SCRIPT',
-  'צהריים טובים, הגעתם ל־BluBinet. שמי נטע, איך אפשר לעזור לכם היום?'
+  "MB_OPENING_SCRIPT",
+  "צהריים טובים, הגעתם ל־BluBinet. שמי נטע, איך אפשר לעזור לכם היום?"
 );
 
-const MB_GENERAL_PROMPT = envStr('MB_GENERAL_PROMPT', '');
-const MB_BUSINESS_PROMPT = envStr('MB_BUSINESS_PROMPT', '');
+const MB_GENERAL_PROMPT = envStr("MB_GENERAL_PROMPT", "");
+const MB_BUSINESS_PROMPT = envStr("MB_BUSINESS_PROMPT", "");
 
-// VAD (OpenAI server_vad)
-const MB_VAD_THRESHOLD = envNumber('MB_VAD_THRESHOLD', 0.75);
-const MB_VAD_SILENCE_MS = envNumber('MB_VAD_SILENCE_MS', 700);
-const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 150);
-
-// Idle / duration
-const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 120000);
-const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 10 * 60 * 1000);
+// VAD
+const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.75);
+const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 700);
+const MB_VAD_PREFIX_MS = envNumber("MB_VAD_PREFIX_MS", 150);
 
 // Barge-in
-const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
-const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
+const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
+const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 900);
 
-// Twilio hangup (optional)
-const TWILIO_ACCOUNT_SID = envStr('TWILIO_ACCOUNT_SID', '');
-const TWILIO_AUTH_TOKEN = envStr('TWILIO_AUTH_TOKEN', '');
+// UX
+const MB_ACK_ENABLED = envBool("MB_ACK_ENABLED", true);
+const MB_ACK_TEXT = envStr("MB_ACK_TEXT", "מעולה, רגע...");
+const MB_REPLY_CHUNKING = envBool("MB_REPLY_CHUNKING", true);
+const MB_REPLY_CHUNK_CHARS = envNumber("MB_REPLY_CHUNK_CHARS", 70);
+
+// Audio quality
+const MB_TTS_TAIL_SILENCE_MS = envNumber("MB_TTS_TAIL_SILENCE_MS", 180);
+// NEW: prebuffer (jitter protection) — 200ms default
+const MB_AUDIO_PREBUFFER_MS = envNumber("MB_AUDIO_PREBUFFER_MS", 200);
+
+// Idle / max call (optional)
+const MB_IDLE_HANGUP_MS = envNumber("MB_IDLE_HANGUP_MS", 120000);
+const MB_MAX_CALL_MS = envNumber("MB_MAX_CALL_MS", 10 * 60 * 1000);
+
+// Twilio REST hangup optional
+const TWILIO_ACCOUNT_SID = envStr("TWILIO_ACCOUNT_SID", "");
+const TWILIO_AUTH_TOKEN = envStr("TWILIO_AUTH_TOKEN", "");
 
 // Logging
-const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase();
+const MB_LOG_LEVEL = envStr("MB_LOG_LEVEL", "info").toLowerCase();
 
 // -----------------------------
 // ElevenLabs TTS config
 // -----------------------------
-const TTS_PROVIDER = envStr('TTS_PROVIDER', 'eleven').toLowerCase();
+const TTS_PROVIDER = envStr("TTS_PROVIDER", "eleven").toLowerCase();
 
-const ELEVEN_API_KEY = envStr('ELEVEN_API_KEY', envStr('ELEVENLABS_API_KEY', ''));
-const ELEVEN_VOICE_ID = envStr('ELEVEN_VOICE_ID', envStr('VOICE_ID', ''));
-const ELEVEN_MODEL = envStr('ELEVEN_TTS_MODEL', 'eleven_v3');
-const ELEVEN_LANGUAGE = envStr('ELEVENLABS_LANGUAGE', envStr('ELEVEN_LANGUAGE', 'he'));
-const ELEVEN_OUTPUT_FORMAT = envStr('ELEVEN_OUTPUT_FORMAT', 'ulaw_8000');
+const ELEVEN_API_KEY = envStr("ELEVEN_API_KEY", envStr("ELEVENLABS_API_KEY", ""));
+const ELEVEN_VOICE_ID = envStr("ELEVEN_VOICE_ID", envStr("VOICE_ID", ""));
+const ELEVEN_MODEL = envStr("ELEVEN_TTS_MODEL", "eleven_v3");
+const ELEVEN_LANGUAGE = envStr("ELEVENLABS_LANGUAGE", envStr("ELEVEN_LANGUAGE", "he"));
+const ELEVEN_OUTPUT_FORMAT = envStr("ELEVEN_OUTPUT_FORMAT", "ulaw_8000");
 
-// Eleven v3 does NOT support optimize_streaming_latency
-const ELEVEN_OPTIMIZE_STREAMING_LATENCY = envNumber('ELEVEN_OPTIMIZE_STREAMING_LATENCY', 3);
-const ELEVEN_ENABLE_OPT_LATENCY = envBool('ELEVEN_ENABLE_OPT_LATENCY', true);
+// v3 limitation
+const ELEVEN_OPTIMIZE_STREAMING_LATENCY = envNumber("ELEVEN_OPTIMIZE_STREAMING_LATENCY", 3);
+const ELEVEN_ENABLE_OPT_LATENCY = envBool("ELEVEN_ENABLE_OPT_LATENCY", true);
 
-const ELEVEN_STABILITY = envNumber('ELEVEN_STABILITY', 0.5);
-const ELEVEN_SIMILARITY = envNumber('ELEVEN_SIMILARITY', 0.75);
-const ELEVEN_STYLE = envNumber('ELEVEN_STYLE', 0.0);
-const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
+// voice settings
+const ELEVEN_STABILITY = envNumber("ELEVEN_STABILITY", 0.5);
+const ELEVEN_SIMILARITY = envNumber("ELEVEN_SIMILARITY", 0.75);
+const ELEVEN_STYLE = envNumber("ELEVEN_STYLE", 0.0);
+const ELEVEN_SPEAKER_BOOST = envBool("ELEVEN_SPEAKER_BOOST", true);
+
+const ELEVEN_FORCE_STREAM_ENDPOINT = envBool("ELEVEN_FORCE_STREAM_ENDPOINT", true);
+const ELEVEN_STRIP_WAV_HEADER = envBool("ELEVEN_STRIP_WAV_HEADER", true);
 
 // Cached opening
-const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
+const MB_CACHE_OPENING_AUDIO = envBool("MB_CACHE_OPENING_AUDIO", true);
 
-// Chunking + ACK
-// ✅ Quality: max 2 chunks
-const MB_CHUNK_FIRST_MAX_CHARS = envNumber('MB_CHUNK_FIRST_MAX_CHARS', 70);
-const MB_CHUNK_MIN_CHARS = envNumber('MB_CHUNK_MIN_CHARS', 18);
-// ✅ Insert real silence between chunks (instead of "gap")
-const MB_CHUNK_SILENCE_MS = envNumber('MB_CHUNK_SILENCE_MS', 120);
-
-const MB_ACK_ENABLED = envBool('MB_ACK_ENABLED', true);
-const MB_ACK_TEXT = envStr('MB_ACK_TEXT', 'מעולה, רגע...');
+if (!OPENAI_API_KEY) console.error("❌ Missing OPENAI_API_KEY in ENV.");
+if (TTS_PROVIDER === "eleven") {
+  if (!ELEVEN_API_KEY) console.error("❌ Missing ELEVEN_API_KEY (or ELEVENLABS_API_KEY) in ENV.");
+  if (!ELEVEN_VOICE_ID) console.error("❌ Missing VOICE_ID (or ELEVEN_VOICE_ID) in ENV.");
+}
 
 // -----------------------------
-// Logging helpers
+// Logging
 // -----------------------------
 function rank(lvl) {
-  if (lvl === 'debug') return 10;
-  if (lvl === 'info') return 20;
-  if (lvl === 'warn') return 30;
-  if (lvl === 'error') return 40;
+  if (lvl === "debug") return 10;
+  if (lvl === "info") return 20;
+  if (lvl === "warn") return 30;
+  if (lvl === "error") return 40;
   return 20;
 }
 const CUR = rank(MB_LOG_LEVEL);
-
 function log(lvl, tag, msg, extra, meta = {}) {
   if (rank(lvl) < CUR) return;
   const ts = new Date().toISOString();
-  const ridPart = meta && meta.rid ? ` { rid: '${meta.rid}' }` : '';
+  const ridPart = meta && meta.rid ? ` { rid: '${meta.rid}' }` : "";
   if (extra !== undefined) console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`, extra);
   else console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`);
 }
-const logDebug = (tag, msg, extra, meta) => log('debug', tag, msg, extra, meta);
-const logInfo  = (tag, msg, extra, meta) => log('info',  tag, msg, extra, meta);
-const logWarn  = (tag, msg, extra, meta) => log('warn',  tag, msg, extra, meta);
-const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
+const logInfo = (tag, msg, extra, meta) => log("info", tag, msg, extra, meta);
+const logWarn = (tag, msg, extra, meta) => log("warn", tag, msg, extra, meta);
+const logError = (tag, msg, extra, meta) => log("error", tag, msg, extra, meta);
+
+console.log(`[CONFIG] PORT=${PORT}`);
+console.log(`[CONFIG] PREBUFFER_MS=${MB_AUDIO_PREBUFFER_MS} TAIL_SILENCE_MS=${MB_TTS_TAIL_SILENCE_MS}`);
+console.log(`[CONFIG] CHUNKING=${MB_REPLY_CHUNKING} ACK=${MB_ACK_ENABLED} BARGE_IN=${MB_ALLOW_BARGE_IN}`);
+console.log(`[CONFIG] ELEVEN fmt=${ELEVEN_OUTPUT_FORMAT} model=${ELEVEN_MODEL} stream=${ELEVEN_FORCE_STREAM_ENDPOINT} stripWav=${ELEVEN_STRIP_WAV_HEADER}`);
 
 // -----------------------------
 // System instructions
@@ -160,147 +161,183 @@ const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים:
 1) דברו בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
-2) אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
+2) אם לא הבנתם: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
 3) תשובות קצרות 1–3 משפטים, וסיימו בשאלה שמקדמת הבנה/איסוף צורך.
 4) אל תסיימו שיחה מיוזמתכם.
 `.trim();
 
 function buildSystemInstructions() {
-  const base = (MB_GENERAL_PROMPT || '').trim();
-  const kb = (MB_BUSINESS_PROMPT || '').trim();
-
-  let instructions = '';
+  const base = (MB_GENERAL_PROMPT || "").trim();
+  const kb = (MB_BUSINESS_PROMPT || "").trim();
+  let instructions = "";
   if (base) instructions += base;
-  if (kb) instructions += (instructions ? '\n\n' : '') + kb;
-
+  if (kb) instructions += (instructions ? "\n\n" : "") + kb;
   if (!instructions) {
-    instructions = `
-אתם עוזר קולי בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
-דברו בעברית כברירת מחדל, תשובות קצרות ומקצועיות.
-`.trim();
+    instructions = `אתם עוזר קולי בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}". דברו בעברית כברירת מחדל, תשובות קצרות ומקצועיות.`;
   }
-
-  return instructions + '\n\n' + EXTRA_BEHAVIOR_RULES;
+  return instructions + "\n\n" + EXTRA_BEHAVIOR_RULES;
 }
 
 // -----------------------------
-// ulaw silence helper
-// Twilio g711_ulaw "silence" commonly is 0xFF
-// 20ms frame @ 8k = 160 bytes
+// ulaw silence helpers
 // -----------------------------
-function ulawSilence(ms) {
-  const frames = Math.max(1, Math.ceil(ms / 20));
+function ulawSilenceBytes(ms) {
+  const frames = Math.ceil(ms / 20);
   const bytes = frames * 160;
   return Buffer.alloc(bytes, 0xff);
 }
+function padTo160(buf) {
+  if (buf.length === 160) return buf;
+  if (buf.length > 160) return buf.subarray(0, 160);
+  const out = Buffer.alloc(160, 0xff);
+  buf.copy(out, 0, 0, buf.length);
+  return out;
+}
 
 // -----------------------------
-// Audio sender (20ms frames, 160 bytes ulaw)
+// Audio sender with PREBUFFER + EXACT 160 bytes frames
 // -----------------------------
 function createAudioSender(connection, meta) {
   const state = {
     streamSid: null,
     timer: null,
-    queue: [],
+    queue: [], // Buffers
+    stopped: false,
+    startedSending: false,
+    prebufferBytes: Math.max(0, Math.floor(MB_AUDIO_PREBUFFER_MS / 20) * 160),
+    queuedBytes: 0,
   };
 
   function bindStreamSid(streamSid) {
     state.streamSid = streamSid;
-    logInfo('AudioSender', 'Bound sender.streamSid', { streamSid }, meta);
+    logInfo("AudioSender", "Bound sender.streamSid", { streamSid }, meta);
     start();
   }
 
   function enqueue(buf) {
+    if (state.stopped) return;
     if (!buf || !Buffer.isBuffer(buf) || buf.length === 0) return;
     state.queue.push(buf);
+    state.queuedBytes += buf.length;
   }
 
-  function clearQueueOnly() {
+  function stop() {
+    state.stopped = true;
+    if (state.timer) clearInterval(state.timer);
+    state.timer = null;
     state.queue = [];
-  }
-
-  function clearTwilioPlayback() {
-    if (!state.streamSid) return;
-    if (connection.readyState !== WebSocket.OPEN) return;
-    try {
-      connection.send(JSON.stringify({ event: 'clear', streamSid: state.streamSid }));
-      logInfo('AudioSender', 'Sent Twilio clear event', undefined, meta);
-    } catch (e) {
-      logWarn('AudioSender', 'Failed sending clear', e, meta);
-    }
+    state.queuedBytes = 0;
   }
 
   function start() {
     if (state.timer) return;
     state.timer = setInterval(() => {
       if (!state.streamSid) return;
+      if (state.stopped) return;
       if (connection.readyState !== WebSocket.OPEN) return;
       if (state.queue.length === 0) return;
 
-      const frameSize = 160;
-      let cur = state.queue[0];
+      // PREBUFFER: wait until we have enough bytes before starting playback
+      if (!state.startedSending && state.prebufferBytes > 0) {
+        if (state.queuedBytes < state.prebufferBytes) return;
+        state.startedSending = true;
+        logInfo("AudioSender", "Prebuffer satisfied -> start sending", { prebufferBytes: state.prebufferBytes }, meta);
+      } else if (!state.startedSending) {
+        state.startedSending = true;
+      }
 
-      if (cur.length <= frameSize) {
+      // send exactly 160 bytes
+      const frameSize = 160;
+
+      let cur = state.queue[0];
+      if (cur.length === 0) {
         state.queue.shift();
-        sendFrame(cur);
+        return;
+      }
+
+      let frame;
+      if (cur.length >= frameSize) {
+        frame = cur.subarray(0, frameSize);
+        const rest = cur.subarray(frameSize);
+        state.queue[0] = rest;
+        state.queuedBytes -= frameSize;
       } else {
-        const frame = cur.subarray(0, frameSize);
-        state.queue[0] = cur.subarray(frameSize);
-        sendFrame(frame);
+        // last partial: pad to 160 to avoid artifacts
+        frame = padTo160(cur);
+        state.queue.shift();
+        state.queuedBytes -= cur.length;
+      }
+
+      try {
+        const payloadB64 = frame.toString("base64");
+        connection.send(JSON.stringify({ event: "media", streamSid: state.streamSid, media: { payload: payloadB64 } }));
+      } catch (e) {
+        logError("AudioSender", "Failed sending frame", e, meta);
       }
     }, 20);
   }
 
-  function stop() {
-    if (state.timer) clearInterval(state.timer);
-    state.timer = null;
-    state.queue = [];
-  }
-
-  function sendFrame(frameBuf) {
-    try {
-      const payloadB64 = frameBuf.toString('base64');
-      const msg = { event: 'media', streamSid: state.streamSid, media: { payload: payloadB64 } };
-      connection.send(JSON.stringify(msg));
-    } catch (e) {
-      logError('AudioSender', 'Failed sending frame', e, meta);
-    }
-  }
-
-  return { bindStreamSid, enqueue, clearQueueOnly, clearTwilioPlayback, stop };
+  return { bindStreamSid, enqueue, stop };
 }
 
 // -----------------------------
-// ElevenLabs URL builder
+// WAV stripper (if needed)
+// -----------------------------
+function stripWavIfPresent(buf, meta) {
+  try {
+    if (!ELEVEN_STRIP_WAV_HEADER) return buf;
+    if (!buf || buf.length < 16) return buf;
+    const riff = buf.toString("ascii", 0, 4);
+    const wave = buf.toString("ascii", 8, 12);
+    if (riff !== "RIFF" || wave !== "WAVE") return buf;
+
+    let i = 12;
+    while (i + 8 <= buf.length) {
+      const chunkId = buf.toString("ascii", i, i + 4);
+      const chunkSize = buf.readUInt32LE(i + 4);
+      i += 8;
+      if (chunkId === "data") {
+        const start = i;
+        const end = Math.min(i + chunkSize, buf.length);
+        const dataBuf = buf.subarray(start, end);
+        logWarn("ElevenTTS", "Stripped WAV header from Eleven audio (RIFF/WAVE detected).", { original: buf.length, data: dataBuf.length }, meta);
+        return dataBuf;
+      }
+      i += chunkSize;
+    }
+    return buf;
+  } catch (e) {
+    logWarn("ElevenTTS", "WAV strip error (kept original)", e, meta);
+    return buf;
+  }
+}
+
+// -----------------------------
+// Eleven URL (always /stream) + v3 restriction
 // -----------------------------
 function buildElevenUrl() {
-  const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}/stream`;
-  const qs = new URLSearchParams({
-    output_format: ELEVEN_OUTPUT_FORMAT,
-    language: ELEVEN_LANGUAGE,
-  });
+  const basePath = ELEVEN_FORCE_STREAM_ENDPOINT ? "/stream" : "";
+  const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}${basePath}`;
+  const qs = new URLSearchParams({ output_format: ELEVEN_OUTPUT_FORMAT, language: ELEVEN_LANGUAGE });
 
-  const isV3 = String(ELEVEN_MODEL).toLowerCase() === 'eleven_v3';
+  const isV3 = String(ELEVEN_MODEL).toLowerCase() === "eleven_v3";
   const shouldAddOpt =
     ELEVEN_ENABLE_OPT_LATENCY &&
     !isV3 &&
     Number.isFinite(ELEVEN_OPTIMIZE_STREAMING_LATENCY) &&
     ELEVEN_OPTIMIZE_STREAMING_LATENCY > 0;
 
-  if (shouldAddOpt) qs.set('optimize_streaming_latency', String(ELEVEN_OPTIMIZE_STREAMING_LATENCY));
+  if (shouldAddOpt) qs.set("optimize_streaming_latency", String(ELEVEN_OPTIMIZE_STREAMING_LATENCY));
   return `${baseUrl}?${qs.toString()}`;
 }
 
 // -----------------------------
-// ElevenLabs streaming TTS
+// Eleven streaming TTS
 // -----------------------------
-async function elevenTtsStreamToSender(text, reason, sender, meta, abortFn) {
-  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-    logError('ElevenTTS', 'Missing ELEVEN_API_KEY or VOICE_ID', undefined, meta);
-    return { ok: false };
-  }
-  const cleaned = String(text || '').trim();
-  if (!cleaned) return { ok: false };
+async function elevenTtsStreamToSender(text, reason, sender, meta) {
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return false;
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return false;
 
   const url = buildElevenUrl();
   const body = {
@@ -314,62 +351,80 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortFn) {
     },
   };
 
-  logInfo('ElevenTTS', 'TTS request', { reason, length: cleaned.length, model: ELEVEN_MODEL, lang: ELEVEN_LANGUAGE, fmt: ELEVEN_OUTPUT_FORMAT }, meta);
-
   const t0 = Date.now();
-  let firstByteMs = null;
-  let totalBytes = 0;
+  logInfo("ElevenTTS", "TTS request", { reason, length: cleaned.length, url }, meta);
 
   try {
     const res = await fetch(url, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'xi-api-key': ELEVEN_API_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'audio/*',
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/*",
       },
       body: JSON.stringify(body),
     });
 
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      logError('ElevenTTS', `HTTP ${res.status}`, txt, meta);
-      return { ok: false, status: res.status };
+      logWarn("ElevenTTS", `HTTP ${res.status}`, await res.text().catch(() => ""), meta);
+      return false;
     }
 
-    if (!res.body) {
+    // Log content-type (helps detect wrong format like mp3)
+    const ct = res.headers.get("content-type") || "";
+    logInfo("ElevenTTS", "Response headers", { contentType: ct }, meta);
+
+    if (!res.body || !res.body.getReader) {
       const arr = await res.arrayBuffer();
-      const buf = Buffer.from(arr);
+      let buf = Buffer.from(arr);
+      buf = stripWavIfPresent(buf, meta);
       sender.enqueue(buf);
-      totalBytes += buf.length;
-      const totalMs = Date.now() - t0;
-      logInfo('ElevenTTS', 'TTS done (buffered)', { firstByteMs: totalMs, totalMs, bytes: totalBytes }, meta);
-      return { ok: true, firstByteMs: totalMs, totalMs, bytes: totalBytes };
+      if (MB_TTS_TAIL_SILENCE_MS > 0) sender.enqueue(ulawSilenceBytes(MB_TTS_TAIL_SILENCE_MS));
+      return true;
     }
 
     const reader = res.body.getReader();
+    let total = 0;
+    let firstByteMs = null;
+
+    // small buffer to detect RIFF quickly
+    let head = Buffer.alloc(0);
+    let decided = false;
+
     while (true) {
-      if (abortFn && abortFn()) {
-        try { reader.cancel().catch(() => {}); } catch {}
-        logWarn('ElevenTTS', 'TTS aborted', undefined, meta);
-        return { ok: false, aborted: true };
-      }
       const { value, done } = await reader.read();
       if (done) break;
-      if (value && value.length) {
-        if (firstByteMs === null) firstByteMs = Date.now() - t0;
-        const buf = Buffer.from(value);
-        totalBytes += buf.length;
-        sender.enqueue(buf);
+      if (!value || !value.length) continue;
+
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (firstByteMs === null) firstByteMs = Date.now() - t0;
+
+      if (!decided) {
+        head = Buffer.concat([head, chunk]);
+        if (head.length >= 4096) {
+          const stripped = stripWavIfPresent(head, meta);
+          sender.enqueue(stripped);
+          decided = true;
+        }
+        continue;
       }
+
+      sender.enqueue(chunk);
     }
 
-    const totalMs = Date.now() - t0;
-    logInfo('ElevenTTS', 'TTS done', { firstByteMs, totalMs, bytes: totalBytes }, meta);
-    return { ok: true, firstByteMs, totalMs, bytes: totalBytes };
+    if (!decided && head.length) {
+      const stripped = stripWavIfPresent(head, meta);
+      sender.enqueue(stripped);
+    }
+
+    if (MB_TTS_TAIL_SILENCE_MS > 0) sender.enqueue(ulawSilenceBytes(MB_TTS_TAIL_SILENCE_MS));
+
+    logInfo("ElevenTTS", "TTS done", { firstByteMs: firstByteMs ?? (Date.now() - t0), totalMs: Date.now() - t0, bytes: total }, meta);
+    return true;
   } catch (e) {
-    logError('ElevenTTS', 'TTS error', e, meta);
-    return { ok: false, error: String(e && e.message ? e.message : e) };
+    logWarn("ElevenTTS", "TTS error", e, meta);
+    return false;
   }
 }
 
@@ -377,208 +432,144 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortFn) {
 // Cached opening audio
 // -----------------------------
 let OPENING_AUDIO_CACHE = null;
+
 async function warmupOpeningCache() {
   if (!MB_CACHE_OPENING_AUDIO) return;
-  if (TTS_PROVIDER !== 'eleven') return;
+  if (TTS_PROVIDER !== "eleven") return;
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return;
 
   try {
     const url = buildElevenUrl();
-    const text = String(MB_OPENING_SCRIPT || '').trim();
-    if (!text) return;
+    const body = {
+      text: String(MB_OPENING_SCRIPT || "").trim(),
+      model_id: ELEVEN_MODEL,
+      voice_settings: {
+        stability: ELEVEN_STABILITY,
+        similarity_boost: ELEVEN_SIMILARITY,
+        style: ELEVEN_STYLE,
+        use_speaker_boost: ELEVEN_SPEAKER_BOOST,
+      },
+    };
 
-    logInfo('Startup', 'Warming opening audio cache with ElevenLabs...', { model: ELEVEN_MODEL, lang: ELEVEN_LANGUAGE, fmt: ELEVEN_OUTPUT_FORMAT, len: text.length, url_has_opt_latency: url.includes('optimize_streaming_latency') });
+    logInfo("Startup", "Warming opening audio cache with ElevenLabs...", { url });
 
     const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVEN_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/*' },
-      body: JSON.stringify({
-        text,
-        model_id: ELEVEN_MODEL,
-        voice_settings: {
-          stability: ELEVEN_STABILITY,
-          similarity_boost: ELEVEN_SIMILARITY,
-          style: ELEVEN_STYLE,
-          use_speaker_boost: ELEVEN_SPEAKER_BOOST,
-        },
-      }),
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/*",
+      },
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      logWarn('Startup', `Opening cache warmup failed HTTP ${res.status}`, txt);
+      logWarn("Startup", `Opening cache warmup failed HTTP ${res.status}`, await res.text().catch(() => ""));
       return;
     }
 
     const arr = await res.arrayBuffer();
-    OPENING_AUDIO_CACHE = Buffer.from(arr);
-    logInfo('Startup', `Opening audio cached. bytes=${OPENING_AUDIO_CACHE.length}`);
+    let buf = Buffer.from(arr);
+    buf = stripWavIfPresent(buf);
+    if (MB_TTS_TAIL_SILENCE_MS > 0) buf = Buffer.concat([buf, ulawSilenceBytes(MB_TTS_TAIL_SILENCE_MS)]);
+    OPENING_AUDIO_CACHE = buf;
+    logInfo("Startup", `Opening audio cached. bytes=${OPENING_AUDIO_CACHE.length}`);
   } catch (e) {
-    logWarn('Startup', 'Opening cache warmup error', e);
+    logWarn("Startup", "Opening cache warmup error", e);
   }
 }
 
 // -----------------------------
-// LLM: OpenAI Responses
+// LLM: IVRIT -> fallback OpenAI Responses
 // -----------------------------
-function extractOpenAiText(respJson) {
+async function callIvritLLM(userText, meta) {
+  if (!IVRIT_LLM_URL) return null;
   try {
-    const output = respJson && respJson.output;
-    if (Array.isArray(output)) {
-      let acc = '';
-      for (const item of output) {
-        const content = item && item.content;
-        if (Array.isArray(content)) {
-          for (const c of content) {
-            if (c && (c.type === 'output_text' || c.type === 'text') && typeof c.text === 'string') acc += c.text;
+    const res = await fetch(IVRIT_LLM_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: userText }),
+    });
+    if (!res.ok) {
+      logWarn("IVRIT", `HTTP ${res.status}`, await res.text().catch(() => ""), meta);
+      return null;
+    }
+    const j = await res.json().catch(() => null);
+    const out = j && typeof j.text === "string" ? j.text.trim() : "";
+    return out || null;
+  } catch (e) {
+    logWarn("IVRIT", "Call error", e, meta);
+    return null;
+  }
+}
+
+async function callOpenAiResponses(systemInstructions, userText, meta) {
+  try {
+    const res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_LLM_MODEL,
+        input: [
+          { role: "system", content: systemInstructions },
+          { role: "user", content: userText },
+        ],
+        max_output_tokens: 220,
+      }),
+    });
+
+    if (!res.ok) {
+      logWarn("LLM", `OpenAI HTTP ${res.status}`, await res.text().catch(() => ""), meta);
+      return "לֹא הִצְלַחְתִּי לַעֲנוֹת רֶגַע. אֶפְשָׁר לְנַסּוֹת שׁוּב?";
+    }
+
+    const j = await res.json();
+    let text = "";
+    if (j.output && Array.isArray(j.output)) {
+      for (const item of j.output) {
+        if (item?.content && Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (c?.type === "output_text" && typeof c.text === "string") text += c.text;
           }
         }
       }
-      return acc.trim();
     }
-  } catch {}
-  try { if (respJson && typeof respJson.output_text === 'string') return respJson.output_text.trim(); } catch {}
-  return '';
-}
-
-async function callOpenAiResponses({ system, userText, meta }) {
-  const url = 'https://api.openai.com/v1/responses';
-  const body = {
-    model: OPENAI_LLM_MODEL,
-    input: [
-      { role: 'system', content: [{ type: 'input_text', text: system }] },
-      { role: 'user', content: [{ type: 'input_text', text: userText }] },
-    ],
-  };
-
-  const t0 = Date.now();
-  logInfo('LLM', 'Calling OpenAI Responses', { model: OPENAI_LLM_MODEL }, meta);
-
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), OPENAI_LLM_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-
-    const ms = Date.now() - t0;
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      logWarn('LLM', `OpenAI HTTP ${res.status}`, { ms, body: txt }, meta);
-      return { ok: false, ms, text: null };
-    }
-
-    const json = await res.json();
-    const text = extractOpenAiText(json);
-    logInfo('LLM', 'OpenAI ok', { ms, len: text ? text.length : 0 }, meta);
-    return { ok: true, ms, text: text || '' };
+    text = String(text || "").trim();
+    return text || "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?";
   } catch (e) {
-    const ms = Date.now() - t0;
-    logWarn('LLM', 'OpenAI error', { ms, error: String(e && e.message ? e.message : e) }, meta);
-    return { ok: false, ms, text: null };
-  } finally {
-    clearTimeout(to);
+    logWarn("LLM", "OpenAI call error", e, meta);
+    return "לֹא הִצְלַחְתִּי לַעֲנוֹת רֶגַע. אֶפְשָׁר לְנַסּוֹת שׁוּב?";
   }
 }
 
-// -----------------------------
-// LLM: IVRIT (fallback)
-// -----------------------------
-async function callIvrit({ system, userText, meta }) {
-  const t0 = Date.now();
-  logInfo('LLM', 'Calling IVRIT', { url: IVRIT_LLM_URL, method: IVRIT_LLM_METHOD }, meta);
-
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), IVRIT_LLM_TIMEOUT_MS);
-
-  try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (IVRIT_LLM_HEADER_KEY && IVRIT_LLM_HEADER_VALUE) headers[IVRIT_LLM_HEADER_KEY] = IVRIT_LLM_HEADER_VALUE;
-
-    const res = await fetch(IVRIT_LLM_URL, {
-      method: IVRIT_LLM_METHOD,
-      headers,
-      body: JSON.stringify({ system, text: userText }),
-      signal: ctrl.signal,
-    });
-
-    const ms = Date.now() - t0;
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      logWarn('LLM', `IVRIT HTTP ${res.status}`, { ms, body: txt }, meta);
-      return { ok: false, ms, text: null };
-    }
-
-    const json = await res.json().catch(() => null);
-    const text = (json && (json.text || json.output || json.answer)) ? String(json.text || json.output || json.answer) : '';
-    logInfo('LLM', 'IVRIT ok', { ms, len: text.length }, meta);
-    return { ok: true, ms, text: text.trim() };
-  } catch (e) {
-    const ms = Date.now() - t0;
-    logWarn('LLM', 'IVRIT error', { ms, error: String(e && e.message ? e.message : e) }, meta);
-    return { ok: false, ms, text: null };
-  } finally {
-    clearTimeout(to);
+function splitIntoChunks(text, maxChars) {
+  const s = String(text || "").trim();
+  if (!s) return [];
+  const chunks = [];
+  let cur = "";
+  const tokens = s.split(/\s+/);
+  for (const t of tokens) {
+    if (!cur) cur = t;
+    else if ((cur + " " + t).length <= maxChars) cur += " " + t;
+    else { chunks.push(cur); cur = t; }
   }
+  if (cur) chunks.push(cur);
+  return chunks;
 }
 
 // -----------------------------
-// ✅ Quality split: MAX 2 chunks
-// First chunk: short intro (<= MB_CHUNK_FIRST_MAX_CHARS) based on punctuation.
-// Second chunk: rest (single TTS call).
-// -----------------------------
-function splitToTwoChunks(text) {
-  const t = String(text || '').replace(/\s+/g, ' ').trim();
-  if (!t) return [];
-
-  // Try split at first sentence end near the limit
-  const limit = MB_CHUNK_FIRST_MAX_CHARS;
-  if (t.length <= limit) return [t];
-
-  const candidates = [];
-  const regex = /[.!?\u05F3\u05F4\u061F]/g;
-  let m;
-  while ((m = regex.exec(t)) !== null) {
-    const idx = m.index + 1;
-    if (idx >= MB_CHUNK_MIN_CHARS && idx <= limit + 20) candidates.push(idx);
-  }
-
-  let cut = null;
-  if (candidates.length) {
-    // choose candidate closest to limit
-    cut = candidates.reduce((best, x) => (Math.abs(x - limit) < Math.abs(best - limit) ? x : best), candidates[0]);
-  } else {
-    // fallback: cut at last space before limit
-    const space = t.lastIndexOf(' ', limit);
-    cut = space > MB_CHUNK_MIN_CHARS ? space : limit;
-  }
-
-  const first = t.slice(0, cut).trim();
-  const rest = t.slice(cut).trim();
-
-  if (!rest) return [first];
-  return [first, rest];
-}
-
-// -----------------------------
-// Express & HTTP
+// Express & HTTP server
 // -----------------------------
 const app = express();
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-app.get('/', (req, res) => res.status(200).send('OK'));
+app.get("/", (req, res) => res.status(200).send("OK"));
 
-app.post('/twilio-voice', (req, res) => {
-  const host = (DOMAIN || req.headers.host || '').replace(/^https?:\/\//, '');
+app.post("/twilio-voice", (req, res) => {
+  const host = (DOMAIN || req.headers.host || "").replace(/^https?:\/\//, "");
   const wsUrl = MB_TWILIO_STREAM_URL || `wss://${host}/twilio-media-stream`;
-  const caller = req.body.From || '';
+  const caller = req.body.From || "";
 
   const twiml = `
 <?xml version="1.0" encoding="UTF-8"?>
@@ -590,79 +581,29 @@ app.post('/twilio-voice', (req, res) => {
   </Connect>
 </Response>`.trim();
 
-  res.type('text/xml').send(twiml);
+  res.type("text/xml").send(twiml);
 });
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
-
-// -----------------------------
-// Twilio hangup (optional)
-// -----------------------------
-async function hangupTwilioCall(callSid, meta) {
-  if (!callSid) return;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
-
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
-    const body = new URLSearchParams({ Status: 'completed' });
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body,
-    });
-
-    if (!res.ok) {
-      logWarn('Call', `Twilio hangup HTTP ${res.status}`, await res.text().catch(() => ''), meta);
-    } else {
-      logInfo('Call', 'Twilio call hangup requested successfully.', undefined, meta);
-    }
-  } catch (e) {
-    logWarn('Call', 'Twilio hangup error', e, meta);
-  }
-}
+const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 // -----------------------------
 // Per-call handler
 // -----------------------------
-wss.on('connection', (connection) => {
-  const meta = { rid: rid() };
-  logInfo('Call', 'New Twilio Media Stream connection established.', undefined, meta);
-
-  if (!OPENAI_API_KEY) {
-    logError('Call', 'OPENAI_API_KEY missing – closing.', undefined, meta);
-    try { connection.close(); } catch {}
-    return;
-  }
+wss.on("connection", (connection) => {
+  const meta = { rid: makeRid() };
+  logInfo("Call", "New Twilio Media Stream connection established.", undefined, meta);
 
   const sender = createAudioSender(connection, meta);
 
-  let streamSid = null;
-  let callSid = null;
   let callEnded = false;
-
   let lastMediaTs = Date.now();
-  let idleInterval = null;
-  let maxCallTimeout = null;
-
-  // VAD state
-  let userIsSpeaking = false;
-
-  // Speech generation control
-  let speechGen = 0;
   let botSpeaking = false;
   let noListenUntilTs = 0;
 
-  // LLM turn queue
-  let turnCounter = 0;
-  let llmBusy = false;
-  let pendingTurn = null; // newest only
-
   const conversationLog = [];
+  let idleInterval = null;
+  let maxCallTimeout = null;
 
   function cleanupTimers() {
     if (idleInterval) clearInterval(idleInterval);
@@ -674,310 +615,170 @@ wss.on('connection', (connection) => {
   function endCall(reason) {
     if (callEnded) return;
     callEnded = true;
-
     cleanupTimers();
-    logInfo('Call', `endCall reason="${reason}"`, undefined, meta);
-    logInfo('Call', 'Final conversation log:', conversationLog, meta);
-
+    logInfo("Call", `endCall reason="${reason}"`, undefined, meta);
+    logInfo("Call", "Final conversation log:", conversationLog, meta);
     try { sender.stop(); } catch {}
-    if (callSid) hangupTwilioCall(callSid, meta).catch(() => {});
     try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
     try { if (connection.readyState === WebSocket.OPEN) connection.close(); } catch {}
   }
 
-  function shouldAbortSpeech(myGen) {
-    if (callEnded) return true;
-    if (myGen !== speechGen) return true;
-    if (MB_ALLOW_BARGE_IN && userIsSpeaking) return true;
-    return false;
-  }
-
-  async function speakText(text, reason, myGen) {
-    const t = String(text || '').trim();
-    if (!t) return;
-    if (shouldAbortSpeech(myGen)) return;
-
-    botSpeaking = true;
-    const r = await elevenTtsStreamToSender(t, reason, sender, meta, () => shouldAbortSpeech(myGen));
-    botSpeaking = false;
-
-    noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
-    return r;
-  }
-
-  async function speakTwoChunks(text, baseReason, myGen) {
-    const reply = String(text || '').trim();
-    if (!reply) return;
-
-    const chunks = splitToTwoChunks(reply);
-    logInfo('Chunking', 'Split reply (max2)', { chunks: chunks.length, firstMax: MB_CHUNK_FIRST_MAX_CHARS, silenceMs: MB_CHUNK_SILENCE_MS }, meta);
-
-    // Chunk 1
-    await speakText(chunks[0], `${baseReason}:part1`, myGen);
-
-    if (chunks.length === 1) return;
-
-    // ✅ Add real ulaw silence between parts (prevents “pop” perception)
-    sender.enqueue(ulawSilence(MB_CHUNK_SILENCE_MS));
-
-    // Chunk 2 (single call for the rest -> much cleaner)
-    await speakText(chunks[1], `${baseReason}:part2`, myGen);
-  }
-
-  async function runLlmForTurn(turnId, userText) {
-    const t = String(userText || '').trim();
-    if (!t) return;
-
-    llmBusy = true;
-    const myGen = ++speechGen;
-
-    conversationLog.push({ from: 'user', text: t });
-    logInfo('User', t, undefined, meta);
-
-    if (MB_ACK_ENABLED && MB_ACK_TEXT) {
-      conversationLog.push({ from: 'bot', text: MB_ACK_TEXT });
-      logInfo('ACK', 'Speaking immediate ack', { text: MB_ACK_TEXT }, meta);
-      await speakText(MB_ACK_TEXT, 'ack', myGen);
-    }
-
-    const system = buildSystemInstructions();
-
-    let llmRes;
-    if (IVRIT_LLM_URL) {
-      llmRes = await callIvrit({ system, userText: t, meta });
-      if (!llmRes.ok) {
-        logWarn('LLM', 'IVRIT failed -> fallback OpenAI', undefined, meta);
-        llmRes = await callOpenAiResponses({ system, userText: t, meta });
-      }
-    } else {
-      llmRes = await callOpenAiResponses({ system, userText: t, meta });
-    }
-
-    if (pendingTurn && pendingTurn.turnId > turnId) {
-      logWarn('LLM', 'Newer user turn exists -> skip old reply', { oldTurn: turnId, newTurn: pendingTurn.turnId }, meta);
-      llmBusy = false;
-      return;
-    }
-
-    const reply = (llmRes && llmRes.ok && llmRes.text) ? String(llmRes.text).trim() : '';
-    if (!reply) {
-      const fallback = 'לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?';
-      conversationLog.push({ from: 'bot', text: fallback });
-      logInfo('Bot', fallback, undefined, meta);
-      await speakTwoChunks(fallback, 'fallback', myGen);
-      llmBusy = false;
-      return;
-    }
-
-    conversationLog.push({ from: 'bot', text: reply });
-    logInfo('Bot', reply, undefined, meta);
-
-    await speakTwoChunks(reply, 'llm_reply', myGen);
-
-    llmBusy = false;
-  }
-
-  function enqueueTurn(text) {
-    turnCounter++;
-    const turnId = turnCounter;
-
-    if (llmBusy) {
-      pendingTurn = { turnId, text };
-      logInfo('LLM', 'Queued newer user turn (LLM busy)', { turnId, textLen: text.length }, meta);
-      return;
-    }
-
-    pendingTurn = null;
-    runLlmForTurn(turnId, text).then(() => {
-      if (!callEnded && pendingTurn && !llmBusy) {
-        const pt = pendingTurn;
-        pendingTurn = null;
-        runLlmForTurn(pt.turnId, pt.text).catch((e) => logWarn('LLM', 'runLlmForTurn error (pending)', e, meta));
-      }
-    }).catch((e) => {
-      llmBusy = false;
-      logWarn('LLM', 'runLlmForTurn error', e, meta);
-    });
-  }
-
-  // ---- OpenAI Realtime WS (VAD + transcription)
+  // OpenAI Realtime WS (transcription only)
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
-    }
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
-  openAiWs.on('open', () => {
-    logInfo('Call', 'Connected to OpenAI Realtime API.', undefined, meta);
-
+  openAiWs.on("open", () => {
+    logInfo("Call", "Connected to OpenAI Realtime API.", undefined, meta);
     openAiWs.send(JSON.stringify({
-      type: 'session.update',
+      type: "session.update",
       session: {
         model: OPENAI_REALTIME_MODEL,
-        modalities: ['text'],
-        input_audio_format: 'g711_ulaw',
-        input_audio_transcription: { model: 'whisper-1' },
+        modalities: ["text", "audio"],
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: { model: "whisper-1" },
         turn_detection: {
-          type: 'server_vad',
+          type: "server_vad",
           threshold: MB_VAD_THRESHOLD,
           silence_duration_ms: MB_VAD_SILENCE_MS,
-          prefix_padding_ms: MB_VAD_PREFIX_MS,
+          prefix_padding_ms: MB_VAD_PREFIX_MS
         },
-        instructions: buildSystemInstructions(),
-      },
+        instructions: buildSystemInstructions()
+      }
     }));
   });
 
-  openAiWs.on('close', () => {
-    logInfo('Call', 'OpenAI WS closed.', undefined, meta);
-    if (!callEnded) endCall('openai_ws_closed');
-  });
+  openAiWs.on("close", () => { if (!callEnded) endCall("openai_ws_closed"); });
+  openAiWs.on("error", (e) => { logError("Call", "OpenAI WS error", e, meta); if (!callEnded) endCall("openai_ws_error"); });
 
-  openAiWs.on('error', (err) => {
-    logError('Call', 'OpenAI WS error', err, meta);
-    if (!callEnded) endCall('openai_ws_error');
-  });
-
-  let lastTranscript = '';
+  let llmBusy = false;
+  let lastTranscript = "";
   let lastTranscriptAt = 0;
 
-  openAiWs.on('message', (data) => {
+  async function speakReply(text) {
+    const reply = String(text || "").trim();
+    if (!reply) return;
+    conversationLog.push({ from: "bot", text: reply });
+
+    botSpeaking = true;
+
+    if (MB_REPLY_CHUNKING) {
+      const chunks = splitIntoChunks(reply, MB_REPLY_CHUNK_CHARS);
+      for (let i = 0; i < chunks.length; i++) {
+        await elevenTtsStreamToSender(chunks[i], `llm_reply:chunk_${i + 1}/${chunks.length}`, sender, meta);
+      }
+    } else {
+      await elevenTtsStreamToSender(reply, "llm_reply", sender, meta);
+    }
+
+    botSpeaking = false;
+    noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+  }
+
+  async function handleUserText(t) {
+    const text = String(t || "").trim();
+    if (!text) return;
+
+    const now = Date.now();
+    if (text === lastTranscript && now - lastTranscriptAt < 800) return;
+    lastTranscript = text;
+    lastTranscriptAt = now;
+
+    conversationLog.push({ from: "user", text });
+    logInfo("User", text, undefined, meta);
+
+    if (!MB_ALLOW_BARGE_IN && (botSpeaking || now < noListenUntilTs)) return;
+    if (llmBusy) return;
+
+    llmBusy = true;
+
+    if (MB_ACK_ENABLED) {
+      botSpeaking = true;
+      conversationLog.push({ from: "bot", text: MB_ACK_TEXT });
+      await elevenTtsStreamToSender(MB_ACK_TEXT, "ack", sender, meta);
+      botSpeaking = false;
+      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+    }
+
+    let reply = null;
+    if (IVRIT_LLM_URL) reply = await callIvritLLM(text, meta);
+    if (!reply) reply = await callOpenAiResponses(buildSystemInstructions(), text, meta);
+
+    await speakReply(reply);
+    llmBusy = false;
+  }
+
+  openAiWs.on("message", async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
-
-    if (msg.type === 'input_audio_buffer.speech_started') {
-      userIsSpeaking = true;
-      logDebug('VAD', 'speech_started', undefined, meta);
-
-      if (MB_ALLOW_BARGE_IN && botSpeaking) {
-        speechGen++;
-        sender.clearQueueOnly();
-        sender.clearTwilioPlayback();
-        logInfo('Barge', 'User interrupted -> cleared playback', undefined, meta);
-      }
-      return;
-    }
-
-    if (msg.type === 'input_audio_buffer.speech_stopped') {
-      userIsSpeaking = false;
-      logDebug('VAD', 'speech_stopped', undefined, meta);
-      return;
-    }
-
-    if (msg.type === 'conversation.item.input_audio_transcription.completed') {
-      const t = String(msg.transcript || '').trim();
-      if (!t) return;
-
-      const now = Date.now();
-      if (t === lastTranscript && (now - lastTranscriptAt) < 800) return;
-      lastTranscript = t;
-      lastTranscriptAt = now;
-
-      enqueueTurn(t);
-      return;
-    }
-
-    if (msg.type === 'error') {
-      logWarn('OpenAI', 'Realtime error', msg.error || msg, meta);
-      return;
+    if (msg.type === "conversation.item.input_audio_transcription.completed") {
+      await handleUserText(msg.transcript || "");
     }
   });
 
-  // ---- Twilio Media Stream handlers
-  connection.on('message', async (data) => {
+  connection.on("message", async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    if (msg.event === 'start') {
-      streamSid = msg.start?.streamSid || null;
-      callSid = msg.start?.callSid || null;
-
+    if (msg.event === "start") {
+      const streamSid = msg.start?.streamSid || null;
       sender.bindStreamSid(streamSid);
       lastMediaTs = Date.now();
 
-      logInfo('Call', `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}`, undefined, meta);
+      conversationLog.push({ from: "bot", text: MB_OPENING_SCRIPT });
+      botSpeaking = true;
 
-      // Opening
-      conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
-
-      if (TTS_PROVIDER === 'eleven') {
-        if (OPENING_AUDIO_CACHE && OPENING_AUDIO_CACHE.length) {
-          logInfo('Opening', 'Playing cached opening', { bytes: OPENING_AUDIO_CACHE.length }, meta);
-          sender.enqueue(Buffer.from(OPENING_AUDIO_CACHE));
-        } else {
-          logInfo('Opening', 'No cache; streaming opening now', undefined, meta);
-          await elevenTtsStreamToSender(MB_OPENING_SCRIPT, 'opening', sender, meta);
-        }
+      if (OPENING_AUDIO_CACHE && OPENING_AUDIO_CACHE.length) {
+        sender.enqueue(Buffer.from(OPENING_AUDIO_CACHE));
+      } else {
+        await elevenTtsStreamToSender(MB_OPENING_SCRIPT, "opening_greeting", sender, meta);
       }
 
-      // Idle watchdog
-      if (idleInterval) clearInterval(idleInterval);
+      botSpeaking = false;
+      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+
       idleInterval = setInterval(() => {
-        if (callEnded) {
-          clearInterval(idleInterval);
-          idleInterval = null;
-          return;
-        }
         const since = Date.now() - lastMediaTs;
-        if (since > MB_IDLE_HANGUP_MS) {
-          logInfo('Call', 'Idle hangup.', { sinceMs: since }, meta);
-          endCall('idle_timeout');
-        }
+        if (since > MB_IDLE_HANGUP_MS) endCall("idle_timeout");
       }, 1000);
 
-      // Max call duration
       if (MB_MAX_CALL_MS > 0) {
-        if (maxCallTimeout) clearTimeout(maxCallTimeout);
-        maxCallTimeout = setTimeout(() => {
-          if (!callEnded) endCall('max_call_duration');
-        }, MB_MAX_CALL_MS);
+        maxCallTimeout = setTimeout(() => endCall("max_call_duration"), MB_MAX_CALL_MS);
       }
 
       return;
     }
 
-    if (msg.event === 'media') {
+    if (msg.event === "media") {
       lastMediaTs = Date.now();
       const payload = msg.media?.payload;
       if (!payload) return;
       if (openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
+      if (!MB_ALLOW_BARGE_IN && (botSpeaking || now < noListenUntilTs)) return;
 
-      // If barge-in disabled, ignore input while bot speaking/tail (to avoid echo triggers)
-      if (!MB_ALLOW_BARGE_IN) {
-        if (botSpeaking || now < noListenUntilTs) return;
-      }
-
-      openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
       return;
     }
 
-    if (msg.event === 'stop') {
-      logInfo('Call', 'Twilio stream stopped.', undefined, meta);
-      if (!callEnded) endCall('twilio_stop');
-      return;
+    if (msg.event === "stop") {
+      endCall("twilio_stop");
     }
   });
 
-  connection.on('close', () => {
-    logInfo('Call', 'Twilio WS closed.', undefined, meta);
-    if (!callEnded) endCall('twilio_ws_closed');
-  });
-
-  connection.on('error', (err) => {
-    logError('Call', 'Twilio WS error', err, meta);
-    if (!callEnded) endCall('twilio_ws_error');
-  });
+  connection.on("close", () => { if (!callEnded) endCall("twilio_ws_closed"); });
+  connection.on("error", (e) => { logError("Call", "Twilio WS error", e, meta); if (!callEnded) endCall("twilio_ws_error"); });
 });
 
 // -----------------------------
-// Start server
+// Start
 // -----------------------------
+process.on("uncaughtException", (e) => console.error("[FATAL] uncaughtException", e));
+process.on("unhandledRejection", (e) => console.error("[FATAL] unhandledRejection", e));
+
 server.listen(PORT, async () => {
   console.log(`✅ BluBinet Realtime Voice Bot running on port ${PORT} (TTS_PROVIDER=${TTS_PROVIDER})`);
   await warmupOpeningCache();
