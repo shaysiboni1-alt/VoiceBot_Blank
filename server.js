@@ -6,17 +6,19 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+// הגדרות מה-ENV
 const VOICE_NAME = process.env.MB_VOICE_NAME || 'Aoede'; 
 const BOT_NAME = process.env.MB_BOT_NAME || 'נטע';
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
 
 const SYSTEM_INSTRUCTIONS = `
-You are an AI assistant named ${BOT_NAME} for ${BUSINESS_NAME}.
-Respond in the language the user speaks to you. Keep it short.
+את נציגה בשם ${BOT_NAME} עבור ${BUSINESS_NAME}.
+עני בעברית בלבד בצורה קצרה (1-2 משפטים).
+תמכי גם באנגלית, רוסית וערבית אם פונים אלייך בשפות אלו.
 `.trim();
 
 const app = express();
-app.get('/', (req, res) => res.send('BluBinet is Up'));
+app.get('/', (req, res) => res.send('BluBinet Gemini 2.0 Live is Running'));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
@@ -27,42 +29,29 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
-        // ניסיון עם ה-URL המקוצר והישיר ביותר
-        const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
+        // הכתובת המדויקת שעובדת עם מפתחות AI Studio בגרסה 2.0
+        const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
         
         geminiWs = new WebSocket(url);
 
         geminiWs.on('open', () => {
             console.log('Gemini: Socket Opened');
-            
-            // הודעת SETUP מינימלית
-            const setupMessage = {
+            const setup = {
                 setup: {
-                    model: "models/gemini-2.0-flash-exp"
+                    model: "models/gemini-2.0-flash-exp", // המודל שמופיע אצלך ב-Playground
+                    generation_config: { response_modalities: ["audio"] },
+                    speech_config: {
+                        voice_config: { prebuilt_voice_config: { voice_name: VOICE_NAME } }
+                    },
+                    system_instruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] }
                 }
             };
-            geminiWs.send(JSON.stringify(setupMessage));
+            geminiWs.send(JSON.stringify(setup));
         });
 
         geminiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
-                
-                // אם קיבלנו אישור SETUP, נשלח את הקונפיגורציה
-                if (response.setupComplete) {
-                    console.log('Gemini: Setup Complete');
-                    const configUpdate = {
-                        client_content: {
-                            turns: [{
-                                role: "user",
-                                parts: [{ text: SYSTEM_INSTRUCTIONS }]
-                            }],
-                            turn_complete: true
-                        }
-                    };
-                    geminiWs.send(JSON.stringify(configUpdate));
-                }
-
                 if (response.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                     const audioBase64 = response.serverContent.modelTurn.parts[0].inlineData.data;
                     if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -73,18 +62,10 @@ wss.on('connection', (ws) => {
                         }));
                     }
                 }
-            } catch (err) {
-                console.error("Gemini Msg Error:", err);
-            }
+            } catch (err) { console.error("Error parsing Gemini message"); }
         });
 
-        geminiWs.on('error', (error) => {
-            console.error('Gemini Error:', error.message);
-        });
-
-        geminiWs.on('close', (code) => {
-            console.log('Gemini Closed:', code);
-        });
+        geminiWs.on('error', (err) => console.error('Gemini Error:', err.message));
     };
 
     connectToGemini();
@@ -94,22 +75,19 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(message);
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log('Twilio Started:', streamSid);
+                console.log('Twilio Stream Started:', streamSid);
             }
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
-                const audioMessage = {
+                geminiWs.send(JSON.stringify({
                     realtime_input: {
                         media_chunks: [{
                             data: msg.media.payload,
                             mime_type: "audio/mulaw"
                         }]
                     }
-                };
-                geminiWs.send(JSON.stringify(audioMessage));
+                }));
             }
-        } catch (err) {
-            console.error("Twilio Msg Error:", err);
-        }
+        } catch (e) { }
     });
 
     ws.on('close', () => {
@@ -118,4 +96,4 @@ wss.on('connection', (ws) => {
     });
 });
 
-server.listen(PORT, () => console.log(`Running on ${PORT}`));
+server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
