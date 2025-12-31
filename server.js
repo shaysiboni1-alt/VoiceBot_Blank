@@ -1,21 +1,25 @@
 /**
- * BluBinet Realtime – Twilio Media Streams <-> Gemini Live (WebSocket)
+ * BluBinet Realtime – Twilio Media Streams <-> Gemini Live (WebSocket, v1beta)
  *
- * Fixes:
- * - Correct Gemini Live endpoint (v1beta)
- * - Correct message casing: generationConfig / speechConfig / realtimeInput / audio / mimeType
- * - Audio transcoding:
- *   Twilio => 8k μ-law (base64) -> PCM16 8k -> upsample to PCM16 16k -> Gemini
- *   Gemini => PCM16 24k (base64) -> downsample to PCM16 8k -> μ-law 8k -> Twilio
+ * Fixes / Features:
+ * - v1beta WS endpoint
+ * - systemInstruction is Content (parts[]) not string (fixes 1007)
+ * - Bot speaks immediately: send clientContent with turnComplete right after setupComplete
+ * - "No interruption" (no barge-in): realtimeInputConfig.activityHandling = NO_INTERRUPTION
+ * - Short answers + low latency generation config
+ * - Optional input/output audio transcription for logs
+ * - Lead webhook on call end
  *
  * ENV:
- * - PORT (Render)
+ * - PORT
  * - GEMINI_API_KEY (required)
  * - MB_BOT_NAME (default: נטע)
  * - MB_BUSINESS_NAME (default: BluBinet)
+ * - MB_OPENING_TEXT (optional)  // what the bot says immediately
  * - MAKE_WEBHOOK_URL or MB_WEBHOOK_URL (optional)
- * - MB_GEMINI_MODEL (optional, default below)
- * - MB_GEMINI_VOICE (optional, default: Aoede)
+ * - MB_GEMINI_MODEL (optional)  // default below
+ * - MB_GEMINI_VOICE (optional)  // default: Aoede
+ * - MB_LANGUAGES (optional)     // e.g. "he,en,ru"
  */
 
 require("dotenv").config();
@@ -36,10 +40,26 @@ const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || process.env.MB_WEBHOOK_URL || "";
 
-const GEMINI_MODEL = process.env.MB_GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
+const GEMINI_MODEL =
+  process.env.MB_GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_VOICE = process.env.MB_GEMINI_VOICE || "Aoede";
 
-const SYSTEM_INSTRUCTIONS = `את נציגה בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}". עני בעברית בלבד ובקצרה (1–2 משפטים). אל תברכי שוב.`;
+const MB_LANGUAGES = (process.env.MB_LANGUAGES || "he").split(",").map(s => s.trim()).filter(Boolean);
+
+// פתיח מיידי (אפשר לשלוט ב-ENV)
+const OPENING_TEXT =
+  process.env.MB_OPENING_TEXT ||
+  `שָׁלוֹם, הִגַּעְתֶּם לְ־${BUSINESS_NAME}. מְדַבֶּרֶת ${BOT_NAME}. אֵיךְ אֶפְשָׁר לַעֲזוֹר?`;
+
+const SYSTEM_INSTRUCTIONS = `
+את נציגה בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
+כללים:
+- דברי בעברית כברירת מחדל, תשובות קצרות (1–2 משפטים).
+- אל תחזרי על ברכת פתיחה שכבר נאמרה.
+- אל תקטעי את הלקוח. המתיני שיסיים ואז עני.
+- אם הלקוח עובר לאנגלית/רוסית, מותר לענות בשפה שלו. השפות המותרות: ${MB_LANGUAGES.join(", ")}.
+- אם חסר מידע כדי לענות, שאלי שאלה אחת קצרה בלבד.
+`.trim();
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -48,7 +68,7 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (req, res) => res.send("BluBinet Status: Online"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Twilio Voice webhook -> returns TwiML that connects Media Stream to our WS
+// Twilio Voice webhook (TwiML -> Media Stream)
 app.post("/twilio-voice", (req, res) => {
   const host = req.headers.host;
   res.type("text/xml").send(
@@ -67,22 +87,18 @@ const server = http.createServer(app);
 // μ-law (G.711) helpers
 // =====================
 function mulawDecodeSample(muLawByte) {
-  // muLawByte: 0..255
   let mu = (~muLawByte) & 0xff;
   let sign = (mu & 0x80) ? -1 : 1;
   let exponent = (mu >> 4) & 0x07;
   let mantissa = mu & 0x0f;
   let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
-  // Bias 33 per μ-law
   let sample = sign * (magnitude - 33);
-  // clamp 16-bit
   if (sample > 32767) sample = 32767;
   if (sample < -32768) sample = -32768;
   return sample;
 }
 
 function mulawEncodeSample(pcm16) {
-  // pcm16: signed 16-bit
   const BIAS = 33;
   let sign = 0;
   let sample = pcm16;
@@ -96,7 +112,6 @@ function mulawEncodeSample(pcm16) {
   sample = sample + BIAS;
   if (sample > 0x7fff) sample = 0x7fff;
 
-  // Determine exponent and mantissa
   let exponent = 7;
   for (let exp = 0; exp < 8; exp++) {
     if (sample <= (0x1f << (exp + 3))) {
@@ -109,26 +124,24 @@ function mulawEncodeSample(pcm16) {
   return mu;
 }
 
-function base64ToBuffer(b64) {
+function b64ToBuf(b64) {
   return Buffer.from(b64, "base64");
 }
-
-function bufferToBase64(buf) {
+function bufToB64(buf) {
   return Buffer.from(buf).toString("base64");
 }
 
-// Convert Twilio μ-law base64 (8k) -> PCM16 buffer @8k
+// Twilio μ-law b64 (8k) -> PCM16 buffer @8k
 function mulawB64ToPcm16_8k(mulawB64) {
-  const muBuf = base64ToBuffer(mulawB64);
+  const muBuf = b64ToBuf(mulawB64);
   const pcmBuf = Buffer.alloc(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
-    const s = mulawDecodeSample(muBuf[i]);
-    pcmBuf.writeInt16LE(s, i * 2);
+    pcmBuf.writeInt16LE(mulawDecodeSample(muBuf[i]), i * 2);
   }
   return pcmBuf;
 }
 
-// Upsample PCM16 @8k -> PCM16 @16k (linear interpolation)
+// Upsample PCM16 @8k -> PCM16 @16k (linear)
 function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   if (inSamples < 2) return pcm8kBuf;
@@ -136,15 +149,12 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   const outSamples = inSamples * 2;
   const outBuf = Buffer.alloc(outSamples * 2);
 
-  let prev = pcm8kBuf.readInt16LE(0);
   for (let i = 0; i < inSamples; i++) {
     const curr = pcm8kBuf.readInt16LE(i * 2);
     const outIndex = i * 2;
 
-    // sample at t = i
     outBuf.writeInt16LE(curr, outIndex * 2);
 
-    // sample at t = i + 0.5 (between curr and next)
     if (i < inSamples - 1) {
       const next = pcm8kBuf.readInt16LE((i + 1) * 2);
       const mid = ((curr + next) / 2) | 0;
@@ -152,20 +162,17 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
     } else {
       outBuf.writeInt16LE(curr, (outIndex + 1) * 2);
     }
-
-    prev = curr;
   }
   return outBuf;
 }
 
-// Downsample PCM16 @24k -> PCM16 @8k (factor 3, simple average)
+// Downsample PCM16 @24k -> PCM16 @8k (factor 3 avg)
 function downsamplePcm16_24k_to_8k(pcm24kBuf) {
   const inSamples = pcm24kBuf.length / 2;
   const outSamples = Math.floor(inSamples / 3);
   if (outSamples <= 0) return Buffer.alloc(0);
 
   const outBuf = Buffer.alloc(outSamples * 2);
-
   for (let i = 0; i < outSamples; i++) {
     const a = pcm24kBuf.readInt16LE((i * 3 + 0) * 2);
     const b = pcm24kBuf.readInt16LE((i * 3 + 1) * 2);
@@ -176,7 +183,7 @@ function downsamplePcm16_24k_to_8k(pcm24kBuf) {
   return outBuf;
 }
 
-// PCM16 @8k -> μ-law base64 @8k
+// PCM16 @8k -> μ-law b64 @8k
 function pcm16_8k_to_mulawB64(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   const muBuf = Buffer.alloc(inSamples);
@@ -184,12 +191,12 @@ function pcm16_8k_to_mulawB64(pcm8kBuf) {
     const s = pcm8kBuf.readInt16LE(i * 2);
     muBuf[i] = mulawEncodeSample(s);
   }
-  return bufferToBase64(muBuf);
+  return bufToB64(muBuf);
 }
 
 // =====================
-// WebSocket: Twilio side
-// =====================
+// WebSocket Server (Twilio stream)
+/// ====================
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs) => {
@@ -198,26 +205,29 @@ wss.on("connection", (twilioWs) => {
   let streamSid = null;
   let geminiWs = null;
   let callLog = [];
+  let setupDone = false;
+  let openingSent = false;
 
   function connectToGemini() {
-    // Live API WebSocket endpoint (v1beta) per docs
     const url =
-      `wss://generativelanguage.googleapis.com/ws/` +
-      `google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
-        GEMINI_API_KEY
-      )}`;
+      "wss://generativelanguage.googleapis.com/ws/" +
+      "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
+      `?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
     geminiWs = new WebSocket(url);
 
     geminiWs.on("open", () => {
       console.log("Gemini: Connection Opened");
 
-      // Setup message must be first. Uses camelCase fields.
+      // IMPORTANT: systemInstruction must be Content (parts[])
       const setupMsg = {
         setup: {
           model: GEMINI_MODEL,
           generationConfig: {
             responseModalities: ["AUDIO"],
+            // קצר, חד, בלי חפירות
+            maxOutputTokens: 120,
+            temperature: 0.3,
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
@@ -226,7 +236,16 @@ wss.on("connection", (twilioWs) => {
               },
             },
           },
-          systemInstruction: SYSTEM_INSTRUCTIONS,
+          systemInstruction: {
+            parts: [{ text: SYSTEM_INSTRUCTIONS }],
+          },
+          // "לא קוטע" – פעילות משתמש לא תפסיק את תגובת המודל
+          realtimeInputConfig: {
+            activityHandling: "NO_INTERRUPTION",
+          },
+          // תמלול ללוגים (אופציונלי אך מועיל)
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
         },
       };
 
@@ -237,37 +256,57 @@ wss.on("connection", (twilioWs) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString("utf8"));
-      } catch (e) {
+      } catch {
         return;
       }
 
+      // Setup complete -> send opening immediately via clientContent
       if (msg.setupComplete) {
         console.log("Gemini: Setup Complete");
+        setupDone = true;
+
+        if (!openingSent) {
+          openingSent = true;
+
+          // clientContent appends to conversation and turnComplete starts generation immediately
+          const openingClientContent = {
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [{ text: OPENING_TEXT }],
+                },
+              ],
+              turnComplete: true,
+            },
+          };
+
+          geminiWs.send(JSON.stringify(openingClientContent));
+        }
         return;
       }
 
-      // Model output: serverContent.modelTurn.parts[].inlineData (audio)
+      // Collect transcriptions (if enabled)
+      if (msg?.serverContent?.inputTranscription?.text) {
+        callLog.push({ user_transcript: msg.serverContent.inputTranscription.text });
+      }
+      if (msg?.serverContent?.outputTranscription?.text) {
+        callLog.push({ bot_transcript: msg.serverContent.outputTranscription.text });
+      }
+
+      // Model output audio is in serverContent.modelTurn.parts[].inlineData
       const parts = msg?.serverContent?.modelTurn?.parts;
       if (Array.isArray(parts)) {
         for (const p of parts) {
-          // Audio chunk
+          // audio chunk
           if (p?.inlineData?.data && typeof p.inlineData.data === "string") {
             const mime = p?.inlineData?.mimeType || "";
-            // Expect PCM16 24k from Live API examples/docs
-            // We'll handle PCM only; if the API changes you’ll see mime here.
-            const pcmBuf = base64ToBuffer(p.inlineData.data);
+            const pcmBuf = b64ToBuf(p.inlineData.data);
 
-            // If it's 24k PCM -> downsample to 8k -> μ-law -> send to Twilio
-            // (Twilio Media Streams expects base64 μ-law 8k payload)
+            // Most commonly audio/pcm;rate=24000 -> downsample to 8k -> μ-law -> Twilio
             let pcm8k = pcmBuf;
-            if (mime.includes("rate=24000")) {
+            if (!mime.includes("rate=8000")) {
               pcm8k = downsamplePcm16_24k_to_8k(pcmBuf);
-            }
-            // If mime doesn't specify, we still try the 24k->8k path (common)
-            if (!mime || mime.includes("audio/pcm")) {
-              if (!mime.includes("rate=8000")) {
-                pcm8k = downsamplePcm16_24k_to_8k(pcmBuf);
-              }
             }
 
             const mulawB64 = pcm16_8k_to_mulawB64(pcm8k);
@@ -283,44 +322,38 @@ wss.on("connection", (twilioWs) => {
             }
           }
 
-          // Text chunk (log)
+          // text (if any)
           if (typeof p?.text === "string" && p.text.trim()) {
-            callLog.push({ bot: p.text.trim() });
+            callLog.push({ bot_text: p.text.trim() });
           }
         }
       }
 
-      // You can also log transcriptions if present
-      const outT = msg?.serverContent?.outputTranscription?.text;
-      if (outT) callLog.push({ bot_transcript: outT });
-      const inT = msg?.serverContent?.inputTranscription?.text;
-      if (inT) callLog.push({ user_transcript: inT });
-
-      // Handle server errors if present
       if (msg?.error?.message) {
         console.error("Gemini Server Error:", msg.error.message);
       }
-    });
-
-    geminiWs.on("error", (e) => {
-      console.error("Gemini Error:", e?.message || e);
     });
 
     geminiWs.on("close", (code, reason) => {
       console.log("Gemini Connection Closed", code, reason?.toString?.() || "");
       try {
         if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
-      } catch (_) {}
+      } catch {}
+    });
+
+    geminiWs.on("error", (e) => {
+      console.error("Gemini Error:", e?.message || e);
     });
   }
 
   connectToGemini();
 
+  // Twilio -> Gemini realtime audio stream
   twilioWs.on("message", (message) => {
     let msg;
     try {
       msg = JSON.parse(message);
-    } catch (e) {
+    } catch {
       return;
     }
 
@@ -334,54 +367,51 @@ wss.on("connection", (twilioWs) => {
       if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
       if (!msg?.media?.payload) return;
 
-      // Twilio sends μ-law 8k base64 -> PCM16 8k -> upsample to PCM16 16k
+      // Twilio μ-law 8k -> PCM16 8k -> upsample to PCM16 16k for Gemini
       const pcm8k = mulawB64ToPcm16_8k(msg.media.payload);
       const pcm16k = upsamplePcm16_8k_to_16k(pcm8k);
 
-      const geminiAudioMsg = {
+      const audioMsg = {
         realtimeInput: {
           audio: {
             mimeType: "audio/pcm;rate=16000",
-            data: bufferToBase64(pcm16k),
+            data: bufToB64(pcm16k),
           },
         },
       };
 
-      geminiWs.send(JSON.stringify(geminiAudioMsg));
+      geminiWs.send(JSON.stringify(audioMsg));
       return;
     }
 
     if (msg.event === "stop") {
-      // Twilio ended stream
       try {
-        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.close();
-        }
-      } catch (_) {}
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+      } catch {}
       return;
     }
   });
 
   twilioWs.on("close", () => {
     console.log("Twilio Closed");
-
     try {
       if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-    } catch (_) {}
+    } catch {}
 
     if (MAKE_WEBHOOK_URL) {
-      // send call summary
       fetch(MAKE_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event: "call_ended", sid: streamSid, log: callLog }),
+        body: JSON.stringify({
+          event: "call_ended",
+          sid: streamSid,
+          log: callLog,
+        }),
       }).catch(() => {});
     }
   });
 
-  twilioWs.on("error", (e) => {
-    console.error("Twilio WS Error:", e?.message || e);
-  });
+  twilioWs.on("error", (e) => console.error("Twilio WS Error:", e?.message || e));
 });
 
 process.on("unhandledRejection", (err) => console.error("unhandledRejection", err));
