@@ -14,7 +14,7 @@ const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
 const SYSTEM_INSTRUCTIONS = `
 You are an AI assistant named ${BOT_NAME} for ${BUSINESS_NAME}.
 You must be helpful and professional.
-Language Policy: Support Hebrew, English, Russian, and Arabic. Always respond in the language the user speaks to you.
+Respond in the language the user speaks to you (Hebrew, English, Russian, or Arabic).
 Keep responses concise (1-3 sentences).
 `.trim();
 
@@ -30,7 +30,7 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
-        // תיקון ה-URL לפורמט ה-Live API המעודכן
+        // כתובת URL מעודכנת ופשוטה יותר עבור ה-Live API
         const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
         
         geminiWs = new WebSocket(url);
@@ -38,7 +38,6 @@ wss.on('connection', (ws) => {
         geminiWs.on('open', () => {
             console.log('Gemini: Connection established');
             
-            // הודעת SETUP מתוקנת
             const setupMessage = {
                 setup: {
                     model: "models/gemini-2.0-flash-exp",
@@ -51,18 +50,31 @@ wss.on('connection', (ws) => {
                                 voice_name: VOICE_NAME 
                             } 
                         }
-                    },
-                    system_instruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] }
+                    }
                 }
             };
+            
+            // שליחת ה-Setup
             geminiWs.send(JSON.stringify(setupMessage));
+
+            // שליחת הוראות המערכת כהודעה ראשונה (או בתוך ה-Setup אם השרת תומך)
+            const firstMessage = {
+                client_content: {
+                    turns: [{
+                        role: "user",
+                        parts: [{ text: SYSTEM_INSTRUCTIONS }]
+                    }],
+                    turn_complete: true
+                }
+            };
+            geminiWs.send(JSON.stringify(firstMessage));
         });
 
         geminiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
                 
-                // הזרמת אודיו חזרה לטוויליו
+                // טיפול באודיו שחוזר מ-Gemini
                 if (response.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                     const audioBase64 = response.serverContent.modelTurn.parts[0].inlineData.data;
                     if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -72,10 +84,6 @@ wss.on('connection', (ws) => {
                             media: { payload: audioBase64 }
                         }));
                     }
-                }
-                
-                if (response.serverContent?.turnComplete) {
-                    console.log("Gemini finished speaking.");
                 }
             } catch (err) {
                 console.error("Error processing Gemini message:", err);
@@ -87,7 +95,7 @@ wss.on('connection', (ws) => {
         });
 
         geminiWs.on('close', (code, reason) => {
-            console.log(`Gemini: Closed (Code: ${code}, Reason: ${reason})`);
+            console.log(`Gemini: Closed (Code: ${code})`);
         });
     };
 
@@ -102,7 +110,6 @@ wss.on('connection', (ws) => {
             }
             
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
-                // הזרמת האודיו מטוויליו ל-Gemini
                 const audioMessage = {
                     realtime_input: {
                         media_chunks: [{
