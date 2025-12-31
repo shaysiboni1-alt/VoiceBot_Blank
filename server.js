@@ -5,9 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT) || 3000;
-
-// חובה כדי שלא ניפול על host header
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim(); // e.g. https://blubinet-realtime.onrender.com
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
@@ -19,8 +17,22 @@ const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || process.env.MB_WEBHOOK_URL || "";
 
-const GEMINI_MODEL = process.env.MB_GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
+const MB_LANGUAGES = (process.env.MB_LANGUAGES || "he")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const GEMINI_VOICE = process.env.MB_GEMINI_VOICE || "Aoede";
+
+// מודל ראשי מה-ENV. ברירת מחדל שמרנית (כדי שלא תיפול על מודל לא נתמך)
+const PRIMARY_MODEL = (process.env.MB_GEMINI_MODEL || "models/gemini-2.0-flash-exp").trim();
+
+// fallback models (ננסה אחד אחד אם נקבל 1008 על model not supported for bidi)
+const FALLBACK_MODELS = [
+  "models/gemini-2.0-flash-exp",
+  "models/gemini-2.0-flash-live-001",
+  "models/gemini-2.0-flash",
+].filter((m, i, arr) => arr.indexOf(m) === i);
 
 const OPENING_TEXT =
   process.env.MB_OPENING_TEXT ||
@@ -30,8 +42,9 @@ const SYSTEM_INSTRUCTIONS = `
 את נציגה בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
 כללים:
 - תשובות קצרות (1–2 משפטים), ענייניות.
-- לא לקטוע את הלקוח: המתיני שיסיים ואז עני.
-- לא לברך שוב אחרי פתיח.
+- אל תקטעי את הלקוח: המתיני שיסיים ואז עני.
+- אל תברכי שוב אחרי פתיח.
+- אם הלקוח עובר שפה: מותר לענות בשפתו. השפות המותרות: ${MB_LANGUAGES.join(", ")}.
 - אם חסר מידע: שאלי שאלה אחת קצרה בלבד.
 `.trim();
 
@@ -44,19 +57,15 @@ app.get("/", (req, res) => res.send("BluBinet Status: Online"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 function buildWsUrl(req) {
-  // אם יש PUBLIC_BASE_URL – זו האמת האבסולוטית
   if (PUBLIC_BASE_URL) {
     const u = new URL(PUBLIC_BASE_URL);
     const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
     return `${wsProto}//${u.host}/twilio-media-stream`;
   }
-
-  // fallback: נסה forwarded host ואז host
   const host = (req.headers["x-forwarded-host"] || req.headers.host || "").toString();
   return `wss://${host}/twilio-media-stream`;
 }
 
-// Twilio Voice Webhook -> TwiML
 app.post("/twilio-voice", (req, res) => {
   const wsUrl = buildWsUrl(req);
 
@@ -86,7 +95,7 @@ const server = http.createServer(app);
 // =====================
 function mulawDecodeSample(muLawByte) {
   let mu = (~muLawByte) & 0xff;
-  let sign = (mu & 0x80) ? -1 : 1;
+  let sign = mu & 0x80 ? -1 : 1;
   let exponent = (mu >> 4) & 0x07;
   let mantissa = mu & 0x0f;
   let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
@@ -118,14 +127,12 @@ function mulawEncodeSample(pcm16) {
     }
   }
   let mantissa = (sample >> (exponent + 3)) & 0x0f;
-  let mu = ~(sign | (exponent << 4) | mantissa) & 0xff;
-  return mu;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
 }
 
 const b64ToBuf = (b64) => Buffer.from(b64, "base64");
 const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
 
-// Twilio mulaw 8k -> PCM16 8k
 function mulawB64ToPcm16_8k(mulawB64) {
   const muBuf = b64ToBuf(mulawB64);
   const pcmBuf = Buffer.alloc(muBuf.length * 2);
@@ -135,7 +142,6 @@ function mulawB64ToPcm16_8k(mulawB64) {
   return pcmBuf;
 }
 
-// Upsample 8k -> 16k
 function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   if (inSamples < 2) return pcm8kBuf;
@@ -146,6 +152,7 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   for (let i = 0; i < inSamples; i++) {
     const curr = pcm8kBuf.readInt16LE(i * 2);
     const outIndex = i * 2;
+
     outBuf.writeInt16LE(curr, outIndex * 2);
 
     if (i < inSamples - 1) {
@@ -159,7 +166,6 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   return outBuf;
 }
 
-// Downsample 24k -> 8k
 function downsamplePcm16_24k_to_8k(pcm24kBuf) {
   const inSamples = pcm24kBuf.length / 2;
   const outSamples = Math.floor(inSamples / 3);
@@ -175,7 +181,6 @@ function downsamplePcm16_24k_to_8k(pcm24kBuf) {
   return outBuf;
 }
 
-// PCM16 8k -> mulaw b64
 function pcm16_8k_to_mulawB64(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   const muBuf = Buffer.alloc(inSamples);
@@ -183,6 +188,41 @@ function pcm16_8k_to_mulawB64(pcm8kBuf) {
     muBuf[i] = mulawEncodeSample(pcm8kBuf.readInt16LE(i * 2));
   }
   return bufToB64(muBuf);
+}
+
+// =====================
+// Gemini connector with model fallback
+// =====================
+function geminiWsUrl() {
+  return (
+    "wss://generativelanguage.googleapis.com/ws/" +
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
+    `?key=${encodeURIComponent(GEMINI_API_KEY)}`
+  );
+}
+
+function makeSetupMsg(modelName) {
+  return {
+    setup: {
+      model: modelName,
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        maxOutputTokens: 120,
+        temperature: 0.3,
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: GEMINI_VOICE },
+          },
+        },
+      },
+      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
+      realtimeInputConfig: {
+        activityHandling: "NO_INTERRUPTION",
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+    },
+  };
 }
 
 // =====================
@@ -197,44 +237,21 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   let streamSid = null;
-  let geminiWs = null;
   let callLog = [];
+  let geminiWs = null;
+
   let openingSent = false;
+  let currentModelIndex = 0;
 
-  function connectToGemini() {
-    const url =
-      "wss://generativelanguage.googleapis.com/ws/" +
-      "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
-      `?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  // סדר נסיונות: primary model קודם ואז fallback
+  const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS.filter((m) => m !== PRIMARY_MODEL)];
 
-    geminiWs = new WebSocket(url);
+  const connectGeminiWithModel = (modelName) => {
+    geminiWs = new WebSocket(geminiWsUrl());
 
     geminiWs.on("open", () => {
-      console.log("Gemini: Connection Opened");
-
-      const setupMsg = {
-        setup: {
-          model: GEMINI_MODEL,
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            maxOutputTokens: 120,
-            temperature: 0.3,
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: GEMINI_VOICE },
-              },
-            },
-          },
-          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
-          realtimeInputConfig: {
-            activityHandling: "NO_INTERRUPTION",
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-      };
-
-      geminiWs.send(JSON.stringify(setupMsg));
+      console.log("Gemini: Connection Opened. Trying model:", modelName);
+      geminiWs.send(JSON.stringify(makeSetupMsg(modelName)));
     });
 
     geminiWs.on("message", (raw) => {
@@ -246,9 +263,8 @@ wss.on("connection", (twilioWs, req) => {
       }
 
       if (msg.setupComplete) {
-        console.log("Gemini: Setup Complete");
-
-        // פתיח מיידי בלי להמתין לדיבור משתמש
+        console.log("Gemini: Setup Complete (model ok)");
+        // פתיח מיידי בלי לחכות לדיבור
         if (!openingSent) {
           openingSent = true;
           geminiWs.send(
@@ -277,7 +293,6 @@ wss.on("connection", (twilioWs, req) => {
             const mime = p.inlineData.mimeType || "";
             const pcmBuf = b64ToBuf(p.inlineData.data);
 
-            // לרוב: PCM16 24k -> 8k -> mulaw
             let pcm8k = pcmBuf;
             if (!mime.includes("rate=8000")) {
               pcm8k = downsamplePcm16_24k_to_8k(pcmBuf);
@@ -301,16 +316,38 @@ wss.on("connection", (twilioWs, req) => {
     });
 
     geminiWs.on("close", (code, reason) => {
-      console.log("Gemini Connection Closed", code, reason?.toString?.() || "");
+      const reasonStr = reason?.toString?.() || "";
+      console.log("Gemini Connection Closed", code, reasonStr);
+
+      // אם זה 1008 על מודל לא נתמך ל-bidi -> נסה מודל אחר
+      const isModelNotSupported =
+        code === 1008 &&
+        (reasonStr.includes("not found") || reasonStr.includes("not supported") || reasonStr.includes("bidi"));
+
+      if (isModelNotSupported) {
+        currentModelIndex += 1;
+        const nextModel = modelsToTry[currentModelIndex];
+        if (nextModel) {
+          console.log("Gemini: Switching model to:", nextModel);
+          try {
+            // לפתוח חיבור חדש לג'מיני עם מודל חדש
+            connectGeminiWithModel(nextModel);
+          } catch {}
+          return;
+        }
+      }
+
+      // אחרת סוגרים גם את טוויליו
       try {
         if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
       } catch {}
     });
 
     geminiWs.on("error", (e) => console.error("Gemini Error:", e?.message || e));
-  }
+  };
 
-  connectToGemini();
+  // start with primary
+  connectGeminiWithModel(modelsToTry[currentModelIndex]);
 
   twilioWs.on("message", (message) => {
     let msg;
