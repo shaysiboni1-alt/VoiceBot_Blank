@@ -4,6 +4,7 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3000;
+// וודא שב-Render הזנת את ה-Default Gemini API Key (זה עם ה-Tier 1)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const app = express();
@@ -18,7 +19,7 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
-        // הכתובת המלאה והרשמית ל-Realtime בגרסת v1beta
+        // הכתובת המדויקת למניעת שגיאת 404 בגרסה שמופיעה אצלך ב-Studio
         const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
         
         geminiWs = new WebSocket(url);
@@ -26,10 +27,14 @@ wss.on('connection', (ws) => {
         geminiWs.on('open', () => {
             console.log('Gemini: Connection Opened');
             
-            // הודעת SETUP - בגרסה הזו חייבים לשלוח רק את שם המודל קודם
+            // הודעת SETUP - אנחנו שולחים את הגדרות המודל והקול
             const setup = {
                 setup: {
-                    model: "models/gemini-2.0-flash-exp"
+                    model: "models/gemini-2.0-flash-exp",
+                    generation_config: { response_modalities: ["audio"] },
+                    speech_config: {
+                        voice_config: { prebuilt_voice_config: { voice_name: "Aoede" } }
+                    }
                 }
             };
             geminiWs.send(JSON.stringify(setup));
@@ -39,11 +44,12 @@ wss.on('connection', (ws) => {
             try {
                 const response = JSON.parse(data);
                 
-                // ברגע שגוגל מאשרת שה-Setup עבר, אנחנו יודעים שהחיבור חי
+                // אישור שהחיבור הצליח
                 if (response.setupComplete) {
-                    console.log('Gemini: Setup Verified (No more 404!)');
+                    console.log('Gemini: Setup Verified!');
                 }
 
+                // שליחת אודיו חזרה לטוויליו
                 if (response.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                     const audioBase64 = response.serverContent.modelTurn.parts[0].inlineData.data;
                     if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -54,7 +60,9 @@ wss.on('connection', (ws) => {
                         }));
                     }
                 }
-            } catch (e) { }
+            } catch (e) {
+                console.error("Error parsing Gemini message");
+            }
         });
 
         geminiWs.on('error', (err) => {
@@ -75,6 +83,7 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log('Twilio Started:', streamSid);
             }
+            // הזרמת אודיו מטוויליו לג'מיני
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
                 geminiWs.send(JSON.stringify({
                     realtime_input: {
@@ -89,6 +98,7 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        console.log('Twilio Closed');
         if (geminiWs) geminiWs.close();
     });
 });
