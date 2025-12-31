@@ -8,7 +8,6 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // הגדרות שליטה מה-ENV
 const VOICE_NAME = process.env.MB_VOICE_NAME || 'Aoede'; 
-const SPEECH_RATE = parseFloat(process.env.MB_VOICE_SPEECH_RATE || '1.0');
 const BOT_NAME = process.env.MB_BOT_NAME || 'נטע';
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
 
@@ -31,11 +30,15 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
+        // תיקון ה-URL לפורמט ה-Live API המעודכן
         const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
+        
         geminiWs = new WebSocket(url);
 
         geminiWs.on('open', () => {
-            console.log('Gemini: Connected');
+            console.log('Gemini: Connection established');
+            
+            // הודעת SETUP מתוקנת
             const setupMessage = {
                 setup: {
                     model: "models/gemini-2.0-flash-exp",
@@ -80,11 +83,11 @@ wss.on('connection', (ws) => {
         });
 
         geminiWs.on('error', (error) => {
-            console.error('Gemini WebSocket Error:', error);
+            console.error('Gemini WebSocket Error:', error.message);
         });
 
-        geminiWs.on('close', () => {
-            console.log('Gemini: Connection closed');
+        geminiWs.on('close', (code, reason) => {
+            console.log(`Gemini: Closed (Code: ${code}, Reason: ${reason})`);
         });
     };
 
@@ -99,6 +102,7 @@ wss.on('connection', (ws) => {
             }
             
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
+                // הזרמת האודיו מטוויליו ל-Gemini
                 const audioMessage = {
                     realtime_input: {
                         media_chunks: [{
@@ -116,7 +120,9 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         console.log('Twilio: Connection closed');
-        if (geminiWs) geminiWs.close();
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
+            geminiWs.close();
+        }
     });
 });
 
