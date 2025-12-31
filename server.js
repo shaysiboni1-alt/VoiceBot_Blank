@@ -1,413 +1,336 @@
+/**
+ * BluBinet Voice Bot (Stable, Hebrew, Clean Audio)
+ * Twilio Voice (Gather STT he-IL) -> Gemini Text -> Google Cloud TTS -> Twilio <Play>
+ *
+ * Why:
+ * - You do NOT have Gemini Live audio-bidi permissions (only text-out models appear).
+ * - This gives: perfect Hebrew understanding, clean voice (no μ-law noise), full logs.
+ *
+ * ENV:
+ * - PORT (Render)
+ * - PUBLIC_BASE_URL (required) e.g. https://blubinet-realtime.onrender.com
+ *
+ * - GEMINI_API_KEY (required)  // from Google AI Studio
+ * - MB_GEMINI_TEXT_MODEL (optional) default: gemini-2.0-flash-exp
+ *
+ * - GOOGLE_TTS_API_KEY (required for clean Hebrew voice)  // Google Cloud Text-to-Speech API key
+ * - MB_TTS_VOICE (optional) default: he-IL-Wavenet-C
+ * - MB_TTS_RATE (optional) default: 1.04
+ *
+ * - MB_BOT_NAME (default: נטע)
+ * - MB_BUSINESS_NAME (default: BluBinet)
+ * - MB_OPENING_TEXT (optional)
+ * - MB_CLOSING_TEXT (optional)
+ *
+ * - MAKE_WEBHOOK_URL or MB_WEBHOOK_URL (optional) // call summary on completed calls
+ */
+
 require("dotenv").config();
 
 const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
+const crypto = require("crypto");
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = Number(process.env.PORT) || 3000;
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.error("Missing GEMINI_API_KEY in environment");
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
+if (!PUBLIC_BASE_URL) {
+  console.error("Missing PUBLIC_BASE_URL. Example: https://blubinet-realtime.onrender.com");
   process.exit(1);
 }
 
-const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
-const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.error("Missing GEMINI_API_KEY");
+  process.exit(1);
+}
+
+const GOOGLE_TTS_API_KEY = (process.env.GOOGLE_TTS_API_KEY || "").trim();
+if (!GOOGLE_TTS_API_KEY) {
+  console.error("Missing GOOGLE_TTS_API_KEY (Google Cloud Text-to-Speech API key). Required for clean Hebrew voice.");
+  process.exit(1);
+}
+
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || process.env.MB_WEBHOOK_URL || "";
 
-const MB_LANGUAGES = (process.env.MB_LANGUAGES || "he")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
+const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
 
-const GEMINI_VOICE = process.env.MB_GEMINI_VOICE || "Aoede";
+const GEMINI_TEXT_MODEL = (process.env.MB_GEMINI_TEXT_MODEL || "gemini-2.0-flash-exp").trim();
 
-// מודל ראשי מה-ENV. ברירת מחדל שמרנית (כדי שלא תיפול על מודל לא נתמך)
-const PRIMARY_MODEL = (process.env.MB_GEMINI_MODEL || "models/gemini-2.0-flash-exp").trim();
-
-// fallback models (ננסה אחד אחד אם נקבל 1008 על model not supported for bidi)
-const FALLBACK_MODELS = [
-  "models/gemini-2.0-flash-exp",
-  "models/gemini-2.0-flash-live-001",
-  "models/gemini-2.0-flash",
-].filter((m, i, arr) => arr.indexOf(m) === i);
+const TTS_VOICE = (process.env.MB_TTS_VOICE || "he-IL-Wavenet-C").trim();
+const TTS_RATE = Number(process.env.MB_TTS_RATE || "1.04");
 
 const OPENING_TEXT =
-  process.env.MB_OPENING_TEXT ||
+  (process.env.MB_OPENING_TEXT || "").trim() ||
   `שָׁלוֹם, הִגַּעְתֶּם לְ־${BUSINESS_NAME}. מְדַבֶּרֶת ${BOT_NAME}. אֵיךְ אֶפְשָׁר לַעֲזוֹר?`;
+
+const CLOSING_TEXT =
+  (process.env.MB_CLOSING_TEXT || "").trim() ||
+  `תּוֹדָה רַבָּה. אִם תִּרְצוּ, אֲחֲזוֹר אֲלֵיכֶם עִם פְּרָטִים. יוֹם נָעִים.`;
 
 const SYSTEM_INSTRUCTIONS = `
 את נציגה בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
 כללים:
-- תשובות קצרות (1–2 משפטים), ענייניות.
-- אל תקטעי את הלקוח: המתיני שיסיים ואז עני.
-- אל תברכי שוב אחרי פתיח.
-- אם הלקוח עובר שפה: מותר לענות בשפתו. השפות המותרות: ${MB_LANGUAGES.join(", ")}.
-- אם חסר מידע: שאלי שאלה אחת קצרה בלבד.
+- דברי בעברית בלבד כברירת מחדל.
+- תשובות קצרות מאוד (1–2 משפטים).
+- לא לחזור על פתיח שכבר נאמר.
+- לא לשאול הרבה שאלות: לכל היותר שאלה אחת כדי להמשיך.
+- סגנון שירותי-מכירתי עדין, מקצועי וזורם.
 `.trim();
 
-const app = express();
-app.set("trust proxy", true);
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+// ===== In-memory storage (simple + fast). For production, you can swap to Redis.
+const sessions = new Map(); // callSid -> { log: [{role,text,ts}], audio: Map<audioId,Buffer>, createdAt }
+function getSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      log: [],
+      audio: new Map(),
+      createdAt: Date.now(),
+    });
+  }
+  return sessions.get(callSid);
+}
 
+function addLog(callSid, role, text) {
+  const s = getSession(callSid);
+  s.log.push({ role, text, ts: new Date().toISOString() });
+}
+
+function makeId() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function twiml(xml) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n${xml}\n</Response>`;
+}
+
+// ===== Health
 app.get("/", (req, res) => res.send("BluBinet Status: Online"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-function buildWsUrl(req) {
-  if (PUBLIC_BASE_URL) {
-    const u = new URL(PUBLIC_BASE_URL);
-    const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
-    return `${wsProto}//${u.host}/twilio-media-stream`;
-  }
-  const host = (req.headers["x-forwarded-host"] || req.headers.host || "").toString();
-  return `wss://${host}/twilio-media-stream`;
-}
+// ===== Serve synthesized audio
+app.get("/audio/:audioId.mp3", (req, res) => {
+  const { audioId } = req.params;
+  const callSid = (req.query.callSid || "").toString();
+  if (!callSid) return res.status(400).send("Missing callSid");
+  const s = sessions.get(callSid);
+  if (!s) return res.status(404).send("Session not found");
+  const buf = s.audio.get(audioId);
+  if (!buf) return res.status(404).send("Audio not found");
 
-app.post("/twilio-voice", (req, res) => {
-  const wsUrl = buildWsUrl(req);
-
-  console.log("==> /twilio-voice HIT", {
-    from: req.body?.From,
-    to: req.body?.To,
-    host: req.headers.host,
-    xfh: req.headers["x-forwarded-host"],
-    wsUrl,
-  });
-
-  res.type("text/xml").send(
-    `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}" />
-  </Connect>
-  <Pause length="60"/>
-</Response>`
-  );
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(buf);
 });
 
-const server = http.createServer(app);
+// ===== Gemini text call
+async function geminiGenerateText(userText, callSid) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_TEXT_MODEL
+  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
-// =====================
-// μ-law helpers
-// =====================
-function mulawDecodeSample(muLawByte) {
-  let mu = (~muLawByte) & 0xff;
-  let sign = mu & 0x80 ? -1 : 1;
-  let exponent = (mu >> 4) & 0x07;
-  let mantissa = mu & 0x0f;
-  let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
-  let sample = sign * (magnitude - 33);
-  if (sample > 32767) sample = 32767;
-  if (sample < -32768) sample = -32768;
-  return sample;
-}
-
-function mulawEncodeSample(pcm16) {
-  const BIAS = 33;
-  let sign = 0;
-  let sample = pcm16;
-
-  if (sample < 0) {
-    sign = 0x80;
-    sample = -sample;
-    if (sample > 32767) sample = 32767;
-  }
-
-  sample = sample + BIAS;
-  if (sample > 0x7fff) sample = 0x7fff;
-
-  let exponent = 7;
-  for (let exp = 0; exp < 8; exp++) {
-    if (sample <= (0x1f << (exp + 3))) {
-      exponent = exp;
-      break;
+  // Keep it short: user + system only (you can add memory later if needed)
+  const body = {
+    systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
+    contents: [
+      { role: "user", parts: [{ text: userText }] }
+    ],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 140
     }
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.error("Gemini generateContent error", r.status, j);
+    return "סליחה, הייתה תקלה רגעית. אפשר לנסות שוב?";
   }
-  let mantissa = (sample >> (exponent + 3)) & 0x0f;
-  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+
+  const text =
+    j?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join(" ").trim() ||
+    "סליחה, לא הבנתי. אפשר לחזור בקצרה?";
+
+  // ultra-short safety: cut overly long outputs
+  return text.length > 450 ? text.slice(0, 450) : text;
 }
 
-const b64ToBuf = (b64) => Buffer.from(b64, "base64");
-const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
+// ===== Google Cloud TTS -> MP3
+async function googleTtsMp3(text) {
+  const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${encodeURIComponent(
+    GOOGLE_TTS_API_KEY
+  )}`;
 
-function mulawB64ToPcm16_8k(mulawB64) {
-  const muBuf = b64ToBuf(mulawB64);
-  const pcmBuf = Buffer.alloc(muBuf.length * 2);
-  for (let i = 0; i < muBuf.length; i++) {
-    pcmBuf.writeInt16LE(mulawDecodeSample(muBuf[i]), i * 2);
-  }
-  return pcmBuf;
-}
-
-function upsamplePcm16_8k_to_16k(pcm8kBuf) {
-  const inSamples = pcm8kBuf.length / 2;
-  if (inSamples < 2) return pcm8kBuf;
-
-  const outSamples = inSamples * 2;
-  const outBuf = Buffer.alloc(outSamples * 2);
-
-  for (let i = 0; i < inSamples; i++) {
-    const curr = pcm8kBuf.readInt16LE(i * 2);
-    const outIndex = i * 2;
-
-    outBuf.writeInt16LE(curr, outIndex * 2);
-
-    if (i < inSamples - 1) {
-      const next = pcm8kBuf.readInt16LE((i + 1) * 2);
-      const mid = ((curr + next) / 2) | 0;
-      outBuf.writeInt16LE(mid, (outIndex + 1) * 2);
-    } else {
-      outBuf.writeInt16LE(curr, (outIndex + 1) * 2);
-    }
-  }
-  return outBuf;
-}
-
-function downsamplePcm16_24k_to_8k(pcm24kBuf) {
-  const inSamples = pcm24kBuf.length / 2;
-  const outSamples = Math.floor(inSamples / 3);
-  if (outSamples <= 0) return Buffer.alloc(0);
-
-  const outBuf = Buffer.alloc(outSamples * 2);
-  for (let i = 0; i < outSamples; i++) {
-    const a = pcm24kBuf.readInt16LE((i * 3 + 0) * 2);
-    const b = pcm24kBuf.readInt16LE((i * 3 + 1) * 2);
-    const c = pcm24kBuf.readInt16LE((i * 3 + 2) * 2);
-    outBuf.writeInt16LE(((a + b + c) / 3) | 0, i * 2);
-  }
-  return outBuf;
-}
-
-function pcm16_8k_to_mulawB64(pcm8kBuf) {
-  const inSamples = pcm8kBuf.length / 2;
-  const muBuf = Buffer.alloc(inSamples);
-  for (let i = 0; i < inSamples; i++) {
-    muBuf[i] = mulawEncodeSample(pcm8kBuf.readInt16LE(i * 2));
-  }
-  return bufToB64(muBuf);
-}
-
-// =====================
-// Gemini connector with model fallback
-// =====================
-function geminiWsUrl() {
-  return (
-    "wss://generativelanguage.googleapis.com/ws/" +
-    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
-    `?key=${encodeURIComponent(GEMINI_API_KEY)}`
-  );
-}
-
-function makeSetupMsg(modelName) {
-  return {
-    setup: {
-      model: modelName,
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        maxOutputTokens: 120,
-        temperature: 0.3,
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: GEMINI_VOICE },
-          },
-        },
-      },
-      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
-      realtimeInputConfig: {
-        activityHandling: "NO_INTERRUPTION",
-      },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
+  const body = {
+    input: { text },
+    voice: {
+      languageCode: "he-IL",
+      name: TTS_VOICE,
+    },
+    audioConfig: {
+      audioEncoding: "MP3",
+      speakingRate: TTS_RATE,
     },
   };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.error("Google TTS error", r.status, j);
+    // fallback: return null -> Twilio <Say> (will be English voice, not ideal)
+    return null;
+  }
+
+  const b64 = j.audioContent;
+  if (!b64) return null;
+  return Buffer.from(b64, "base64");
 }
 
-// =====================
-// WS Server for Twilio Media Stream
-// =====================
-const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
+// ===== Build a Gather step (Hebrew STT)
+function gatherStep(actionUrl, sayOrPlayXml) {
+  // Important: speechTimeout="auto" waits for end-of-speech.
+  // language="he-IL" ensures correct Hebrew STT.
+  return `
+${sayOrPlayXml}
+<Gather input="speech" language="he-IL" speechTimeout="auto" action="${actionUrl}" method="POST">
+</Gather>
+<Redirect method="POST">${actionUrl.replace("/gather", "/reprompt")}</Redirect>
+`.trim();
+}
 
-wss.on("connection", (twilioWs, req) => {
-  console.log("Twilio: WS Connected", {
-    ip: req.socket?.remoteAddress,
-    ua: req.headers["user-agent"],
-  });
+// ===== Entry point: play opening, start gather
+app.post("/twilio-voice", async (req, res) => {
+  const callSid = req.body.CallSid;
+  const from = req.body.From;
+  const to = req.body.To;
 
-  let streamSid = null;
-  let callLog = [];
-  let geminiWs = null;
+  console.log("==> /twilio-voice", { callSid, from, to });
 
-  let openingSent = false;
-  let currentModelIndex = 0;
+  // init session
+  getSession(callSid);
+  addLog(callSid, "system", `CALL_START from=${from} to=${to}`);
 
-  // סדר נסיונות: primary model קודם ואז fallback
-  const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS.filter((m) => m !== PRIMARY_MODEL)];
+  // synth opening
+  addLog(callSid, "assistant", OPENING_TEXT);
+  const mp3 = await googleTtsMp3(OPENING_TEXT);
 
-  const connectGeminiWithModel = (modelName) => {
-    geminiWs = new WebSocket(geminiWsUrl());
+  const audioId = makeId();
+  if (mp3) getSession(callSid).audio.set(audioId, mp3);
 
-    geminiWs.on("open", () => {
-      console.log("Gemini: Connection Opened. Trying model:", modelName);
-      geminiWs.send(JSON.stringify(makeSetupMsg(modelName)));
-    });
+  const playXml = mp3
+    ? `<Play>${PUBLIC_BASE_URL}/audio/${audioId}.mp3?callSid=${encodeURIComponent(callSid)}</Play>`
+    : `<Say>${OPENING_TEXT}</Say>`;
 
-    geminiWs.on("message", (raw) => {
-      let msg;
-      try {
-        msg = JSON.parse(raw.toString("utf8"));
-      } catch {
-        return;
-      }
+  const actionUrl = `${PUBLIC_BASE_URL}/gather?callSid=${encodeURIComponent(callSid)}`;
 
-      if (msg.setupComplete) {
-        console.log("Gemini: Setup Complete (model ok)");
-        // פתיח מיידי בלי לחכות לדיבור
-        if (!openingSent) {
-          openingSent = true;
-          geminiWs.send(
-            JSON.stringify({
-              clientContent: {
-                turns: [{ role: "user", parts: [{ text: OPENING_TEXT }] }],
-                turnComplete: true,
-              },
-            })
-          );
-        }
-        return;
-      }
+  res.type("text/xml").send(twiml(gatherStep(actionUrl, playXml)));
+});
 
-      if (msg?.serverContent?.inputTranscription?.text) {
-        callLog.push({ user_transcript: msg.serverContent.inputTranscription.text });
-      }
-      if (msg?.serverContent?.outputTranscription?.text) {
-        callLog.push({ bot_transcript: msg.serverContent.outputTranscription.text });
-      }
+// ===== Reprompt if no speech captured
+app.post("/reprompt", async (req, res) => {
+  const callSid = (req.query.callSid || req.body.CallSid || "").toString();
+  if (!callSid) return res.type("text/xml").send(twiml(`<Hangup/>`));
 
-      const parts = msg?.serverContent?.modelTurn?.parts;
-      if (Array.isArray(parts)) {
-        for (const p of parts) {
-          if (p?.inlineData?.data) {
-            const mime = p.inlineData.mimeType || "";
-            const pcmBuf = b64ToBuf(p.inlineData.data);
+  const repromptText = "לא שמעתי תשובה. איך אפשר לעזור?";
+  addLog(callSid, "assistant", repromptText);
 
-            let pcm8k = pcmBuf;
-            if (!mime.includes("rate=8000")) {
-              pcm8k = downsamplePcm16_24k_to_8k(pcmBuf);
-            }
-            const mulawB64 = pcm16_8k_to_mulawB64(pcm8k);
+  const mp3 = await googleTtsMp3(repromptText);
+  const audioId = makeId();
+  if (mp3) getSession(callSid).audio.set(audioId, mp3);
 
-            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: mulawB64 } }));
-            }
-          }
+  const playXml = mp3
+    ? `<Play>${PUBLIC_BASE_URL}/audio/${audioId}.mp3?callSid=${encodeURIComponent(callSid)}</Play>`
+    : `<Say>${repromptText}</Say>`;
 
-          if (typeof p?.text === "string" && p.text.trim()) {
-            callLog.push({ bot_text: p.text.trim() });
-          }
-        }
-      }
+  const actionUrl = `${PUBLIC_BASE_URL}/gather?callSid=${encodeURIComponent(callSid)}`;
+  res.type("text/xml").send(twiml(gatherStep(actionUrl, playXml)));
+});
 
-      if (msg?.error?.message) {
-        console.error("Gemini Server Error:", msg.error.message);
-      }
-    });
+// ===== Handle user speech -> Gemini -> TTS -> continue gather
+app.post("/gather", async (req, res) => {
+  const callSid = (req.query.callSid || req.body.CallSid || "").toString();
+  const speech = (req.body.SpeechResult || "").toString().trim();
+  const confidence = req.body.Confidence;
 
-    geminiWs.on("close", (code, reason) => {
-      const reasonStr = reason?.toString?.() || "";
-      console.log("Gemini Connection Closed", code, reasonStr);
+  if (!callSid) return res.type("text/xml").send(twiml(`<Hangup/>`));
 
-      // אם זה 1008 על מודל לא נתמך ל-bidi -> נסה מודל אחר
-      const isModelNotSupported =
-        code === 1008 &&
-        (reasonStr.includes("not found") || reasonStr.includes("not supported") || reasonStr.includes("bidi"));
+  if (!speech) {
+    // no speech recognized -> reprompt
+    return res.type("text/xml").send(
+      twiml(`<Redirect method="POST">${PUBLIC_BASE_URL}/reprompt?callSid=${encodeURIComponent(callSid)}</Redirect>`)
+    );
+  }
 
-      if (isModelNotSupported) {
-        currentModelIndex += 1;
-        const nextModel = modelsToTry[currentModelIndex];
-        if (nextModel) {
-          console.log("Gemini: Switching model to:", nextModel);
-          try {
-            // לפתוח חיבור חדש לג'מיני עם מודל חדש
-            connectGeminiWithModel(nextModel);
-          } catch {}
-          return;
-        }
-      }
+  console.log("User said:", speech, "conf:", confidence);
+  addLog(callSid, "user", speech);
 
-      // אחרת סוגרים גם את טוויליו
-      try {
-        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
-      } catch {}
-    });
+  // Gemini text answer
+  const answer = await geminiGenerateText(speech, callSid);
+  addLog(callSid, "assistant", answer);
 
-    geminiWs.on("error", (e) => console.error("Gemini Error:", e?.message || e));
-  };
+  // TTS answer (clean MP3)
+  const mp3 = await googleTtsMp3(answer);
+  const audioId = makeId();
+  if (mp3) getSession(callSid).audio.set(audioId, mp3);
 
-  // start with primary
-  connectGeminiWithModel(modelsToTry[currentModelIndex]);
+  const playXml = mp3
+    ? `<Play>${PUBLIC_BASE_URL}/audio/${audioId}.mp3?callSid=${encodeURIComponent(callSid)}</Play>`
+    : `<Say>${answer}</Say>`;
 
-  twilioWs.on("message", (message) => {
-    let msg;
-    try {
-      msg = JSON.parse(message);
-    } catch {
-      return;
+  const actionUrl = `${PUBLIC_BASE_URL}/gather?callSid=${encodeURIComponent(callSid)}`;
+  res.type("text/xml").send(twiml(gatherStep(actionUrl, playXml)));
+});
+
+// ===== Call status callback (send full log to Make when completed)
+app.post("/call-status", async (req, res) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+
+  console.log("==> /call-status", { callSid, callStatus });
+
+  if (callSid && (callStatus === "completed" || callStatus === "canceled" || callStatus === "failed" || callStatus === "busy" || callStatus === "no-answer")) {
+    const s = sessions.get(callSid);
+    const log = s?.log || [];
+
+    // clean up old audio to save memory
+    if (s) {
+      s.audio.clear();
+      // keep log for a bit or delete immediately
+      // sessions.delete(callSid);
     }
-
-    if (msg.event === "start") {
-      streamSid = msg?.start?.streamSid || null;
-      console.log("Twilio Started:", streamSid);
-      return;
-    }
-
-    if (msg.event === "media") {
-      if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
-      if (!msg?.media?.payload) return;
-
-      const pcm8k = mulawB64ToPcm16_8k(msg.media.payload);
-      const pcm16k = upsamplePcm16_8k_to_16k(pcm8k);
-
-      geminiWs.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: { mimeType: "audio/pcm;rate=16000", data: bufToB64(pcm16k) },
-          },
-        })
-      );
-      return;
-    }
-
-    if (msg.event === "stop") {
-      try {
-        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-      } catch {}
-    }
-  });
-
-  twilioWs.on("close", () => {
-    console.log("Twilio Closed");
-    try {
-      if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-    } catch {}
 
     if (MAKE_WEBHOOK_URL) {
       fetch(MAKE_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event: "call_ended", sid: streamSid, log: callLog }),
+        body: JSON.stringify({
+          event: "call_ended",
+          callSid,
+          callStatus,
+          log,
+        }),
       }).catch(() => {});
     }
-  });
+  }
 
-  twilioWs.on("error", (e) => console.error("Twilio WS Error:", e?.message || e));
+  res.sendStatus(200);
 });
 
-process.on("unhandledRejection", (err) => console.error("unhandledRejection", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException", err));
-
-server.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on port ${PORT}`);
 });
