@@ -54,6 +54,11 @@ async function getSheetsClient() {
   return { sheets, sheetId };
 }
 
+function dropHeader(values) {
+  if (!values || values.length === 0) return [];
+  return values.slice(1);
+}
+
 function rowsToKV(rows) {
   const out = {};
   for (const r of rows || []) {
@@ -77,7 +82,6 @@ function rowsToPrompts(rows) {
 }
 
 function rowsToIntents(rows) {
-  // expected headers: intent_id, intent_type, priority, triggers_he, triggers_en, triggers_ru (ועוד אפשריים)
   const intents = [];
   for (const r of rows || []) {
     const intent_id = (r?.[0] ?? "").toString().trim();
@@ -97,20 +101,16 @@ function rowsToIntents(rows) {
 /**
  * loadSSOT(force)
  * - force=false: respects cache ttl
- * - force=true : reloads from Google Sheets now
+ * - force=true : reloads now
  */
 async function loadSSOT(force = false) {
   const ttl = env.SSOT_TTL_MS || 60000;
   if (!force && isCacheValid()) return CACHE;
 
   const startedAt = Date.now();
-
   const { sheets, sheetId } = await getSheetsClient();
 
-  // We read:
-  // SETTINGS!A:B (skip header row)
-  // PROMPTS!A:B (skip header row)
-  // INTENTS!A:F (skip header row)
+  // IMPORTANT: rely on returned order, not vr.range string
   const ranges = ["SETTINGS!A:B", "PROMPTS!A:B", "INTENTS!A:F"];
 
   const resp = await sheets.spreadsheets.values.batchGet({
@@ -118,22 +118,16 @@ async function loadSSOT(force = false) {
     ranges
   });
 
-  const valueRanges = resp?.data?.valueRanges || [];
-  const byRange = {};
-  for (const vr of valueRanges) {
-    byRange[vr.range] = vr.values || [];
-  }
+  const vrs = resp?.data?.valueRanges || [];
 
-  // Helper: drop first row header if present
-  function dropHeader(values) {
-    if (!values || values.length === 0) return [];
-    // If first row contains "key/value" or "PromptId/Content" etc, drop it
-    return values.slice(1);
-  }
+  // Google may return range strings like SETTINGS!A1:B200 - don't key by it.
+  const settingsVals = vrs?.[0]?.values || [];
+  const promptsVals = vrs?.[1]?.values || [];
+  const intentsVals = vrs?.[2]?.values || [];
 
-  const settingsRows = dropHeader(byRange["SETTINGS!A:B"] || byRange["SETTINGS!A:B".replace("!A:B", "!A1:B")] || []);
-  const promptsRows = dropHeader(byRange["PROMPTS!A:B"] || []);
-  const intentsRows = dropHeader(byRange["INTENTS!A:F"] || []);
+  const settingsRows = dropHeader(settingsVals);
+  const promptsRows = dropHeader(promptsVals);
+  const intentsRows = dropHeader(intentsVals);
 
   const settings = rowsToKV(settingsRows);
   const prompts = rowsToPrompts(promptsRows);
@@ -151,7 +145,8 @@ async function loadSSOT(force = false) {
     settings_keys: Object.keys(settings).length,
     prompts_keys: Object.keys(prompts).length,
     intents: intents.length,
-    ms: Date.now() - startedAt
+    ms: Date.now() - startedAt,
+    ranges_returned: vrs.map((x) => x.range)
   });
 
   return CACHE;
