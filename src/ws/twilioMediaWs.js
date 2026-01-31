@@ -5,6 +5,49 @@ const { logger } = require("../utils/logger");
 const { env } = require("../config/env");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
 
+/**
+ * Very small μ-law decoder + RMS energy VAD
+ * Twilio sends μ-law 8k audio frames even during silence.
+ * We only enable barge when energy indicates actual speech.
+ */
+
+function muLawToLinearSample(uVal) {
+  // Standard G.711 μ-law decode (8-bit -> 16-bit PCM)
+  uVal = ~uVal & 0xff;
+  const sign = uVal & 0x80;
+  const exponent = (uVal >> 4) & 0x07;
+  const mantissa = uVal & 0x0f;
+
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  return sign ? -sample : sample;
+}
+
+function ulawB64ToPcm16LEBuffer(ulawB64) {
+  const ulawBuf = Buffer.from(ulawB64, "base64");
+  const pcmBuf = Buffer.allocUnsafe(ulawBuf.length * 2);
+
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const s = muLawToLinearSample(ulawBuf[i]);
+    pcmBuf.writeInt16LE(s, i * 2);
+  }
+  return pcmBuf;
+}
+
+function rms01FromPcm16LE(pcmBuf) {
+  // Compute RMS normalized to 0..1
+  const n = pcmBuf.length / 2;
+  if (n <= 0) return 0;
+
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) {
+    const s = pcmBuf.readInt16LE(i * 2);
+    sumSq += s * s;
+  }
+  const rms = Math.sqrt(sumSq / n); // 0..~32768
+  return Math.min(1, rms / 32768);
+}
+
 function installTwilioMediaWs(server) {
   const wss = new WebSocket.Server({ noServer: true });
 
@@ -21,64 +64,52 @@ function installTwilioMediaWs(server) {
     let customParameters = {};
     let gemini = null;
 
-    // --- BARGE-IN gate state ---
-    let bargeActive = false;
-    let lastUserMediaAt = 0;
-    let lastBargeStartAt = 0;
+    // --- VAD/BARGE state ---
+    const vadThreshold = env.MB_VAD_THRESHOLD; // e.g. 0.65 (we'll map it more gently below)
+    const vadSilenceMs = env.MB_VAD_SILENCE_MS; // e.g. 900
+    const bargeEnabled = env.MB_BARGEIN_ENABLED;
+
+    // We use an "energy threshold" derived from MB_VAD_THRESHOLD but tuned for RMS01.
+    // If MB_VAD_THRESHOLD is 0.65, energy threshold will be ~0.04-0.06 (typical telephony).
+    const energyThreshold = Math.max(0.01, Math.min(0.2, vadThreshold * 0.08));
+
+    let userSpeaking = false;
+    let lastAboveAt = 0;
+    let lastBelowAt = 0;
 
     function nowMs() {
       return Date.now();
     }
 
-    function setBargeActive(on) {
-      if (!env.MB_BARGEIN_ENABLED) return;
-      if (on === bargeActive) return;
-      bargeActive = on;
+    function updateVADFromUlaw(ulawB64) {
+      try {
+        const pcm = ulawB64ToPcm16LEBuffer(ulawB64);
+        const e = rms01FromPcm16LE(pcm);
 
-      if (bargeActive) {
-        lastBargeStartAt = nowMs();
-        logger.debug("BARGE-IN ON", { streamSid, callSid });
-      } else {
-        logger.debug("BARGE-IN OFF", { streamSid, callSid });
-      }
-    }
-
-    // heuristic: אם מגיע media מהמשתמש - נחשב כ"תחילת דיבור"
-    // ונשאיר bargeActive עד שלא הגיע media X מילישניות.
-    function onUserMediaFrame() {
-      if (!env.MB_BARGEIN_ENABLED) return;
-
-      const t = nowMs();
-      lastUserMediaAt = t;
-
-      // start gate immediately (or after MB_BARGEIN_MIN_MS via simple latch)
-      if (!bargeActive) setBargeActive(true);
-    }
-
-    function maybeReleaseBarge() {
-      if (!env.MB_BARGEIN_ENABLED) return;
-      if (!bargeActive) return;
-
-      const t = nowMs();
-      const sinceLastUser = t - lastUserMediaAt;
-
-      // אם המשתמש השתתק מספיק זמן — משחררים את gate
-      if (sinceLastUser >= env.MB_BARGEIN_COOLDOWN_MS) {
-        // optional: enforce minimum barge window
-        const sinceStart = t - lastBargeStartAt;
-        if (sinceStart >= env.MB_BARGEIN_MIN_MS) {
-          setBargeActive(false);
+        const t = nowMs();
+        if (e >= energyThreshold) {
+          lastAboveAt = t;
+          if (!userSpeaking) {
+            userSpeaking = true;
+            logger.debug("VAD userSpeaking=TRUE", { streamSid, callSid, e, energyThreshold });
+          }
+        } else {
+          lastBelowAt = t;
+          if (userSpeaking && (t - lastAboveAt) >= vadSilenceMs) {
+            userSpeaking = false;
+            logger.debug("VAD userSpeaking=FALSE", { streamSid, callSid, e, energyThreshold });
+          }
         }
+      } catch {
+        // ignore VAD failure
       }
     }
-
-    const bargeTimer = setInterval(maybeReleaseBarge, 100);
 
     function sendToTwilioMedia(ulaw8kB64) {
       if (!streamSid) return;
 
-      // אם המשתמש מדבר כרגע — לא משדרים אודיו של הבוט לטוויליו (זה ה-barge)
-      if (env.MB_BARGEIN_ENABLED && bargeActive) return;
+      // BARGE-IN gate: block bot audio ONLY while user is actually speaking (via VAD)
+      if (bargeEnabled && userSpeaking) return;
 
       const payload = {
         event: "media",
@@ -116,13 +147,14 @@ function installTwilioMediaWs(server) {
           meta: { streamSid, callSid },
           onGeminiAudioUlaw8kBase64: (ulawB64) => sendToTwilioMedia(ulawB64),
           onGeminiText: (t) => {
-            // לא משנה קול. רק לוגים.
-            if (env.MB_LOG_ASSISTANT_TEXT) logger.info("ASSISTANT_TEXT", { streamSid, callSid, text: t });
+            if (env.MB_LOG_ASSISTANT_TEXT) {
+              logger.info("ASSISTANT_TEXT", { streamSid, callSid, text: String(t) });
+            }
           },
           onTranscript: (role, text) => {
-            // תמלול מלא — נשאיר JSON נקי
             if (!env.MB_LOG_TRANSCRIPTS) return;
-            logger.info("TRANSCRIPT", { streamSid, callSid, role, text });
+            // log clean JSON (no long prefix)
+            logger.info("TRANSCRIPT", { streamSid, callSid, role, text: String(text) });
           }
         });
 
@@ -134,8 +166,8 @@ function installTwilioMediaWs(server) {
         const b64 = msg?.media?.payload;
         if (!b64) return;
 
-        // BARGE signal
-        onUserMediaFrame();
+        // Update VAD on incoming user audio
+        if (bargeEnabled) updateVADFromUlaw(b64);
 
         if (gemini) gemini.sendUlaw8kFromTwilio(b64);
         return;
@@ -152,13 +184,11 @@ function installTwilioMediaWs(server) {
     });
 
     twilioWs.on("close", () => {
-      clearInterval(bargeTimer);
       logger.info("Twilio media WS closed", { streamSid, callSid });
       if (gemini) gemini.stop();
     });
 
     twilioWs.on("error", (err) => {
-      clearInterval(bargeTimer);
       logger.error("Twilio media WS error", { streamSid, callSid, error: err.message });
       if (gemini) gemini.stop();
     });
