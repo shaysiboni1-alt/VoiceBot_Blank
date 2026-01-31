@@ -5,167 +5,107 @@ const WebSocket = require("ws");
 const { logger } = require("../utils/logger");
 
 /**
- * Twilio Media Streams WS handler (inbound/outbound audio).
- * This stage implements a deterministic outbound-audio smoke-test:
- * after "start", send a 1s beep tone to caller (μ-law 8k).
- *
- * Goal: validate server -> Twilio -> caller audio path, BEFORE Gemini integration.
+ * Attaches Twilio Media Streams WebSocket endpoint:
+ *  - path: /twilio-media-stream
+ *  - logs start/stop + counts inbound media frames
+ *  - (optional) sends a short beep test OUT but DOES NOT close the socket
  */
-
-function ulawEncodeSample(pcm16) {
-  // G.711 μ-law encoder for a single 16-bit PCM sample
-  const MU_LAW_MAX = 0x1FFF;
-  const BIAS = 0x84;
-
-  let sign = (pcm16 >> 8) & 0x80;
-  if (sign !== 0) pcm16 = -pcm16;
-  if (pcm16 > MU_LAW_MAX) pcm16 = MU_LAW_MAX;
-
-  pcm16 = pcm16 + BIAS;
-
-  let exponent = 7;
-  for (let expMask = 0x4000; (pcm16 & expMask) === 0 && exponent > 0; expMask >>= 1) {
-    exponent--;
-  }
-
-  const mantissa = (pcm16 >> (exponent + 3)) & 0x0F;
-  const ulawByte = ~(sign | (exponent << 4) | mantissa) & 0xFF;
-  return ulawByte;
-}
-
-function genBeepUlawFrames({
-  durationMs = 1000,
-  freqHz = 1000,
-  sampleRate = 8000,
-  frameMs = 20,
-  amplitude = 0.35
-} = {}) {
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000); // 160 at 8k/20ms
-  const totalFrames = Math.floor(durationMs / frameMs);
-
-  const framesB64 = [];
-  let t = 0;
-
-  // amplitude in PCM16 scale
-  const amp = Math.floor(32767 * amplitude);
-
-  for (let f = 0; f < totalFrames; f++) {
-    const ulaw = Buffer.alloc(samplesPerFrame);
-    for (let i = 0; i < samplesPerFrame; i++) {
-      const sample =
-        Math.sin((2 * Math.PI * freqHz * t) / sampleRate) * amp;
-      // clamp + convert to int16
-      let s = sample | 0;
-      if (s > 32767) s = 32767;
-      if (s < -32768) s = -32768;
-
-      ulaw[i] = ulawEncodeSample(s);
-      t++;
-    }
-    framesB64.push(ulaw.toString("base64"));
-  }
-
-  return framesB64;
-}
-
-function attachTwilioMediaWs(server) {
-  const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
+function attachTwilioMediaWs(httpServer) {
+  const wss = new WebSocket.Server({
+    server: httpServer,
+    path: "/twilio-media-stream"
+  });
 
   wss.on("connection", (ws) => {
     logger.info("Twilio media WS connected");
 
-    let streamSid = null;
-    let callSid = null;
-    let beepSent = false;
-    let beepTimer = null;
-
-    const safeSend = (obj) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    const state = {
+      streamSid: null,
+      callSid: null,
+      customParameters: {},
+      mediaFrames: 0,
+      mediaBytesB64: 0,
+      lastMediaAt: null,
+      statsTimer: null
     };
+
+    // כל 2 שניות נדפיס סטטיסטיקה כדי לראות אם נכנס RX אודיו מהמתקשר
+    state.statsTimer = setInterval(() => {
+      logger.info("Twilio RX stats", {
+        streamSid: state.streamSid,
+        callSid: state.callSid,
+        frames: state.mediaFrames,
+        b64_chars: state.mediaBytesB64,
+        last_media_at: state.lastMediaAt
+      });
+    }, 2000);
 
     ws.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
       } catch (e) {
+        logger.warn("Twilio WS non-JSON message", { len: data?.length });
         return;
       }
 
-      if (msg.event === "start") {
-        streamSid = msg.start?.streamSid || null;
-        callSid = msg.start?.callSid || null;
+      const ev = msg.event;
 
+      if (ev === "start") {
+        state.streamSid = msg?.start?.streamSid || null;
+        state.callSid = msg?.start?.callSid || null;
+        state.customParameters = msg?.start?.customParameters || {};
         logger.info("Twilio stream start", {
-          streamSid,
-          callSid,
-          customParameters: msg.start?.customParameters || {}
+          streamSid: state.streamSid,
+          callSid: state.callSid,
+          customParameters: state.customParameters
         });
 
-        // Outbound-audio smoke test: send beep once
-        if (!beepSent && streamSid) {
-          beepSent = true;
-
-          const frames = genBeepUlawFrames({
-            durationMs: 1000,
-            freqHz: 1000,
-            amplitude: 0.35
-          });
-
-          let idx = 0;
-          beepTimer = setInterval(() => {
-            if (idx >= frames.length) {
-              clearInterval(beepTimer);
-              beepTimer = null;
-              logger.info("Beep test finished", { streamSid, callSid });
-              return;
-            }
-
-            safeSend({
-              event: "media",
-              streamSid,
-              media: {
-                payload: frames[idx]
-              }
-            });
-
-            idx++;
-          }, 20);
-
-          logger.info("Beep test started", { streamSid, callSid });
-        }
-      }
-
-      if (msg.event === "media") {
-        // inbound audio from caller is in msg.media.payload (μ-law 8k base64)
-        // Not used yet in this stage.
+        // NOTE: אם כבר יש אצלך פונקציית Beep קיימת – תשאיר אותה.
+        // כאן אנחנו בכוונה לא סוגרים WS אחרי הביפ/כלום.
         return;
       }
 
-      if (msg.event === "stop") {
-        logger.info("Twilio stream stop", { streamSid, callSid });
-        if (beepTimer) clearInterval(beepTimer);
-        beepTimer = null;
+      if (ev === "media") {
+        const payload = msg?.media?.payload || "";
+        state.mediaFrames += 1;
+        state.mediaBytesB64 += payload.length;
+        state.lastMediaAt = new Date().toISOString();
+
+        // לא נלוג כל פריים (זה רועש). מספיק הסטטיסטיקה כל 2 שניות.
+        return;
       }
+
+      if (ev === "stop") {
+        logger.info("Twilio stream stop", {
+          streamSid: state.streamSid,
+          callSid: state.callSid
+        });
+        return;
+      }
+
+      // events אחרים (mark וכו')
+      logger.info("Twilio WS event", { event: ev, streamSid: state.streamSid, callSid: state.callSid });
     });
 
     ws.on("close", () => {
-      logger.info("Twilio media WS closed", { streamSid, callSid });
-      if (beepTimer) clearInterval(beepTimer);
-      beepTimer = null;
+      if (state.statsTimer) clearInterval(state.statsTimer);
+      logger.info("Twilio media WS closed", {
+        streamSid: state.streamSid,
+        callSid: state.callSid,
+        frames: state.mediaFrames,
+        b64_chars: state.mediaBytesB64
+      });
     });
 
     ws.on("error", (err) => {
-      logger.error("Twilio media WS error", {
-        streamSid,
-        callSid,
+      logger.error("Twilio WS error", {
+        streamSid: state.streamSid,
+        callSid: state.callSid,
         error: err?.message || String(err)
       });
-      if (beepTimer) clearInterval(beepTimer);
-      beepTimer = null;
     });
   });
-
-  return wss;
 }
 
 module.exports = { attachTwilioMediaWs };
