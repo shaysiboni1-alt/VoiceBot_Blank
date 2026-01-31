@@ -1,35 +1,28 @@
-// src/server.js
 "use strict";
 
+const http = require("http");
 const express = require("express");
 const { env } = require("./config/env");
 const { logger } = require("./utils/logger");
 const { healthRouter } = require("./routes/health");
 const { adminReloadRouter } = require("./routes/adminReloadSheets");
-const { twilioStatusRouter } = require("./routes/twilioStatus");
 const { loadSSOT } = require("./ssot/ssotClient");
+const { attachTwilioMediaWs } = require("./ws/twilioMediaWs");
 
 const app = express();
-
-// Twilio sends application/x-www-form-urlencoded by default
-app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 app.use(express.json({ limit: "1mb" }));
 
 app.use(healthRouter);
 app.use(adminReloadRouter);
-app.use(twilioStatusRouter);
 
-app.use((req, res) => {
-  res.status(404).json({ error: "not_found" });
-});
+app.use((req, res) => res.status(404).json({ error: "not_found" }));
 
-app.listen(env.PORT, async () => {
-  logger.info("Service started", {
-    port: env.PORT,
-    provider_mode: env.PROVIDER_MODE
-  });
+const server = http.createServer(app);
+attachTwilioMediaWs(server);
 
-  // Best-effort preload SSOT
+server.listen(env.PORT, async () => {
+  logger.info("Service started", { port: env.PORT, provider_mode: env.PROVIDER_MODE });
+
   try {
     await loadSSOT(false);
   } catch (err) {
