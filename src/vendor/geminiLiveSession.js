@@ -19,8 +19,6 @@ class GeminiLiveSession {
     this._started = false;
     this._setupAck = false;
     this._stopping = false;
-
-    // small buffer until setup completes
     this._pendingAudio = [];
   }
 
@@ -28,15 +26,9 @@ class GeminiLiveSession {
     if (this._started) return;
     this._started = true;
 
-    if (!env.GEMINI_API_KEY) {
-      throw new Error("Missing GEMINI_API_KEY");
-    }
-    if (!env.GEMINI_LIVE_MODEL) {
-      throw new Error("Missing GEMINI_LIVE_MODEL");
-    }
+    if (!env.GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
+    if (!env.GEMINI_LIVE_MODEL) throw new Error("Missing GEMINI_LIVE_MODEL");
 
-    // Live API WS endpoint (v1beta)
-    // Docs: wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent :contentReference[oaicite:2]{index=2}
     const url =
       "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
       `?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
@@ -52,17 +44,15 @@ class GeminiLiveSession {
     ws.on("open", () => {
       logger.info("Gemini Live WS connected", { callSid: this.callSid, streamSid: this.streamSid });
 
-      // IMPORTANT:
-      // setup.systemInstruction is STRING (not Content object) and field name is camelCase. :contentReference[oaicite:3]{index=3}
+      // IMPORTANT: Live API expects camelCase "systemInstruction" as a STRING.
       const systemInstruction = this._buildSystemInstruction();
 
       const setupMsg = {
         setup: {
           model: this._normalizeModel(env.GEMINI_LIVE_MODEL),
-          systemInstruction,
+          systemInstruction, // <-- MUST be camelCase and string
           generationConfig: {
             responseModalities: ["AUDIO"],
-            // low-latency defaults; you can tune later
             temperature: 0.4,
           },
         },
@@ -76,32 +66,24 @@ class GeminiLiveSession {
       try {
         msg = JSON.parse(data.toString("utf8"));
       } catch {
-        // sometimes servers can send non-json, ignore
         return;
       }
 
-      // setupComplete ack
       if (msg?.setupComplete) {
         this._setupAck = true;
 
-        // flush pending audio
         const pending = this._pendingAudio;
         this._pendingAudio = [];
         for (const b64 of pending) this._sendRealtimeAudio(b64);
-
         return;
       }
 
-      // serverContent: can contain modelTurn parts incl audio inlineData
       const serverContent = msg?.serverContent;
-      if (serverContent?.modelTurn?.parts?.length) {
-        for (const part of serverContent.modelTurn.parts) {
-          // audio chunk
-          if (part?.inlineData?.data && part?.inlineData?.mimeType) {
+      const parts = serverContent?.modelTurn?.parts;
+      if (Array.isArray(parts)) {
+        for (const part of parts) {
+          if (part?.inlineData?.data && typeof part.inlineData.mimeType === "string") {
             const mime = part.inlineData.mimeType;
-
-            // We expect PCM back (often 24k). Convert -> ulaw8k for Twilio.
-            // If mime includes rate=24000 => convert accordingly (this helper assumes 24k PCM16 LE).
             if (mime.startsWith("audio/pcm")) {
               const b64Pcm = part.inlineData.data;
               const b64Ulaw = pcm24kB64ToUlaw8kB64(b64Pcm);
@@ -109,14 +91,11 @@ class GeminiLiveSession {
             }
           }
 
-          // sometimes text is returned as well
           if (typeof part?.text === "string" && part.text.trim()) {
             this.onGeminiText(part.text);
           }
         }
       }
-
-      // toolCall / etc can come later; ignore for MVP
     });
 
     ws.on("close", (code, reasonBuf) => {
@@ -135,17 +114,14 @@ class GeminiLiveSession {
   }
 
   pushTwilioUlaw8k(twilioUlawB64) {
-    if (!this._geminiWs) return;
-    if (this._stopping) return;
+    if (!this._geminiWs || this._stopping) return;
 
-    // Twilio ulaw8k base64 -> PCM16k base64
     const pcm16kB64 = ulaw8kB64ToPcm16kB64(twilioUlawB64);
     if (!pcm16kB64) return;
 
     if (!this._setupAck) {
-      // buffer until setupComplete
       this._pendingAudio.push(pcm16kB64);
-      if (this._pendingAudio.length > 50) this._pendingAudio.shift(); // cap
+      if (this._pendingAudio.length > 50) this._pendingAudio.shift();
       return;
     }
 
@@ -156,7 +132,6 @@ class GeminiLiveSession {
     const ws = this._geminiWs;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    // realtimeInput.audio is Blob (mimeType+data) :contentReference[oaicite:4]{index=4}
     const msg = {
       realtimeInput: {
         audio: {
@@ -181,7 +156,6 @@ class GeminiLiveSession {
 
     try {
       if (this._geminiWs && this._geminiWs.readyState === WebSocket.OPEN) {
-        // tell server audio stream ended (optional)
         this._geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
       }
     } catch {}
@@ -194,14 +168,11 @@ class GeminiLiveSession {
   }
 
   _normalizeModel(modelEnv) {
-    // Accept either "models/..." or raw name
     if (modelEnv.startsWith("models/")) return modelEnv;
     return `models/${modelEnv}`;
   }
 
   _buildSystemInstruction() {
-    // MVP: keep it minimal. We’ll later inject SSOT prompts, languages, lead rules, closing hangup, etc.
-    // NOTE: Live API expects STRING here. :contentReference[oaicite:5]{index=5}
     return [
       "You are a Hebrew phone voice assistant for a business.",
       "Be concise and natural.",
