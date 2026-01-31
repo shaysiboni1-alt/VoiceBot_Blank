@@ -1,9 +1,15 @@
-// src/ws/twilioMediaWs.js
 "use strict";
 
 const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
+
+/**
+ * Twilio <-> Gemini Live realtime audio bridge (API KEY mode)
+ * - RX: Twilio μ-law 8k -> Gemini realtimeInput.audio
+ * - TX: Gemini inlineData audio -> Twilio media payload
+ * - No intents, no closing, no hangup (yet)
+ */
 
 function attachTwilioMediaWs(httpServer) {
   const wss = new WebSocket.Server({
@@ -16,84 +22,76 @@ function attachTwilioMediaWs(httpServer) {
 
     let callSid = null;
     let streamSid = null;
-    let geminiWs = null;
+
+    // --- Gemini Live WS ---
+    const geminiUrl =
+      "wss://generativelanguage.googleapis.com/ws/" +
+      "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
+      "?key=" + encodeURIComponent(env.GEMINI_API_KEY);
+
+    const geminiWs = new WebSocket(geminiUrl);
     let geminiReady = false;
 
-    function connectGemini() {
-      const url =
-        "wss://generativelanguage.googleapis.com/v1beta/models/" +
-        env.GEMINI_LIVE_MODEL +
-        ":streamGenerateContent?key=" +
-        env.GEMINI_API_KEY;
+    geminiWs.on("open", () => {
+      geminiReady = true;
+      logger.info("Gemini Live WS connected");
 
-      geminiWs = new WebSocket(url, {
-        headers: {
-          "Content-Type": "application/json"
+      // Setup message (required)
+      geminiWs.send(JSON.stringify({
+        setup: {
+          model: `models/${env.GEMINI_LIVE_MODEL}`,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            temperature: 0.4
+          },
+          systemInstruction:
+            "אתה בוט קולי בעברית. דבר ברור, קצר וטבעי. אל תמציא מידע."
         }
-      });
+      }));
+    });
 
-      geminiWs.on("open", () => {
-        geminiReady = true;
-        logger.info("Gemini Live WS connected");
-
-        // Initial config message
-        geminiWs.send(
-          JSON.stringify({
-            setup: {
-              generation_config: {
-                audio_config: {
-                  audio_encoding: "MULAW",
-                  sample_rate_hz: 8000
-                }
-              }
-            }
-          })
-        );
-      });
-
-      geminiWs.on("message", (data) => {
-        let msg;
-        try {
-          msg = JSON.parse(data.toString("utf8"));
-        } catch {
-          return;
-        }
-
-        const audio =
-          msg?.candidates?.[0]?.content?.parts?.find(
-            (p) => p.inlineData && p.inlineData.mimeType === "audio/mulaw"
-          )?.inlineData?.data;
-
-        if (audio) {
-          // Send audio back to Twilio
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: {
-                payload: audio
-              }
-            })
-          );
-        }
-      });
-
-      geminiWs.on("close", () => {
-        geminiReady = false;
-        logger.info("Gemini Live WS closed");
-      });
-
-      geminiWs.on("error", (err) => {
-        logger.error("Gemini Live WS error", { error: err.message });
-      });
-    }
-
-    connectGemini();
-
-    twilioWs.on("message", (data) => {
+    geminiWs.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
+      } catch {
+        return;
+      }
+
+      const parts = msg?.serverContent?.modelTurn?.parts;
+      if (!Array.isArray(parts)) return;
+
+      for (const p of parts) {
+        if (p.inlineData && p.inlineData.data) {
+          // Gemini returns base64 audio
+          twilioWs.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: {
+              payload: p.inlineData.data
+            }
+          }));
+        }
+
+        if (typeof p.text === "string" && env.MB_LOG_ASSISTANT_TEXT) {
+          logger.info("Assistant text", { callSid, text: p.text });
+        }
+      }
+    });
+
+    geminiWs.on("error", (err) => {
+      logger.error("Gemini Live WS error", { error: err.message });
+    });
+
+    geminiWs.on("close", () => {
+      logger.info("Gemini Live WS closed");
+    });
+
+    // --- Twilio WS ---
+    twilioWs.on("message", (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString("utf8"));
       } catch {
         return;
       }
@@ -108,17 +106,15 @@ function attachTwilioMediaWs(httpServer) {
       if (msg.event === "media") {
         if (!geminiReady) return;
 
-        geminiWs.send(
-          JSON.stringify({
-            input: {
-              audio: {
-                data: msg.media.payload,
-                encoding: "MULAW",
-                sample_rate_hz: 8000
-              }
+        // Forward μ-law audio to Gemini
+        geminiWs.send(JSON.stringify({
+          realtimeInput: {
+            audio: {
+              mimeType: "audio/x-mulaw;rate=8000",
+              data: msg.media.payload
             }
-          })
-        );
+          }
+        }));
         return;
       }
 
@@ -130,13 +126,12 @@ function attachTwilioMediaWs(httpServer) {
 
     twilioWs.on("close", () => {
       logger.info("Twilio media WS closed", { streamSid, callSid });
-      try {
-        geminiWs && geminiWs.close();
-      } catch {}
+      try { geminiWs.close(); } catch {}
     });
 
     twilioWs.on("error", (err) => {
       logger.error("Twilio WS error", { error: err.message });
+      try { geminiWs.close(); } catch {}
     });
   });
 }
