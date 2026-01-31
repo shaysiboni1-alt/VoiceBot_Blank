@@ -1,18 +1,9 @@
 "use strict";
 
-function req(name) {
-  const v = process.env[name];
-  if (v === undefined || v === null || v === "") {
-    throw new Error(`Missing required env var: ${name}`);
-  }
-  return v;
-}
-
 function opt(name, def = "") {
   const v = process.env[name];
   return v === undefined || v === null ? def : v;
 }
-
 function optInt(name, def) {
   const v = process.env[name];
   if (v === undefined || v === null || v === "") return def;
@@ -20,7 +11,6 @@ function optInt(name, def) {
   if (Number.isNaN(n)) throw new Error(`Invalid int env var ${name}: ${v}`);
   return n;
 }
-
 function optFloat(name, def) {
   const v = process.env[name];
   if (v === undefined || v === null || v === "") return def;
@@ -28,7 +18,6 @@ function optFloat(name, def) {
   if (Number.isNaN(n)) throw new Error(`Invalid float env var ${name}: ${v}`);
   return n;
 }
-
 function optBool(name, def) {
   const v = process.env[name];
   if (v === undefined || v === null || v === "") return def;
@@ -59,12 +48,12 @@ const env = {
   TWILIO_ACCOUNT_SID: opt("TWILIO_ACCOUNT_SID", ""),
   TWILIO_AUTH_TOKEN: opt("TWILIO_AUTH_TOKEN", ""),
 
-  // Webhooks
+  // Webhooks (עוד לא מחובר ב-MVP הזה)
   CALL_LOG_WEBHOOK_URL: opt("CALL_LOG_WEBHOOK_URL", ""),
   FINAL_WEBHOOK_URL: opt("FINAL_WEBHOOK_URL", ""),
   ABANDONED_WEBHOOK_URL: opt("ABANDONED_WEBHOOK_URL", ""),
 
-  // VAD / Silence
+  // VAD / Silence (עוד לא בשימוש ב-MVP הזה)
   MB_VAD_PREFIX_MS: optInt("MB_VAD_PREFIX_MS", 200),
   MB_VAD_SILENCE_MS: optInt("MB_VAD_SILENCE_MS", 900),
   MB_VAD_THRESHOLD: optFloat("MB_VAD_THRESHOLD", 0.65),
@@ -83,13 +72,13 @@ const env = {
   MB_LOG_TURNS_MAX_CHARS: optInt("MB_LOG_TURNS_MAX_CHARS", 900),
   MB_LOG_ASSISTANT_TEXT: optBool("MB_LOG_ASSISTANT_TEXT", false),
 
-  // Lead parser (future)
+  // Lead parser (אח"כ)
   LEAD_PARSER_ENABLED: optBool("LEAD_PARSER_ENABLED", true),
   LEAD_PARSER_MODE: opt("LEAD_PARSER_MODE", "postcall"),
   LEAD_SUMMARY_STYLE: opt("LEAD_SUMMARY_STYLE", "crm_short"),
 
-  // Voice (optional)
-  VOICE_NAME_OVERRIDE: opt("VOICE_NAME_OVERRIDE", "")
+  // Voice
+  VOICE_NAME_OVERRIDE: opt("VOICE_NAME_OVERRIDE", "Kore")
 };
 
-module.exports = { env, req };
+module.exports = { env };
