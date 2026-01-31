@@ -1,170 +1,246 @@
+// src/vendor/geminiLiveSession.js
 "use strict";
 
 const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
-const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 
-function normalizeModelName(m) {
-  // Google expects: "models/<model>"
-  if (!m) return "";
-  if (m.startsWith("models/")) return m;
-  return `models/${m}`;
-}
+// Gemini Live WS endpoint (Google AI for Developers - Live API)
+function buildGeminiLiveWsUrl() {
+  // Live API endpoint (key-based)
+  // NOTE: we keep this minimal; you already have a working connection.
+  const model = env.GEMINI_LIVE_MODEL;
+  if (!model) throw new Error("Missing GEMINI_LIVE_MODEL");
+  if (!env.GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
 
-function liveWsUrl() {
-  // Live API WS endpoint (API key)
-  // wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=...
-  const key = env.GEMINI_API_KEY;
-  if (!key) throw new Error("Missing GEMINI_API_KEY");
+  // This is the Live API websocket endpoint pattern (you already reached "connected").
+  // Keep as-is if your repo already uses a different URL builder that works.
   return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
-    key
+    env.GEMINI_API_KEY
   )}`;
 }
 
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 class GeminiLiveSession {
-  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, meta }) {
+  constructor({
+    callSid,
+    streamSid,
+    systemInstructionText,
+    onGeminiAudioUlaw8kBase64,
+    onGeminiInputTranscript,
+    onGeminiOutputTranscript,
+    onGeminiText
+  }) {
+    this.callSid = callSid || "";
+    this.streamSid = streamSid || "";
+    this.systemInstructionText = systemInstructionText || "";
+
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
+    this.onGeminiInputTranscript = onGeminiInputTranscript;
+    this.onGeminiOutputTranscript = onGeminiOutputTranscript;
     this.onGeminiText = onGeminiText;
-    this.meta = meta || {};
+
     this.ws = null;
-    this.ready = false;
+    this.setupComplete = false;
     this.closed = false;
   }
 
-  start() {
+  async start() {
     if (this.ws) return;
 
-    const url = liveWsUrl();
+    const url = buildGeminiLiveWsUrl();
     this.ws = new WebSocket(url);
 
     this.ws.on("open", () => {
-      logger.info("Gemini Live WS connected", this.meta);
+      logger.info("Gemini Live WS connected", {
+        callSid: this.callSid,
+        streamSid: this.streamSid
+      });
 
-      // MVP: בלי systemInstruction כדי לא ליפול על 1007.
-      // מבקשים AUDIO; נותנים voice.
-      const setup = {
+      // IMPORTANT:
+      // setup.systemInstruction MUST be Content (not string).
+      // Also enable inputTranscription/outputTranscription so we get full transcripts.
+      const setupMsg = {
         setup: {
-          model: normalizeModelName(env.GEMINI_LIVE_MODEL),
+          model: `models/${env.GEMINI_LIVE_MODEL}`,
+
+          // System instruction must be Content with parts[].text
+          systemInstruction: this.systemInstructionText
+            ? { parts: [{ text: this.systemInstructionText }] }
+            : undefined,
+
+          // Realtime config: keep minimal.
+          realtimeInputConfig: {
+            // Turn on transcripts for both sides
+            inputAudioTranscription: {},
+            outputAudioTranscription: {}
+          },
+
+          // Optional: ask for audio+text (depends on model; audio is what we need)
           generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: env.VOICE_NAME_OVERRIDE || "Kore"
-                }
-              }
-            }
+            // Keep defaults; do not force language here.
           }
         }
       };
 
-      try {
-        this.ws.send(JSON.stringify(setup));
-        this.ready = true;
-      } catch (e) {
-        logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
-      }
+      // Remove undefined fields (clean JSON)
+      if (!setupMsg.setup.systemInstruction) delete setupMsg.setup.systemInstruction;
+
+      this.ws.send(JSON.stringify(setupMsg));
     });
 
     this.ws.on("message", (data) => {
-      let msg;
-      try {
-        msg = JSON.parse(data.toString("utf8"));
-      } catch {
+      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+      const msg = safeJsonParse(text);
+      if (!msg) {
+        logger.warn("Gemini WS non-JSON message", {
+          callSid: this.callSid,
+          streamSid: this.streamSid,
+          sample: text.slice(0, 200)
+        });
         return;
       }
 
-      // 1) AUDIO: מחפשים inlineData audio/pcm;rate=24000 (נפוץ) או audio/pcm
-      // וממירים ל-ulaw8k כדי להחזיר ל-Twilio
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
-
-        for (const p of parts) {
-          const inline = p?.inlineData;
-          if (!inline || !inline?.data || !inline?.mimeType) continue;
-
-          if (String(inline.mimeType).startsWith("audio/pcm")) {
-            // Gemini שולח PCM base64 (לעתים 24k). אנו ממירים ל-ulaw8k.
-            const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
-            if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
-              this.onGeminiAudioUlaw8kBase64(ulawB64);
-            }
-          }
-        }
-      } catch (e) {
-        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
+      // setupComplete
+      if (msg.setupComplete) {
+        this.setupComplete = true;
+        logger.info("Gemini Live setupComplete", {
+          callSid: this.callSid,
+          streamSid: this.streamSid
+        });
+        return;
       }
 
-      // 2) TEXT (אופציונלי ללוגים)
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
+      // serverContent: may contain modelTurn (text/audio parts)
+      if (msg.serverContent) {
+        const sc = msg.serverContent;
 
-        for (const p of parts) {
-          const t = p?.text;
-          if (t && this.onGeminiText) this.onGeminiText(String(t));
+        // modelTurn content (text parts)
+        if (sc.modelTurn && sc.modelTurn.parts && Array.isArray(sc.modelTurn.parts)) {
+          const texts = [];
+          for (const p of sc.modelTurn.parts) {
+            if (p && typeof p.text === "string" && p.text.trim()) texts.push(p.text.trim());
+            // Some responses may include inlineData for audio etc. We handle audio below.
+            if (p && p.inlineData && p.inlineData.data && p.inlineData.mimeType) {
+              // If Gemini returns audio as inlineData base64, we forward it.
+              // We assume it's already ulaw8k base64 per your working setup; if you convert elsewhere keep it there.
+              if (typeof this.onGeminiAudioUlaw8kBase64 === "function") {
+                this.onGeminiAudioUlaw8kBase64(p.inlineData.data, {
+                  mimeType: p.inlineData.mimeType
+                });
+              }
+            }
+          }
+          if (texts.length && typeof this.onGeminiText === "function") {
+            this.onGeminiText(texts.join("\n"));
+          }
         }
-      } catch {}
+
+        return;
+      }
+
+      // inputTranscription: caller transcript
+      if (msg.inputTranscription) {
+        const t = msg.inputTranscription;
+        const transcriptText =
+          (t.text && String(t.text)) ||
+          (t.transcript && String(t.transcript)) ||
+          "";
+
+        if (transcriptText.trim()) {
+          if (env.MB_LOG_TRANSCRIPTS) {
+            logger.info("Transcript IN", {
+              callSid: this.callSid,
+              streamSid: this.streamSid,
+              text: transcriptText
+            });
+          }
+          if (typeof this.onGeminiInputTranscript === "function") {
+            this.onGeminiInputTranscript(transcriptText);
+          }
+        }
+        return;
+      }
+
+      // outputTranscription: bot transcript
+      if (msg.outputTranscription) {
+        const t = msg.outputTranscription;
+        const transcriptText =
+          (t.text && String(t.text)) ||
+          (t.transcript && String(t.transcript)) ||
+          "";
+
+        if (transcriptText.trim()) {
+          if (env.MB_LOG_TRANSCRIPTS) {
+            logger.info("Transcript OUT", {
+              callSid: this.callSid,
+              streamSid: this.streamSid,
+              text: transcriptText
+            });
+          }
+          if (typeof this.onGeminiOutputTranscript === "function") {
+            this.onGeminiOutputTranscript(transcriptText);
+          }
+        }
+        return;
+      }
+
+      // usageMetadata etc – ignore for now
     });
 
-    this.ws.on("close", (code, reasonBuf) => {
-      const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
+    this.ws.on("close", (code, reason) => {
       this.closed = true;
-      this.ready = false;
-      logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
+      logger.info("Gemini Live WS closed", {
+        callSid: this.callSid,
+        streamSid: this.streamSid,
+        code,
+        reason: reason ? reason.toString() : ""
+      });
     });
 
     this.ws.on("error", (err) => {
-      logger.error("Gemini Live WS error", { ...this.meta, error: err.message });
+      logger.error("Gemini Live WS error", {
+        callSid: this.callSid,
+        streamSid: this.streamSid,
+        error: err && err.message ? err.message : String(err)
+      });
     });
   }
 
-  sendUlaw8kFromTwilio(ulaw8kB64) {
-    if (!this.ws || this.closed || !this.ready) return;
+  sendAudioUlaw8kBase64(ulaw8kBase64) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.setupComplete) return;
 
-    // Twilio μ-law 8k -> PCM16k base64
-    const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
-
-    // Live API realtimeInput audio
+    // Realtime audio input message
+    // This is the standard pattern: realtimeInput.mediaChunks[]
     const msg = {
       realtimeInput: {
         mediaChunks: [
           {
-            mimeType: "audio/pcm;rate=16000",
-            data: pcm16kB64
+            mimeType: "audio/pcm;rate=8000", // keep if your working code uses something else
+            data: ulaw8kBase64
           }
         ]
       }
     };
 
-    try {
-      this.ws.send(JSON.stringify(msg));
-    } catch (e) {
-      logger.debug("Failed sending audio to Gemini", { ...this.meta, error: e.message });
-    }
-  }
-
-  endInput() {
-    if (!this.ws || this.closed) return;
-    try {
-      // מסמן סיום זרם אודיו (כדי לגרום למודל לסגור turn)
-      this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-    } catch {}
+    // NOTE:
+    // If your current working bridge expects ulaw8k directly with a different mimeType,
+    // keep the mimeType exactly as in your working branch.
+    this.ws.send(JSON.stringify(msg));
   }
 
   stop() {
-    if (!this.ws) return;
     try {
-      this.ws.close();
-    } catch {}
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.close(1000, "client_stop");
+    } catch (_) {}
   }
 }
 
