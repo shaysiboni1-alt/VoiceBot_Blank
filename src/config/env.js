@@ -1,120 +1,95 @@
-// src/config/env.js
 "use strict";
 
-function required(name) {
+function req(name) {
   const v = process.env[name];
-  if (v === undefined || v === null || String(v).trim() === "") {
-    throw new Error(`Missing required ENV: ${name}`);
-  }
-  return String(v);
-}
-
-function optional(name, fallback = "") {
-  const v = process.env[name];
-  if (v === undefined || v === null) return fallback;
-  return String(v);
-}
-
-function bool(name, fallback = "false") {
-  const raw = optional(name, fallback).trim().toLowerCase();
-  return raw === "true" || raw === "1" || raw === "yes";
-}
-
-function num(name, fallback) {
-  const raw = optional(name, fallback);
-  const n = Number(raw);
-  if (!Number.isFinite(n)) throw new Error(`Invalid number ENV: ${name}`);
-  return n;
-}
-
-function oneOf(name, allowed, fallback) {
-  const v = optional(name, fallback).trim();
-  if (!allowed.includes(v)) {
-    throw new Error(`Invalid ENV ${name}="${v}". Allowed: ${allowed.join(", ")}`);
+  if (v === undefined || v === null || v === "") {
+    throw new Error(`Missing required env var: ${name}`);
   }
   return v;
 }
 
-// ===== Canonical locked names (DO NOT CHANGE) =====
-
-const env = Object.freeze({
-  // Core
-  PORT: num("PORT", "10000"),
-  TIME_ZONE: required("TIME_ZONE"),
-  PROVIDER_MODE: oneOf("PROVIDER_MODE", ["gemini", "openai"], "gemini"),
-  PUBLIC_BASE_URL: optional("PUBLIC_BASE_URL", ""),
-
-  // SSOT
-  GSHEET_ID: required("GSHEET_ID"),
-  GOOGLE_SERVICE_ACCOUNT_JSON_B64: required("GOOGLE_SERVICE_ACCOUNT_JSON_B64"),
-  SSOT_TTL_MS: num("SSOT_TTL_MS", "60000"),
-
-  // Webhooks
-  CALL_LOG_WEBHOOK_URL: optional("CALL_LOG_WEBHOOK_URL", ""),
-  FINAL_WEBHOOK_URL: optional("FINAL_WEBHOOK_URL", ""),
-  ABANDONED_WEBHOOK_URL: optional("ABANDONED_WEBHOOK_URL", ""),
-
-  // DB
-  DATABASE_URL: required("DATABASE_URL"),
-
-  // Gemini (provider)
-  GEMINI_API_KEY: optional("GEMINI_API_KEY", ""),
-  GEMINI_LIVE_MODEL: optional("GEMINI_LIVE_MODEL", ""),
-  GEMINI_LOCATION: optional("GEMINI_LOCATION", ""),
-  GEMINI_PROJECT_ID: optional("GEMINI_PROJECT_ID", ""),
-  GEMINI_VERTEX_ENABLED: bool("GEMINI_VERTEX_ENABLED", "false"),
-  GEMINI_AUDIO_IN_FORMAT: optional("GEMINI_AUDIO_IN_FORMAT", "ulaw8k"),
-  GEMINI_AUDIO_OUT_FORMAT: optional("GEMINI_AUDIO_OUT_FORMAT", "ulaw8k"),
-
-  // Twilio
-  TWILIO_ACCOUNT_SID: required("TWILIO_ACCOUNT_SID"),
-  TWILIO_AUTH_TOKEN: optional("TWILIO_AUTH_TOKEN", ""),
-
-  // Voice / prompts
-  VOICE_NAME_OVERRIDE: optional("VOICE_NAME_OVERRIDE", ""),
-
-  // Lead parser / summary (locked names)
-  LEAD_PARSER_ENABLED: bool("LEAD_PARSER_ENABLED", "true"),
-  LEAD_PARSER_MODE: optional("LEAD_PARSER_MODE", "postcall"),
-  LEAD_SUMMARY_STYLE: optional("LEAD_SUMMARY_STYLE", "crm_short"),
-
-  // Silence prompts
-  SILENCE_T1_MS: num("SILENCE_T1_MS", "5000"),
-  SILENCE_T2_MS: num("SILENCE_T2_MS", "9000"),
-  SILENCE_T3_MS: num("SILENCE_T3_MS", "14000"),
-  SILENCE_PROMPT_1: optional("SILENCE_PROMPT_1", ""),
-  SILENCE_PROMPT_2: optional("SILENCE_PROMPT_2", ""),
-  SILENCE_PROMPT_3: optional("SILENCE_PROMPT_3", ""),
-
-  // VAD / barge-in / logs (locked names)
-  MB_DEBUG: bool("MB_DEBUG", "false"),
-  MB_ENABLE_RECORDING: bool("MB_ENABLE_RECORDING", "true"),
-  MB_LOG_ASSISTANT_TEXT: bool("MB_LOG_ASSISTANT_TEXT", "false"),
-  MB_LOG_TRANSCRIPTS: bool("MB_LOG_TRANSCRIPTS", "true"),
-  MB_LOG_TURNS: bool("MB_LOG_TURNS", "true"),
-  MB_LOG_TURNS_MAX_CHARS: num("MB_LOG_TURNS_MAX_CHARS", "900"),
-
-  MB_VAD_PREFIX_MS: num("MB_VAD_PREFIX_MS", "200"),
-  MB_VAD_SILENCE_MS: num("MB_VAD_SILENCE_MS", "900"),
-  MB_VAD_THRESHOLD: num("MB_VAD_THRESHOLD", "0.65"),
-
-  MB_BARGEIN_ENABLED: bool("MB_BARGEIN_ENABLED", "true"),
-  MB_BARGEIN_MIN_MS: num("MB_BARGEIN_MIN_MS", "250"),
-  MB_BARGEIN_COOLDOWN_MS: num("MB_BARGEIN_COOLDOWN_MS", "600"),
-  MB_BARGEIN_AUDIO_DROP_MS: num("MB_BARGEIN_AUDIO_DROP_MS", "0")
-});
-
-// Provider-specific strictness (רק בדיקות בסיסיות)
-if (env.PROVIDER_MODE === "gemini") {
-  // אם אתה עובד דרך Vertex: חייב GEMINI_PROJECT_ID + GEMINI_LOCATION
-  if (env.GEMINI_VERTEX_ENABLED) {
-    if (!env.GEMINI_PROJECT_ID) throw new Error("Missing required ENV for Vertex: GEMINI_PROJECT_ID");
-    if (!env.GEMINI_LOCATION) throw new Error("Missing required ENV for Vertex: GEMINI_LOCATION");
-  } else {
-    // אם לא Vertex — לרוב תעבוד עם API Key
-    if (!env.GEMINI_API_KEY) throw new Error("Missing required ENV for Gemini API: GEMINI_API_KEY");
-  }
+function opt(name, def = "") {
+  const v = process.env[name];
+  return v === undefined || v === null ? def : v;
 }
 
-module.exports = { env };
+function optInt(name, def) {
+  const v = process.env[name];
+  if (v === undefined || v === null || v === "") return def;
+  const n = parseInt(v, 10);
+  if (Number.isNaN(n)) throw new Error(`Invalid int env var ${name}: ${v}`);
+  return n;
+}
 
+function optFloat(name, def) {
+  const v = process.env[name];
+  if (v === undefined || v === null || v === "") return def;
+  const n = parseFloat(v);
+  if (Number.isNaN(n)) throw new Error(`Invalid float env var ${name}: ${v}`);
+  return n;
+}
+
+function optBool(name, def) {
+  const v = process.env[name];
+  if (v === undefined || v === null || v === "") return def;
+  return String(v).toLowerCase() === "true";
+}
+
+const env = {
+  PORT: optInt("PORT", 10000),
+  PROVIDER_MODE: opt("PROVIDER_MODE", "gemini"),
+  TIME_ZONE: opt("TIME_ZONE", "Asia/Jerusalem"),
+  PUBLIC_BASE_URL: opt("PUBLIC_BASE_URL", ""),
+
+  // SSOT
+  GSHEET_ID: opt("GSHEET_ID", ""),
+  GOOGLE_SERVICE_ACCOUNT_JSON_B64: opt("GOOGLE_SERVICE_ACCOUNT_JSON_B64", ""),
+  SSOT_TTL_MS: optInt("SSOT_TTL_MS", 60000),
+
+  // Gemini
+  GEMINI_API_KEY: opt("GEMINI_API_KEY", ""),
+  GEMINI_LIVE_MODEL: opt("GEMINI_LIVE_MODEL", ""),
+  GEMINI_LOCATION: opt("GEMINI_LOCATION", "us-central1"),
+  GEMINI_PROJECT_ID: opt("GEMINI_PROJECT_ID", ""),
+  GEMINI_VERTEX_ENABLED: optBool("GEMINI_VERTEX_ENABLED", false),
+  GEMINI_AUDIO_IN_FORMAT: opt("GEMINI_AUDIO_IN_FORMAT", "ulaw8k"),
+  GEMINI_AUDIO_OUT_FORMAT: opt("GEMINI_AUDIO_OUT_FORMAT", "ulaw8k"),
+
+  // Twilio
+  TWILIO_ACCOUNT_SID: opt("TWILIO_ACCOUNT_SID", ""),
+  TWILIO_AUTH_TOKEN: opt("TWILIO_AUTH_TOKEN", ""),
+
+  // Webhooks
+  CALL_LOG_WEBHOOK_URL: opt("CALL_LOG_WEBHOOK_URL", ""),
+  FINAL_WEBHOOK_URL: opt("FINAL_WEBHOOK_URL", ""),
+  ABANDONED_WEBHOOK_URL: opt("ABANDONED_WEBHOOK_URL", ""),
+
+  // VAD / Silence
+  MB_VAD_PREFIX_MS: optInt("MB_VAD_PREFIX_MS", 200),
+  MB_VAD_SILENCE_MS: optInt("MB_VAD_SILENCE_MS", 900),
+  MB_VAD_THRESHOLD: optFloat("MB_VAD_THRESHOLD", 0.65),
+
+  SILENCE_T1_MS: optInt("SILENCE_T1_MS", 5000),
+  SILENCE_T2_MS: optInt("SILENCE_T2_MS", 9000),
+  SILENCE_T3_MS: optInt("SILENCE_T3_MS", 14000),
+  SILENCE_PROMPT_1: opt("SILENCE_PROMPT_1", ""),
+  SILENCE_PROMPT_2: opt("SILENCE_PROMPT_2", ""),
+  SILENCE_PROMPT_3: opt("SILENCE_PROMPT_3", ""),
+
+  // Logs
+  MB_DEBUG: optBool("MB_DEBUG", false),
+  MB_LOG_TRANSCRIPTS: optBool("MB_LOG_TRANSCRIPTS", true),
+  MB_LOG_TURNS: optBool("MB_LOG_TURNS", true),
+  MB_LOG_TURNS_MAX_CHARS: optInt("MB_LOG_TURNS_MAX_CHARS", 900),
+  MB_LOG_ASSISTANT_TEXT: optBool("MB_LOG_ASSISTANT_TEXT", false),
+
+  // Lead parser (future)
+  LEAD_PARSER_ENABLED: optBool("LEAD_PARSER_ENABLED", true),
+  LEAD_PARSER_MODE: opt("LEAD_PARSER_MODE", "postcall"),
+  LEAD_SUMMARY_STYLE: opt("LEAD_SUMMARY_STYLE", "crm_short"),
+
+  // Voice (optional)
+  VOICE_NAME_OVERRIDE: opt("VOICE_NAME_OVERRIDE", "")
+};
+
+module.exports = { env, req };
