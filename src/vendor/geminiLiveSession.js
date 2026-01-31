@@ -1,4 +1,3 @@
-// src/vendor/geminiLiveSession.js
 "use strict";
 
 const WebSocket = require("ws");
@@ -6,62 +5,69 @@ const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 
+function normalizeModelName(m) {
+  // Google expects: "models/<model>"
+  if (!m) return "";
+  if (m.startsWith("models/")) return m;
+  return `models/${m}`;
+}
+
+function liveWsUrl() {
+  // Live API WS endpoint (API key)
+  // wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=...
+  const key = env.GEMINI_API_KEY;
+  if (!key) throw new Error("Missing GEMINI_API_KEY");
+  return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+    key
+  )}`;
+}
+
 class GeminiLiveSession {
-  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText }) {
+  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, meta }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
     this.onGeminiText = onGeminiText;
-
-    this.streamSid = null;
-    this.callSid = null;
-    this.customParameters = {};
-
-    this._geminiWs = null;
-    this._started = false;
-    this._setupAck = false;
-    this._stopping = false;
-    this._pendingAudio = [];
+    this.meta = meta || {};
+    this.ws = null;
+    this.ready = false;
+    this.closed = false;
   }
 
-  async start() {
-    if (this._started) return;
-    this._started = true;
+  start() {
+    if (this.ws) return;
 
-    if (!env.GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
-    if (!env.GEMINI_LIVE_MODEL) throw new Error("Missing GEMINI_LIVE_MODEL");
+    const url = liveWsUrl();
+    this.ws = new WebSocket(url);
 
-    const url =
-      "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
-      `?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+    this.ws.on("open", () => {
+      logger.info("Gemini Live WS connected", this.meta);
 
-    const ws = new WebSocket(url, {
-      perMessageDeflate: false,
-      handshakeTimeout: 15000,
-      maxPayload: 16 * 1024 * 1024,
-    });
-
-    this._geminiWs = ws;
-
-    ws.on("open", () => {
-      logger.info("Gemini Live WS connected", { callSid: this.callSid, streamSid: this.streamSid });
-
-      // IMPORTANT: Live API expects camelCase "systemInstruction" as a STRING.
-      const systemInstruction = this._buildSystemInstruction();
-
-      const setupMsg = {
+      // MVP: בלי systemInstruction כדי לא ליפול על 1007.
+      // מבקשים AUDIO; נותנים voice.
+      const setup = {
         setup: {
-          model: this._normalizeModel(env.GEMINI_LIVE_MODEL),
-          systemInstruction, // <-- MUST be camelCase and string
+          model: normalizeModelName(env.GEMINI_LIVE_MODEL),
           generationConfig: {
             responseModalities: ["AUDIO"],
-            temperature: 0.4,
-          },
-        },
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: env.VOICE_NAME_OVERRIDE || "Kore"
+                }
+              }
+            }
+          }
+        }
       };
 
-      ws.send(JSON.stringify(setupMsg));
+      try {
+        this.ws.send(JSON.stringify(setup));
+        this.ready = true;
+      } catch (e) {
+        logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
+      }
     });
 
-    ws.on("message", (data) => {
+    this.ws.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
@@ -69,115 +75,96 @@ class GeminiLiveSession {
         return;
       }
 
-      if (msg?.setupComplete) {
-        this._setupAck = true;
+      // 1) AUDIO: מחפשים inlineData audio/pcm;rate=24000 (נפוץ) או audio/pcm
+      // וממירים ל-ulaw8k כדי להחזיר ל-Twilio
+      try {
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.serverContent?.turn?.parts ||
+          msg?.serverContent?.parts ||
+          [];
 
-        const pending = this._pendingAudio;
-        this._pendingAudio = [];
-        for (const b64 of pending) this._sendRealtimeAudio(b64);
-        return;
-      }
+        for (const p of parts) {
+          const inline = p?.inlineData;
+          if (!inline || !inline?.data || !inline?.mimeType) continue;
 
-      const serverContent = msg?.serverContent;
-      const parts = serverContent?.modelTurn?.parts;
-      if (Array.isArray(parts)) {
-        for (const part of parts) {
-          if (part?.inlineData?.data && typeof part.inlineData.mimeType === "string") {
-            const mime = part.inlineData.mimeType;
-            if (mime.startsWith("audio/pcm")) {
-              const b64Pcm = part.inlineData.data;
-              const b64Ulaw = pcm24kB64ToUlaw8kB64(b64Pcm);
-              if (b64Ulaw) this.onGeminiAudioUlaw8kBase64(b64Ulaw);
+          if (String(inline.mimeType).startsWith("audio/pcm")) {
+            // Gemini שולח PCM base64 (לעתים 24k). אנו ממירים ל-ulaw8k.
+            const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
+            if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
+              this.onGeminiAudioUlaw8kBase64(ulawB64);
             }
           }
-
-          if (typeof part?.text === "string" && part.text.trim()) {
-            this.onGeminiText(part.text);
-          }
         }
+      } catch (e) {
+        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
       }
+
+      // 2) TEXT (אופציונלי ללוגים)
+      try {
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.serverContent?.turn?.parts ||
+          msg?.serverContent?.parts ||
+          [];
+
+        for (const p of parts) {
+          const t = p?.text;
+          if (t && this.onGeminiText) this.onGeminiText(String(t));
+        }
+      } catch {}
     });
 
-    ws.on("close", (code, reasonBuf) => {
+    this.ws.on("close", (code, reasonBuf) => {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
-      logger.info("Gemini Live WS closed", {
-        callSid: this.callSid,
-        streamSid: this.streamSid,
-        code,
-        reason,
-      });
+      this.closed = true;
+      this.ready = false;
+      logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
     });
 
-    ws.on("error", (err) => {
-      logger.error("Gemini Live WS error", { error: err.message });
+    this.ws.on("error", (err) => {
+      logger.error("Gemini Live WS error", { ...this.meta, error: err.message });
     });
   }
 
-  pushTwilioUlaw8k(twilioUlawB64) {
-    if (!this._geminiWs || this._stopping) return;
+  sendUlaw8kFromTwilio(ulaw8kB64) {
+    if (!this.ws || this.closed || !this.ready) return;
 
-    const pcm16kB64 = ulaw8kB64ToPcm16kB64(twilioUlawB64);
-    if (!pcm16kB64) return;
+    // Twilio μ-law 8k -> PCM16k base64
+    const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
 
-    if (!this._setupAck) {
-      this._pendingAudio.push(pcm16kB64);
-      if (this._pendingAudio.length > 50) this._pendingAudio.shift();
-      return;
-    }
-
-    this._sendRealtimeAudio(pcm16kB64);
-  }
-
-  _sendRealtimeAudio(pcm16kB64) {
-    const ws = this._geminiWs;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
+    // Live API realtimeInput audio
     const msg = {
       realtimeInput: {
-        audio: {
-          mimeType: "audio/pcm;rate=16000",
-          data: pcm16kB64,
-        },
-      },
+        mediaChunks: [
+          {
+            mimeType: "audio/pcm;rate=16000",
+            data: pcm16kB64
+          }
+        ]
+      }
     };
 
-    ws.send(JSON.stringify(msg));
-  }
-
-  async stop(reason) {
-    if (this._stopping) return;
-    this._stopping = true;
-
-    logger.info("Session cleanup", {
-      reason,
-      streamSid: this.streamSid,
-      callSid: this.callSid,
-    });
-
     try {
-      if (this._geminiWs && this._geminiWs.readyState === WebSocket.OPEN) {
-        this._geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-      }
-    } catch {}
+      this.ws.send(JSON.stringify(msg));
+    } catch (e) {
+      logger.debug("Failed sending audio to Gemini", { ...this.meta, error: e.message });
+    }
+  }
 
+  endInput() {
+    if (!this.ws || this.closed) return;
     try {
-      if (this._geminiWs) this._geminiWs.close();
+      // מסמן סיום זרם אודיו (כדי לגרום למודל לסגור turn)
+      this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
     } catch {}
-
-    this._geminiWs = null;
   }
 
-  _normalizeModel(modelEnv) {
-    if (modelEnv.startsWith("models/")) return modelEnv;
-    return `models/${modelEnv}`;
-  }
-
-  _buildSystemInstruction() {
-    return [
-      "You are a Hebrew phone voice assistant for a business.",
-      "Be concise and natural.",
-      "Ask one question at a time.",
-    ].join(" ");
+  stop() {
+    if (!this.ws) return;
+    try {
+      this.ws.close();
+    } catch {}
   }
 }
 
