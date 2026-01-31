@@ -1,17 +1,16 @@
+// src/server.js
 "use strict";
 
 const http = require("http");
 const express = require("express");
-const WebSocket = require("ws");
+const { WebSocketServer } = require("ws");
 
 const { env } = require("./config/env");
 const { logger } = require("./utils/logger");
-
 const { healthRouter } = require("./routes/health");
 const { adminReloadRouter } = require("./routes/adminReloadSheets");
 const { loadSSOT } = require("./ssot/ssotClient");
-
-const { attachTwilioMediaBridge } = require("./telephony/twilioMediaBridge");
+const { handleTwilioMediaWs } = require("./telephony/twilioMediaStream");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -24,12 +23,8 @@ app.use((req, res) => res.status(404).json({ error: "not_found" }));
 const server = http.createServer(app);
 
 // WS server for Twilio Media Streams
-const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
-
-wss.on("connection", (ws) => {
-  logger.info("Twilio media WS connected");
-  attachTwilioMediaBridge(ws);
-});
+const wss = new WebSocketServer({ server, path: "/twilio-media-stream" });
+wss.on("connection", (ws) => handleTwilioMediaWs(ws));
 
 server.listen(env.PORT, async () => {
   logger.info("Service started", { port: env.PORT, provider_mode: env.PROVIDER_MODE });
@@ -38,6 +33,6 @@ server.listen(env.PORT, async () => {
   try {
     await loadSSOT(false);
   } catch (err) {
-    logger.error("SSOT preload failed", { error: err.message });
+    logger.error("SSOT preload failed", { error: err && err.message ? err.message : String(err) });
   }
 });
