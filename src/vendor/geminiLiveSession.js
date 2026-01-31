@@ -5,242 +5,244 @@ const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 
-// Gemini Live WS endpoint (Google AI for Developers - Live API)
-function buildGeminiLiveWsUrl() {
-  // Live API endpoint (key-based)
-  // NOTE: we keep this minimal; you already have a working connection.
-  const model = env.GEMINI_LIVE_MODEL;
-  if (!model) throw new Error("Missing GEMINI_LIVE_MODEL");
-  if (!env.GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
+// קיים אצלך בקוד: המרות Twilio (ulaw8k) <-> Gemini (pcm16/pcm24)
+const {
+  ulaw8kB64ToPcm16kB64, // ulaw8k -> pcm16 (בדרך כלל 16k)
+  pcm24kB64ToUlaw8kB64, // pcm 24k -> ulaw8k
+} = require("./twilioGeminiAudio");
 
-  // This is the Live API websocket endpoint pattern (you already reached "connected").
-  // Keep as-is if your repo already uses a different URL builder that works.
-  return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
-    env.GEMINI_API_KEY
-  )}`;
-}
-
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
+function buildSystemInstructionContent(text) {
+  // לפי הסכמה: systemInstruction הוא Content (עם parts)
+  return {
+    role: "user",
+    parts: [{ text: String(text || "") }],
+  };
 }
 
 class GeminiLiveSession {
-  constructor({
-    callSid,
-    streamSid,
-    systemInstructionText,
-    onGeminiAudioUlaw8kBase64,
-    onGeminiInputTranscript,
-    onGeminiOutputTranscript,
-    onGeminiText
-  }) {
-    this.callSid = callSid || "";
-    this.streamSid = streamSid || "";
-    this.systemInstructionText = systemInstructionText || "";
-
+  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
-    this.onGeminiInputTranscript = onGeminiInputTranscript;
-    this.onGeminiOutputTranscript = onGeminiOutputTranscript;
     this.onGeminiText = onGeminiText;
 
-    this.ws = null;
-    this.setupComplete = false;
-    this.closed = false;
+    this.streamSid = null;
+    this.callSid = null;
+    this.customParameters = {};
+
+    this._geminiWs = null;
+    this._started = false;
+    this._setupAck = false;
+    this._stopping = false;
+
+    this._pendingAudio = [];
   }
 
-  async start() {
-    if (this.ws) return;
+  _endpointUrl() {
+    // Live API websocket endpoint (API key mode)
+    // wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=...
+    // (זה ה-endpoint של Live API WebSockets reference)
+    const key = env.GEMINI_API_KEY;
+    if (!key) throw new Error("Missing GEMINI_API_KEY");
+    return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+      key
+    )}`;
+  }
 
-    const url = buildGeminiLiveWsUrl();
-    this.ws = new WebSocket(url);
+  _voiceName() {
+    // אם לא הוגדר override – נשאיר ריק (Gemini יבחר default)
+    return env.VOICE_NAME_OVERRIDE && String(env.VOICE_NAME_OVERRIDE).trim()
+      ? String(env.VOICE_NAME_OVERRIDE).trim()
+      : null;
+  }
 
-    this.ws.on("open", () => {
-      logger.info("Gemini Live WS connected", {
-        callSid: this.callSid,
-        streamSid: this.streamSid
-      });
+  _buildSetupMessage() {
+    // IMPORTANT:
+    // 1) inputAudioTranscription/outputAudioTranscription הם שדות בתוך setup (ולא בתוך realtimeInputConfig)
+    // 2) systemInstruction הוא Content (ולא string)
+    // 3) realtimeInputConfig הוא camelCase
 
-      // IMPORTANT:
-      // setup.systemInstruction MUST be Content (not string).
-      // Also enable inputTranscription/outputTranscription so we get full transcripts.
-      const setupMsg = {
-        setup: {
-          model: `models/${env.GEMINI_LIVE_MODEL}`,
+    const voiceName = this._voiceName();
 
-          // System instruction must be Content with parts[].text
-          systemInstruction: this.systemInstructionText
-            ? { parts: [{ text: this.systemInstructionText }] }
-            : undefined,
+    const setup = {
+      model: env.GEMINI_LIVE_MODEL,
+      // System instruction: Content
+      systemInstruction: buildSystemInstructionContent(
+        // כרגע מינימלי כדי לא “להפיל” את הסשן; את הפרומפט המלא נמשוך מה-SSOT בהמשך
+        "דבר/י בעברית כברירת מחדל. היה/י עוזר/ת טלפוני/ת קצר/ה וברור/ה."
+      ),
 
-          // Realtime config: keep minimal.
-          realtimeInputConfig: {
-            // Turn on transcripts for both sides
-            inputAudioTranscription: {},
-            outputAudioTranscription: {}
-          },
+      // מאפשר תמלול גם לקלט וגם לפלט (כמו שביקשת)
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
 
-          // Optional: ask for audio+text (depends on model; audio is what we need)
-          generationConfig: {
-            // Keep defaults; do not force language here.
-          }
-        }
-      };
+      // Realtime input behavior (VAD)
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          // ברירת מחדל enabled. אפשר גם להגדיר מפורש:
+          // אם תרצה לשלוט בסף/זמנים מתקדם – נוסיף אח"כ לפי הסכמה המלאה.
+        },
+      },
 
-      // Remove undefined fields (clean JSON)
-      if (!setupMsg.setup.systemInstruction) delete setupMsg.setup.systemInstruction;
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        // Voice config (אם יש override)
+        ...(voiceName
+          ? {
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName,
+                  },
+                },
+              },
+            }
+          : {}),
+      },
+    };
 
-      this.ws.send(JSON.stringify(setupMsg));
+    return { setup };
+  }
+
+  async start({ streamSid, callSid, customParameters }) {
+    if (this._started) return;
+    this._started = true;
+
+    this.streamSid = streamSid || null;
+    this.callSid = callSid || null;
+    this.customParameters = customParameters || {};
+
+    const url = this._endpointUrl();
+    const ws = new WebSocket(url);
+    this._geminiWs = ws;
+
+    ws.on("open", () => {
+      logger.info("Gemini Live WS connected", { callSid: this.callSid, streamSid: this.streamSid });
+
+      // Send setup FIRST
+      const setupMsg = this._buildSetupMessage();
+      ws.send(JSON.stringify(setupMsg));
+
+      // Flush any audio queued before setup ack (אם קיים)
+      if (this._pendingAudio.length) {
+        for (const msg of this._pendingAudio) ws.send(msg);
+        this._pendingAudio = [];
+      }
     });
 
-    this.ws.on("message", (data) => {
-      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-      const msg = safeJsonParse(text);
-      if (!msg) {
-        logger.warn("Gemini WS non-JSON message", {
-          callSid: this.callSid,
-          streamSid: this.streamSid,
-          sample: text.slice(0, 200)
-        });
-        return;
-      }
+    ws.on("message", (raw) => {
+      try {
+        const txt = raw.toString("utf8");
+        const msg = JSON.parse(txt);
 
-      // setupComplete
-      if (msg.setupComplete) {
-        this.setupComplete = true;
-        logger.info("Gemini Live setupComplete", {
-          callSid: this.callSid,
-          streamSid: this.streamSid
-        });
-        return;
-      }
+        // Setup complete ack
+        if (msg && msg.setupComplete) {
+          this._setupAck = true;
+          return;
+        }
 
-      // serverContent: may contain modelTurn (text/audio parts)
-      if (msg.serverContent) {
-        const sc = msg.serverContent;
+        // Transcription (input/output)
+        // לפי reference: BidiGenerateContentTranscription עם text
+        if (msg && msg.transcription && typeof msg.transcription.text === "string") {
+          const t = msg.transcription.text.trim();
+          if (t) this.onGeminiText && this.onGeminiText(t);
+          return;
+        }
 
-        // modelTurn content (text parts)
-        if (sc.modelTurn && sc.modelTurn.parts && Array.isArray(sc.modelTurn.parts)) {
-          const texts = [];
-          for (const p of sc.modelTurn.parts) {
-            if (p && typeof p.text === "string" && p.text.trim()) texts.push(p.text.trim());
-            // Some responses may include inlineData for audio etc. We handle audio below.
-            if (p && p.inlineData && p.inlineData.data && p.inlineData.mimeType) {
-              // If Gemini returns audio as inlineData base64, we forward it.
-              // We assume it's already ulaw8k base64 per your working setup; if you convert elsewhere keep it there.
-              if (typeof this.onGeminiAudioUlaw8kBase64 === "function") {
-                this.onGeminiAudioUlaw8kBase64(p.inlineData.data, {
-                  mimeType: p.inlineData.mimeType
-                });
-              }
+        // Server content: model audio
+        // בפועל מגיעים כמה wrappers אפשריים; נטפל בצורה "סלחנית":
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.modelTurn?.parts ||
+          msg?.content?.parts ||
+          [];
+
+        if (Array.isArray(parts) && parts.length) {
+          for (const p of parts) {
+            const inline = p.inlineData || p.inline_data;
+            if (!inline || !inline.data) continue;
+
+            const mime = String(inline.mimeType || inline.mime_type || "");
+            const b64 = String(inline.data || "");
+
+            // אנחנו מצפים לאודיו PCM מהמודל, לרוב 24k
+            if (mime.startsWith("audio/")) {
+              // Convert PCM24k base64 -> ulaw8k base64 for Twilio
+              const ulaw8 = pcm24kB64ToUlaw8kB64(b64);
+              if (ulaw8) this.onGeminiAudioUlaw8kBase64 && this.onGeminiAudioUlaw8kBase64(ulaw8);
             }
           }
-          if (texts.length && typeof this.onGeminiText === "function") {
-            this.onGeminiText(texts.join("\n"));
-          }
         }
-
-        return;
+      } catch (e) {
+        logger.warn("Gemini Live WS message parse failed", {
+          error: e.message,
+          callSid: this.callSid,
+          streamSid: this.streamSid,
+        });
       }
-
-      // inputTranscription: caller transcript
-      if (msg.inputTranscription) {
-        const t = msg.inputTranscription;
-        const transcriptText =
-          (t.text && String(t.text)) ||
-          (t.transcript && String(t.transcript)) ||
-          "";
-
-        if (transcriptText.trim()) {
-          if (env.MB_LOG_TRANSCRIPTS) {
-            logger.info("Transcript IN", {
-              callSid: this.callSid,
-              streamSid: this.streamSid,
-              text: transcriptText
-            });
-          }
-          if (typeof this.onGeminiInputTranscript === "function") {
-            this.onGeminiInputTranscript(transcriptText);
-          }
-        }
-        return;
-      }
-
-      // outputTranscription: bot transcript
-      if (msg.outputTranscription) {
-        const t = msg.outputTranscription;
-        const transcriptText =
-          (t.text && String(t.text)) ||
-          (t.transcript && String(t.transcript)) ||
-          "";
-
-        if (transcriptText.trim()) {
-          if (env.MB_LOG_TRANSCRIPTS) {
-            logger.info("Transcript OUT", {
-              callSid: this.callSid,
-              streamSid: this.streamSid,
-              text: transcriptText
-            });
-          }
-          if (typeof this.onGeminiOutputTranscript === "function") {
-            this.onGeminiOutputTranscript(transcriptText);
-          }
-        }
-        return;
-      }
-
-      // usageMetadata etc – ignore for now
     });
 
-    this.ws.on("close", (code, reason) => {
-      this.closed = true;
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString() : "";
       logger.info("Gemini Live WS closed", {
         callSid: this.callSid,
         streamSid: this.streamSid,
         code,
-        reason: reason ? reason.toString() : ""
+        reason,
       });
     });
 
-    this.ws.on("error", (err) => {
+    ws.on("error", (err) => {
       logger.error("Gemini Live WS error", {
+        error: err.message,
         callSid: this.callSid,
         streamSid: this.streamSid,
-        error: err && err.message ? err.message : String(err)
       });
     });
   }
 
-  sendAudioUlaw8kBase64(ulaw8kBase64) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    if (!this.setupComplete) return;
+  /**
+   * Twilio sends ulaw8k base64 frames.
+   * We convert to PCM16 base64 and stream to Gemini as realtime input audio.
+   */
+  sendTwilioUlaw8kBase64(ulaw8kB64) {
+    if (this._stopping) return;
+    if (!this._geminiWs) return;
 
-    // Realtime audio input message
-    // This is the standard pattern: realtimeInput.mediaChunks[]
-    const msg = {
+    // Convert ulaw8k -> pcm16 (base64)
+    const pcm16b64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
+
+    // Live API expects: { realtimeInput: { mediaChunks:[{mimeType, data}] } }
+    // (ב-WS reference זה נקרא realtimeInput) – שמות camelCase
+    const msgObj = {
       realtimeInput: {
         mediaChunks: [
           {
-            mimeType: "audio/pcm;rate=8000", // keep if your working code uses something else
-            data: ulaw8kBase64
-          }
-        ]
-      }
+            mimeType: "audio/pcm;rate=16000",
+            data: pcm16b64,
+          },
+        ],
+      },
     };
 
-    // NOTE:
-    // If your current working bridge expects ulaw8k directly with a different mimeType,
-    // keep the mimeType exactly as in your working branch.
-    this.ws.send(JSON.stringify(msg));
+    const payload = JSON.stringify(msgObj);
+
+    // אם ה-setup עוד לא "התייצב" – נאגור רגע (לא חובה, אבל מונע race)
+    if (!this._setupAck) {
+      this._pendingAudio.push(payload);
+      return;
+    }
+
+    this._geminiWs.send(payload);
   }
 
   stop() {
+    if (this._stopping) return;
+    this._stopping = true;
+
     try {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.close(1000, "client_stop");
+      if (this._geminiWs) this._geminiWs.close();
     } catch (_) {}
+
+    this._geminiWs = null;
   }
 }
 
