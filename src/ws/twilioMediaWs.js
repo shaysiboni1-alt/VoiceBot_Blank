@@ -2,132 +2,112 @@
 
 const WebSocket = require("ws");
 const { env } = require("../config/env");
-const { getLogger } = require("../utils/logger");
+const { logger } = require("../utils/logger");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
-const { ulaw8kToPcm16 } = require("../vendor/twilioGeminiAudio"); // אם אתה משתמש בזה בפועל
-// הערה: אם אינך משתמש ב-ulaw8kToPcm16 בפועל – אפשר להסיר, אבל השארתי לפי המבנה שהיה אצלך.
 
-const log = getLogger();
+function safeCall(obj, fnName, ...args) {
+  try {
+    if (!obj) return;
+    const fn = obj[fnName];
+    if (typeof fn !== "function") return;
+    fn.apply(obj, args);
+  } catch (e) {
+    logger.debug("safeCall failed", { fnName, error: e?.message });
+  }
+}
 
-function installTwilioMediaWs(server, deps) {
+function createTwilioMediaWsServer({ path = "/twilio-media-stream" } = {}) {
   const wss = new WebSocket.Server({ noServer: true });
+  wss._path = path;
 
-  server.on("upgrade", (req, socket, head) => {
-    if (req.url !== "/twilio-media-stream") return;
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  });
-
-  wss.on("connection", (twilioWs) => {
-    log.info("Twilio media WS connected");
+  wss.on("connection", (ws) => {
+    logger.info("Twilio media WS connected");
 
     let streamSid = null;
     let callSid = null;
 
-    // Always keep a gemini object with the expected method shape to avoid crashes
-    let gemini = {
-      start: async () => {},
-      sendUlaw8kFromTwilio: () => {},
-      sendText: () => {},
-      close: () => {},
-      isOpen: () => false
-    };
+    // בונים session מול Gemini
+    const gemini = new GeminiLiveSession({
+      meta: () => ({ streamSid, callSid }),
+      onGeminiAudioUlaw8kBase64: (ulawB64) => {
+        // שולחים חזרה לטוויליו
+        try {
+          ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: ulawB64 },
+            })
+          );
+        } catch (e) {
+          logger.debug("Failed sending audio to Twilio", { streamSid, callSid, error: e.message });
+        }
+      },
 
-    const safeCloseGemini = () => {
-      try {
-        if (gemini && typeof gemini.close === "function") gemini.close(1000, "twilio closed");
-      } catch (_) {}
-    };
+      // אל תדליק את זה אם אתה לא חייב – זה יוצר המון טקסט
+      onGeminiText: env.MB_LOG_ASSISTANT_TEXT
+        ? (t) => logger.debug("Gemini text", { streamSid, callSid, t })
+        : null,
+    });
 
-    twilioWs.on("message", async (raw) => {
+    // התחלת WS לג׳מיני
+    safeCall(gemini, "start");
+
+    ws.on("message", (raw) => {
       let msg;
       try {
-        msg = JSON.parse(raw.toString());
-      } catch (e) {
-        log.warn("Twilio WS message parse failed", { err: String(e) });
+        msg = JSON.parse(raw.toString("utf8"));
+      } catch {
         return;
       }
 
-      const ev = msg.event;
-      log.info("Twilio WS event", { event: ev, streamSid, callSid });
+      const event = msg?.event;
 
-      if (ev === "start") {
+      if (event === "connected") {
+        logger.info("Twilio WS event", { event, streamSid: msg?.streamSid ?? null, callSid: msg?.start?.callSid ?? null });
+        return;
+      }
+
+      if (event === "start") {
         streamSid = msg?.start?.streamSid || null;
         callSid = msg?.start?.callSid || null;
-        const customParameters = msg?.start?.customParameters || {};
-
-        log.info("Twilio stream start", { streamSid, callSid, customParameters });
-
-        // Create a real Gemini session (Vertex or API key) with stable interface
-        gemini = new GeminiLiveSession({
+        logger.info("Twilio stream start", {
           streamSid,
           callSid,
-          responseModalities: ["AUDIO"], // reduce text spam and latency
-          systemInstruction: deps?.getSystemPrompt ? deps.getSystemPrompt(customParameters) : "",
-          generationConfig: deps?.getGenerationConfig ? deps.getGenerationConfig(customParameters) : {},
-          onGeminiText: (t) => {
-            // IMPORTANT: keep assistant-text logging optional to avoid huge logs
-            if (env.MB_LOG_ASSISTANT_TEXT) {
-              log.debug("Gemini text", { streamSid, callSid, t });
-            }
-          },
-          onGeminiAudioUlaw8kB64: (b64) => {
-            // If you already have a bridge that sends audio back to Twilio, call it here.
-            // Many implementations send "media" events back. If deps has a helper, use it.
-            if (deps?.sendAudioToTwilio) {
-              deps.sendAudioToTwilio(twilioWs, streamSid, b64);
-            }
-          }
+          customParameters: msg?.start?.customParameters || {},
         });
-
-        try {
-          await gemini.start();
-        } catch (e) {
-          log.error("Gemini start failed", { streamSid, callSid, err: String(e) });
-        }
-
-        // Proactive opening (if you have it)
-        if (deps?.sendOpening) {
-          try {
-            await deps.sendOpening(gemini, customParameters);
-          } catch (e) {
-            log.warn("Opening send failed", { err: String(e) });
-          }
-        }
-
         return;
       }
 
-      if (ev === "media") {
+      if (event === "media") {
         const b64 = msg?.media?.payload;
-        if (!b64) return;
-
-        // Never throw: if Gemini is down, just ignore until next call.
-        gemini.sendUlaw8kFromTwilio(b64);
+        if (b64) {
+          // זה המקום שממנו הגיע לך הקרש – עכשיו זה מוגן
+          safeCall(gemini, "sendUlaw8kFromTwilio", b64);
+        }
         return;
       }
 
-      if (ev === "stop") {
-        log.info("Twilio stream stop", { streamSid, callSid });
-        safeCloseGemini();
-        try {
-          twilioWs.close();
-        } catch (_) {}
+      if (event === "stop") {
+        logger.info("Twilio stream stop", { streamSid, callSid });
+        safeCall(gemini, "close");
+        try { ws.close(); } catch {}
         return;
       }
     });
 
-    twilioWs.on("close", () => {
-      log.info("Twilio media WS closed", { streamSid, callSid });
-      safeCloseGemini();
+    ws.on("close", () => {
+      logger.info("Twilio media WS closed", { streamSid, callSid });
+      safeCall(gemini, "close");
     });
 
-    twilioWs.on("error", (err) => {
-      log.error("Twilio media WS error", { streamSid, callSid, err: String(err) });
-      safeCloseGemini();
+    ws.on("error", (err) => {
+      logger.info("Twilio media WS error", { streamSid, callSid, error: err.message });
+      safeCall(gemini, "close");
     });
   });
 
   return wss;
 }
 
-module.exports = { installTwilioMediaWs };
+module.exports = { createTwilioMediaWsServer };
