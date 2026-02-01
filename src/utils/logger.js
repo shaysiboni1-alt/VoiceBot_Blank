@@ -1,23 +1,24 @@
 "use strict";
 
-const pino = require("pino");
 const { env } = require("../config/env");
 
-// רמת לוגים: MB_DEBUG=true => debug, אחרת info
-const level = env.MB_DEBUG ? "debug" : "info";
-
-const logger = pino({
-  level,
-  base: null,
-  timestamp: () => `,"time":"${new Date().toISOString()}"`,
-});
-
-// תאימות לאחור לקבצים שמצפים ל-getLogger()
-function getLogger() {
-  return logger;
+function log(level, msg, meta) {
+  const line = {
+    time: new Date().toISOString(),
+    level,
+    msg
+  };
+  if (meta && typeof meta === "object") line.meta = meta;
+  console.log(JSON.stringify(line));
 }
 
-module.exports = {
-  logger,
-  getLogger,
+const logger = {
+  info: (msg, meta) => log("info", msg, meta),
+  warn: (msg, meta) => log("warn", msg, meta),
+  error: (msg, meta) => log("error", msg, meta),
+  debug: (msg, meta) => {
+    if (env.MB_DEBUG) log("debug", msg, meta);
+  }
 };
+
+module.exports = { logger };
