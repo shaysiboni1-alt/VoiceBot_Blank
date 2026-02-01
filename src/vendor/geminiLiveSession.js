@@ -10,7 +10,6 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 // -----------------------------------------------------------------------------
 
 function normalizeModelName(m) {
-  // Google expects: "models/<model>"
   if (!m) return "";
   if (m.startsWith("models/")) return m;
   return `models/${m}`;
@@ -76,7 +75,6 @@ function buildSystemInstructionFromSSOT(ssot) {
 
   const sections = [];
 
-  // Hard guardrail to stop generic LLM self-identification
   sections.push(
     [
       "IDENTITY (NON-NEGOTIABLE):",
@@ -87,7 +85,6 @@ function buildSystemInstructionFromSSOT(ssot) {
     ].join("\n")
   );
 
-  // Canonical prompts (from SSOT)
   const master = safeStr(prompts.MASTER_PROMPT);
   const guardrails = safeStr(prompts.GUARDRAILS_PROMPT);
   const kb = safeStr(prompts.KB_PROMPT);
@@ -100,15 +97,12 @@ function buildSystemInstructionFromSSOT(ssot) {
   if (lead) sections.push(`LEAD_CAPTURE_PROMPT:\n${lead}`);
   if (intentRouter) sections.push(`INTENT_ROUTER_PROMPT:\n${intentRouter}`);
 
-  // Settings context (the only allowed source for business facts per guardrails)
   const settingsContext = buildSettingsContext(settings);
   if (settingsContext) sections.push(`SETTINGS_CONTEXT (SOURCE OF TRUTH):\n${settingsContext}`);
 
-  // Intents table (router policy reference)
   const intentsContext = buildIntentsContext(intents);
   if (intentsContext) sections.push(`INTENTS_TABLE:\n${intentsContext}`);
 
-  // Language policy
   sections.push(
     [
       "LANGUAGE POLICY:",
@@ -121,13 +115,30 @@ function buildSystemInstructionFromSSOT(ssot) {
   return sections.filter(Boolean).join("\n\n---\n\n").trim();
 }
 
+function computeGreetingHebrew(timeZone) {
+  // Default Israel if not provided
+  const tz = timeZone || "Asia/Jerusalem";
+
+  const hourStr = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "2-digit",
+    hour12: false
+  }).format(new Date());
+
+  const hour = Number(hourStr);
+  if (Number.isNaN(hour)) return "שלום";
+
+  if (hour >= 5 && hour < 11) return "בוקר טוב";
+  if (hour >= 11 && hour < 17) return "צהריים טובים";
+  if (hour >= 17 && hour < 22) return "ערב טוב";
+  return "לילה טוב";
+}
+
 function getOpeningScriptFromSSOT(ssot, vars) {
   const settings = ssot?.settings || {};
   const tpl = safeStr(settings.OPENING_SCRIPT) || "שלום! איך נוכל לעזור?";
-  const greeting = safeStr(vars?.GREETING) || "שלום";
 
   const merged = {
-    GREETING: greeting,
     BUSINESS_NAME: safeStr(settings.BUSINESS_NAME),
     BOT_NAME: safeStr(settings.BOT_NAME),
     CALLER_NAME: safeStr(vars?.CALLER_NAME),
@@ -137,6 +148,7 @@ function getOpeningScriptFromSSOT(ssot, vars) {
     WORKING_HOURS: safeStr(settings.WORKING_HOURS),
     BUSINESS_WEBSITE_URL: safeStr(settings.BUSINESS_WEBSITE_URL),
     VOICE_NAME: safeStr(settings.VOICE_NAME),
+    GREETING: safeStr(vars?.GREETING),
     ...vars
   };
 
@@ -162,6 +174,11 @@ class GeminiLiveSession {
     this.closed = false;
 
     this._greetingSent = false;
+
+    // Transcript aggregation (so logs are readable)
+    this._trBuf = { user: "", bot: "" };
+    this._trLastChunk = { user: "", bot: "" };
+    this._trTimer = { user: null, bot: null };
   }
 
   start() {
@@ -178,8 +195,6 @@ class GeminiLiveSession {
       const setup = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
-
-          // systemInstruction MUST be Content (object with parts), not a raw string
           systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
 
           generationConfig: {
@@ -196,7 +211,6 @@ class GeminiLiveSession {
             }
           },
 
-          // Keep minimal to avoid schema errors (barge-in is implemented later server-side)
           realtimeInputConfig: {
             automaticActivityDetection: {
               prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS ?? 200),
@@ -269,21 +283,13 @@ class GeminiLiveSession {
         }
       } catch {}
 
-      // Transcriptions (best-effort)
+      // Transcriptions (aggregated)
       try {
         const inTr = msg?.serverContent?.inputTranscription?.text;
-        if (inTr) {
-          const text = String(inTr);
-          if (this.onTranscript) this.onTranscript({ who: "user", text });
-          if (env.MB_LOG_TRANSCRIPTS) logger.info("TRANSCRIPT user", { ...this.meta, text });
-        }
+        if (inTr) this._onTranscriptChunk("user", String(inTr));
 
         const outTr = msg?.serverContent?.outputTranscription?.text;
-        if (outTr) {
-          const text = String(outTr);
-          if (this.onTranscript) this.onTranscript({ who: "bot", text });
-          if (env.MB_LOG_TRANSCRIPTS) logger.info("TRANSCRIPT bot", { ...this.meta, text });
-        }
+        if (outTr) this._onTranscriptChunk("bot", String(outTr));
       } catch {}
     });
 
@@ -291,6 +297,11 @@ class GeminiLiveSession {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
       this.closed = true;
       this.ready = false;
+
+      // flush pending transcript buffers
+      this._flushTranscript("user");
+      this._flushTranscript("bot");
+
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
     });
 
@@ -299,10 +310,49 @@ class GeminiLiveSession {
     });
   }
 
+  _onTranscriptChunk(who, chunk) {
+    if (!env.MB_LOG_TRANSCRIPTS) return;
+
+    const c = chunk || "";
+    if (!c) return;
+
+    // Ignore exact duplicates (you had lots of duplicates)
+    if (c === this._trLastChunk[who]) return;
+    this._trLastChunk[who] = c;
+
+    // Append chunk, cap size
+    this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
+
+    // Debounce flush so you get one readable line per utterance-ish
+    if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
+    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
+  }
+
+  _flushTranscript(who) {
+    if (!env.MB_LOG_TRANSCRIPTS) return;
+
+    if (this._trTimer[who]) {
+      clearTimeout(this._trTimer[who]);
+      this._trTimer[who] = null;
+    }
+
+    const text = (this._trBuf[who] || "").trim();
+    this._trBuf[who] = "";
+    if (!text) return;
+
+    // One clean log line, easy to read in Render UI
+    logger.info(`UTTERANCE ${who}`, { ...this.meta, text });
+
+    if (this.onTranscript) this.onTranscript({ who, text });
+  }
+
   _sendProactiveOpening() {
     if (!this.ws || this.closed || !this.ready) return;
 
-    const opening = getOpeningScriptFromSSOT(this.ssot, { GREETING: "שלום" });
+    const tz = env.TIME_ZONE || "Asia/Jerusalem";
+    const greeting = computeGreetingHebrew(tz);
+
+    const opening = getOpeningScriptFromSSOT(this.ssot, { GREETING: greeting });
 
     const userKickoff =
       `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n` +
@@ -317,7 +367,7 @@ class GeminiLiveSession {
 
     try {
       this.ws.send(JSON.stringify(msg));
-      logger.info("Proactive opening sent", { ...this.meta, opening_len: opening.length });
+      logger.info("Proactive opening sent", { ...this.meta, greeting, opening_len: opening.length });
     } catch (e) {
       logger.debug("Failed sending proactive opening", { ...this.meta, error: e.message });
     }
