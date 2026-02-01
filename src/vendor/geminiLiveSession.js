@@ -1,138 +1,203 @@
-const { createGeminiLiveClient } = require("../providers/geminiLiveWs");
-const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
-const { getSSOT } = require("../ssot/ssotClient");
-const { logger } = require("../utils/logger");
-const env = require("../config/env");
+"use strict";
 
-function isMostlyHebrew(text) {
-  const s = String(text || "");
-  if (!s) return false;
-  const heb = (s.match(/[\u0590-\u05FF]/g) || []).length;
-  const latin = (s.match(/[A-Za-z]/g) || []).length;
-  // If there's a lot more Hebrew than Latin, treat as Hebrew.
-  return heb >= 4 && heb >= latin;
-}
+const WebSocket = require("ws");
+const { env } = require("../config/env");
+const { getLogger } = require("../utils/logger");
+const { getAccessToken } = require("../utils/gcpAuth");
 
-function looksLikeMetaOrMarkdown(text) {
-  const s = String(text || "").trim();
-  if (!s) return false;
-  // Common meta/markdown patterns we want to suppress from logs
-  if (s.startsWith("**") || s.includes("```") || s.includes("#") || s.includes("**")) return true;
-  // English narration patterns
-  if (/[A-Za-z]{4,}/.test(s) && !isMostlyHebrew(s)) return true;
-  if (s.includes("I've ") || s.includes("I have ") || s.includes("Now, I'm") || s.includes("I've processed")) return true;
-  return false;
-}
+const log = getLogger();
 
-function truncateText(text, max = 500) {
-  const s = String(text || "");
-  return s.length > max ? `${s.slice(0, max)}…` : s;
-}
-
+/**
+ * GeminiLiveSession
+ * - Supports Developer API (API key) OR Vertex AI (OAuth token) based on GEMINI_VERTEX_ENABLED
+ * - Exposes a stable interface:
+ *    - start(): Promise<void>
+ *    - sendUlaw8kFromTwilio(b64): void
+ *    - sendText(text): void
+ *    - close(code?, reason?): void
+ *    - isOpen(): boolean
+ */
 class GeminiLiveSession {
-  constructor({ streamSid, callSid, systemPromptText, onAudioUlaw8kB64, onTranscript, onGeminiText }) {
+  constructor({
+    streamSid,
+    callSid,
+    onGeminiText,
+    onGeminiAudioUlaw8kB64,
+    onGeminiTurnEnd,
+    systemInstruction,
+    generationConfig,
+    responseModalities = ["AUDIO"] // IMPORTANT: default to audio-only to reduce junk text latency
+  }) {
     this.streamSid = streamSid;
     this.callSid = callSid;
-    this.systemPromptText = systemPromptText || "";
-    this.onAudioUlaw8kB64 = onAudioUlaw8kB64;
-    this.onTranscript = onTranscript;
+
     this.onGeminiText = onGeminiText;
-    this.client = null;
+    this.onGeminiAudioUlaw8kB64 = onGeminiAudioUlaw8kB64;
+    this.onGeminiTurnEnd = onGeminiTurnEnd;
+
+    this.systemInstruction = systemInstruction || "";
+    this.generationConfig = generationConfig || {};
+    this.responseModalities = responseModalities;
+
+    this.ws = null;
+    this._closed = false;
+    this._started = false;
+  }
+
+  isOpen() {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
   async start() {
-    // Ensure SSOT is loaded (best-effort); prompt builder relies on it upstream.
-    await getSSOT();
+    if (this._started) return;
+    this._started = true;
 
-    this.client = createGeminiLiveClient({
-      callSid: this.callSid,
-      streamSid: this.streamSid,
-      systemPromptText: this.systemPromptText,
+    const { url, headers } = await this._buildWsTarget();
+
+    this.ws = new WebSocket(url, { headers });
+
+    this.ws.on("open", () => {
+      log.info("Gemini Live WS connected", { streamSid: this.streamSid, callSid: this.callSid });
+      this._sendSetup();
     });
 
-    this.client.ws.onGeminiEvent = (msg) => {
-      // Audio output
+    this.ws.on("message", (raw) => {
       try {
-        const parts = msg?.serverContent?.modelTurn?.parts || [];
-        for (const p of parts) {
-          const inline = p?.inlineData;
-          if (!inline?.data) continue;
+        const msg = JSON.parse(raw.toString());
+        this._handleGeminiMessage(msg);
+      } catch (e) {
+        log.warn("Gemini message parse failed", { err: String(e) });
+      }
+    });
 
-          // Gemini audio output is typically PCM 24k
-          const ulaw8kB64 = pcm24kB64ToUlaw8kB64(String(inline.data));
-          if (ulaw8kB64 && this.onAudioUlaw8kB64) this.onAudioUlaw8kB64(ulaw8kB64);
-        }
-      } catch {}
+    this.ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString() : "";
+      log.info("Gemini Live WS closed", { streamSid: this.streamSid, callSid: this.callSid, code, reason });
+      this._closed = true;
+    });
 
-      // Optional text parts (avoid meta noise)
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          [];
-
-        for (const p of parts) {
-          const raw = p?.text;
-          if (!raw) continue;
-
-          const s = String(raw);
-
-          // Only log assistant text when explicitly enabled, and only if it's likely
-          // to be actual user-facing Hebrew speech (not English narration / markdown).
-          if (!env.MB_LOG_ASSISTANT_TEXT) continue;
-          if (looksLikeMetaOrMarkdown(s)) continue;
-          if (!isMostlyHebrew(s)) continue;
-
-          if (this.onGeminiText) this.onGeminiText(truncateText(s, 400));
-        }
-      } catch {}
-
-      // Transcriptions (best-effort)
-      try {
-        const inTr =
-          msg?.serverContent?.inputTranscription?.text ||
-          msg?.serverContent?.inputTranscription?.transcript ||
-          null;
-
-        if (inTr) {
-          const t = String(inTr);
-          if (env.MB_LOG_TRANSCRIPTS) {
-            logger.info(`TRANSCRIPT user: ${truncateText(t, 500)}`, {
-              streamSid: this.streamSid,
-              callSid: this.callSid,
-            });
-          }
-          if (this.onTranscript) this.onTranscript({ who: "user", text: t });
-        }
-
-        const outTr =
-          msg?.serverContent?.outputTranscription?.text ||
-          msg?.serverContent?.outputTranscription?.transcript ||
-          null;
-
-        if (outTr) {
-          const t = String(outTr);
-          if (env.MB_LOG_TRANSCRIPTS) {
-            logger.info(`TRANSCRIPT bot: ${truncateText(t, 500)}`, {
-              streamSid: this.streamSid,
-              callSid: this.callSid,
-            });
-          }
-          if (this.onTranscript) this.onTranscript({ who: "bot", text: t });
-        }
-      } catch {}
-    };
+    this.ws.on("error", (err) => {
+      log.error("Gemini Live WS error", { streamSid: this.streamSid, callSid: this.callSid, err: String(err) });
+    });
   }
 
-  sendAudioUlaw8kB64(ulaw8kB64) {
-    if (!this.client) return;
-    this.client.sendAudioUlaw8kB64(ulaw8kB64);
-  }
-
-  close() {
+  close(code = 1000, reason = "") {
+    this._closed = true;
     try {
-      this.client?.close();
-    } catch {}
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.close(code, reason);
+      }
+    } catch (_) {}
+  }
+
+  // Stable alias used by Twilio bridge
+  sendUlaw8kFromTwilio(b64) {
+    // Never throw here; Twilio audio can keep coming even if WS died.
+    try {
+      if (!this.isOpen()) return;
+
+      // For Gemini Live, audio chunk message is typically:
+      // { realtimeInput: { mediaChunks: [{ mimeType, data }] } }
+      const mimeType = "audio/mulaw"; // ulaw8k
+      this.ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{ mimeType, data: b64 }]
+          }
+        })
+      );
+    } catch (e) {
+      log.warn("sendUlaw8kFromTwilio failed", { err: String(e) });
+    }
+  }
+
+  sendText(text) {
+    try {
+      if (!this.isOpen()) return;
+      this.ws.send(
+        JSON.stringify({
+          clientContent: {
+            turns: [{ role: "user", parts: [{ text }] }],
+            turnComplete: true
+          }
+        })
+      );
+    } catch (e) {
+      log.warn("sendText failed", { err: String(e) });
+    }
+  }
+
+  _sendSetup() {
+    // Minimize output text: audio-only default
+    const setup = {
+      setup: {
+        model: env.GEMINI_LIVE_MODEL,
+        generationConfig: this.generationConfig,
+        systemInstruction: this.systemInstruction ? { parts: [{ text: this.systemInstruction }] } : undefined,
+        responseModalities: this.responseModalities
+      }
+    };
+
+    // Remove undefined for cleaner payload
+    if (!setup.setup.systemInstruction) delete setup.setup.systemInstruction;
+
+    try {
+      this.ws.send(JSON.stringify(setup));
+    } catch (e) {
+      log.error("Gemini setup send failed", { err: String(e) });
+    }
+  }
+
+  _handleGeminiMessage(msg) {
+    // Text (optional)
+    if (msg?.serverContent?.modelTurn?.parts) {
+      for (const p of msg.serverContent.modelTurn.parts) {
+        if (p?.text && this.onGeminiText) this.onGeminiText(p.text);
+        // Audio output (if any)
+        if (p?.inlineData?.data && this.onGeminiAudioUlaw8kB64) {
+          // In many Live responses, inlineData contains base64 audio bytes
+          this.onGeminiAudioUlaw8kB64(p.inlineData.data);
+        }
+      }
+    }
+
+    // Turn end
+    if (msg?.serverContent?.turnComplete) {
+      if (this.onGeminiTurnEnd) this.onGeminiTurnEnd();
+    }
+  }
+
+  async _buildWsTarget() {
+    // Vertex AI mode
+    if (env.GEMINI_VERTEX_ENABLED) {
+      const token = await getAccessToken();
+      const location = env.GEMINI_LOCATION || "us-central1";
+      const projectId = env.GEMINI_PROJECT_ID;
+
+      if (!projectId) {
+        throw new Error("GEMINI_PROJECT_ID is required when GEMINI_VERTEX_ENABLED=true");
+      }
+
+      // Vertex Live WS endpoint (matches your existing geminiVertexLive.js style)
+      const url =
+        `wss://${location}-aiplatform.googleapis.com/v1/projects/${projectId}` +
+        `/locations/${location}/publishers/google/models/${env.GEMINI_LIVE_MODEL}:streamGenerateContent`;
+
+      return {
+        url,
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      };
+    }
+
+    // Developer API mode (API key)
+    const apiKey = env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY is required when GEMINI_VERTEX_ENABLED=false");
+
+    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+
+    return { url, headers: {} };
   }
 }
 
