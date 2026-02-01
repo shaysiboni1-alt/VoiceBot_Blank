@@ -1,104 +1,102 @@
-// src/telephony/twilioMediaWs.js
 "use strict";
 
 const WebSocket = require("ws");
 const { logger } = require("../utils/logger");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
+const { getSSOT } = require("../ssot/ssotClient");
 
-function attachTwilioMediaWs(httpServer) {
-  const wss = new WebSocket.Server({ server: httpServer, path: "/twilio-media-stream" });
+function installTwilioMediaWs(server) {
+  const wss = new WebSocket.Server({ noServer: true });
+
+  server.on("upgrade", (req, socket, head) => {
+    if (!req.url || !req.url.startsWith("/twilio-media-stream")) return;
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
 
   wss.on("connection", (twilioWs) => {
     logger.info("Twilio media WS connected");
 
-    const session = new GeminiLiveSession({
-      onGeminiAudioUlaw8kBase64: (b64Ulaw) => {
-        // send audio back to Twilio
-        if (!session.streamSid) return;
-        if (twilioWs.readyState !== WebSocket.OPEN) return;
+    let streamSid = null;
+    let callSid = null;
+    let customParameters = {};
+    let gemini = null;
 
-        const msg = {
-          event: "media",
-          streamSid: session.streamSid,
-          media: { payload: b64Ulaw },
-        };
-        twilioWs.send(JSON.stringify(msg));
-      },
-      onGeminiText: (text) => {
-        // optional: log model text
-        logger.info("Gemini text", { callSid: session.callSid, text });
-      },
-    });
+    function sendToTwilioMedia(ulaw8kB64) {
+      if (!streamSid) return;
+      const payload = {
+        event: "media",
+        streamSid,
+        media: { payload: ulaw8kB64 }
+      };
+      try {
+        twilioWs.send(JSON.stringify(payload));
+      } catch {}
+    }
 
-    twilioWs.on("message", async (data) => {
+    twilioWs.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
-      } catch (e) {
-        logger.warn("Twilio WS non-JSON message", { error: String(e) });
+      } catch {
         return;
       }
 
       const ev = msg.event;
 
       if (ev === "start") {
-        session.streamSid = msg?.start?.streamSid || null;
-        session.callSid = msg?.start?.callSid || null;
-        session.customParameters = msg?.start?.customParameters || {};
+        streamSid = msg?.start?.streamSid || null;
+        callSid = msg?.start?.callSid || null;
+        customParameters = msg?.start?.customParameters || {};
+        logger.info("Twilio stream start", { streamSid, callSid, customParameters });
 
-        logger.info("Twilio stream start", {
-          streamSid: session.streamSid,
-          callSid: session.callSid,
-          customParameters: session.customParameters,
+        const ssot = getSSOT(); // כבר נטען בשרת; אם ריק – עדיין לא שוברים קול
+
+        gemini = new GeminiLiveSession({
+          meta: { streamSid, callSid },
+          ssot,
+          onGeminiAudioUlaw8kBase64: (ulawB64) => sendToTwilioMedia(ulawB64),
+          onGeminiText: (t) => logger.debug("Gemini text", { streamSid, callSid, t }),
+          onTranscript: ({ who, text }) => {
+            logger.info(`TRANSCRIPT ${who}`, { streamSid, callSid, text });
+          }
         });
 
-        // start Gemini Live session
-        try {
-          await session.start();
-        } catch (err) {
-          logger.error("Gemini session start failed", { error: err.message });
-        }
+        gemini.start();
         return;
       }
 
       if (ev === "media") {
-        // Twilio sends ulaw8k base64
-        const payload = msg?.media?.payload;
-        if (!payload) return;
-
-        try {
-          session.pushTwilioUlaw8k(payload);
-        } catch (err) {
-          logger.error("pushTwilioUlaw8k failed", { error: err.message });
-        }
+        const b64 = msg?.media?.payload;
+        if (b64 && gemini) gemini.sendUlaw8kFromTwilio(b64);
         return;
       }
 
       if (ev === "stop") {
-        logger.info("Twilio stream stop", {
-          streamSid: session.streamSid,
-          callSid: session.callSid,
-        });
-        await session.stop("twilio_stop");
+        logger.info("Twilio stream stop", { streamSid, callSid });
+        if (gemini) {
+          gemini.endInput();
+          gemini.stop();
+        }
         return;
       }
 
-      // other events: connected / mark / dtmf etc.
+      if (ev === "connected") {
+        logger.info("Twilio WS event", { event: "connected", streamSid: null, callSid: null });
+      }
     });
 
-    twilioWs.on("close", async () => {
-      logger.info("Twilio media WS closed", {
-        streamSid: session.streamSid,
-        callSid: session.callSid,
-      });
-      await session.stop("twilio_ws_closed");
+    twilioWs.on("close", () => {
+      logger.info("Twilio media WS closed", { streamSid, callSid });
+      if (gemini) gemini.stop();
     });
 
-    twilioWs.on("error", async (err) => {
-      logger.error("Twilio media WS error", { error: err.message });
-      await session.stop("twilio_ws_error");
+    twilioWs.on("error", (err) => {
+      logger.error("Twilio media WS error", { streamSid, callSid, error: err.message });
+      if (gemini) gemini.stop();
     });
   });
+
+  return wss;
 }
 
-module.exports = { attachTwilioMediaWs };
+module.exports = { installTwilioMediaWs };
