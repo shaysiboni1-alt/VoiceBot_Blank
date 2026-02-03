@@ -1,19 +1,19 @@
-// src/ws/twilioMediaWs.js
 "use strict";
 
 const WebSocket = require("ws");
+
+const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
-const { getSSOT } = require("../ssot/ssotClient");
-const { env } = require("../config/env");
+const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("../vendor/twilioGeminiAudio");
+const { normalizeUtterance } = require("../logic/hebrewNlp");
+const { detectIntent } = require("../logic/intentRouter");
+const { loadSSOT } = require("../ssot/ssotClient");
+const { startCallRecording, publicRecordingUrl } = require("../utils/twilioRecording");
 
-// -----------------------------
-// small helpers
-// -----------------------------
-
-function nowMs() {
-  return Date.now();
-}
+// -----------------------------------------------------------------------------
+// Utils
+// -----------------------------------------------------------------------------
 
 function nowIso() {
   return new Date().toISOString();
@@ -21,480 +21,446 @@ function nowIso() {
 
 function safeStr(x) {
   if (x === undefined || x === null) return "";
-  return String(x);
+  return String(x).trim();
 }
 
-function normalizeCallerId(caller) {
-  const s = safeStr(caller).trim();
-  const low = s.toLowerCase();
-  if (!s) return { value: "", withheld: true };
-  if (
-    low === "anonymous" ||
-    low === "restricted" ||
-    low === "unavailable" ||
-    low === "unknown" ||
-    low === "withheld"
-  ) {
-    return { value: s, withheld: true };
+function isTruthy(x) {
+  const s = String(x ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
+}
+
+function normalizePhoneE164(p) {
+  const s = safeStr(p);
+  if (!s) return "";
+  const cleaned = s.replace(/[^\d+]/g, "");
+  if (cleaned.startsWith("+")) return cleaned;
+  if (cleaned.startsWith("0")) return `+972${cleaned.slice(1)}`;
+  if (cleaned.startsWith("972")) return `+${cleaned}`;
+  if (cleaned.startsWith("5")) return `+972${cleaned}`;
+  return cleaned;
+}
+
+function extractNameHe(raw) {
+  const text = safeStr(raw);
+  if (!text) return "";
+  const cleaned = text.replace(/[^\p{L}\s\-'.]/gu, " ").replace(/\s+/g, " ").trim();
+
+  // Prefer Hebrew letters
+  const he = cleaned.match(/[א-ת][א-ת\s\-']{1,40}/);
+  if (he && he[0]) return he[0].trim();
+
+  // Fallback: short "name-like" (letters only), no digits
+  if (cleaned.length <= 25 && !/[0-9]/.test(cleaned) && /\p{L}/u.test(cleaned)) {
+    return cleaned;
   }
-  const digits = s.replace(/\D/g, "");
-  return { value: s, withheld: digits.length < 5 };
-}
-
-function extractNameHe(text) {
-  const t = safeStr(text).trim();
-  if (!t) return "";
-  const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
-  if (m && m[1]) return m[1].trim();
-  if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
   return "";
 }
 
 function extractPhoneAny(text) {
-  const digits = safeStr(text).replace(/\D/g, "");
+  const s = safeStr(text);
+  if (!s) return "";
+
+  const digits = s.replace(/[^\d]/g, "");
   if (!digits) return "";
-  if (digits.length >= 9 && digits.length <= 13) {
-    if (digits.startsWith("972") && digits.length === 12) return "+" + digits;
-    if (digits.startsWith("0") && digits.length === 10) return "+972" + digits.slice(1);
-    if (digits.startsWith("+") && digits.length >= 10) return digits;
-    return digits;
+
+  if (digits.length >= 9 && digits.length <= 12) {
+    // try to normalize Israel-ish patterns
+    if (digits.startsWith("972") && digits.length >= 11) return `+${digits}`;
+    if (digits.startsWith("0") && digits.length >= 9) return `+972${digits.slice(1)}`;
+    if (digits.startsWith("5") && digits.length === 9) return `+972${digits}`;
   }
+
+  if (digits.length >= 10 && digits.startsWith("1")) return `+${digits}`;
   return "";
 }
 
-function twilioBasicAuthHeader() {
-  const sid = env.TWILIO_ACCOUNT_SID || process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN; // user confirmed exists
-  if (!sid || !token) return "";
-  const b64 = Buffer.from(`${sid}:${token}`).toString("base64");
-  return `Basic ${b64}`;
+function buildLeadParserPrompt(style) {
+  const mode = safeStr(style) || "crm_short";
+
+  return [
+    "You are a strict JSON generator.",
+    "You will receive a phone call transcript (Hebrew/English/Russian mix possible).",
+    "Return JSON ONLY (no markdown, no prose).",
+    "",
+    "Output schema:",
+    "{",
+    '  "summary": string,',
+    '  "topic": string,',
+    '  "requested_action": string,',
+    '  "important_details": string[],',
+    '  "urgency": "low" | "medium" | "high",',
+    '  "next_step": string',
+    "}",
+    "",
+    `Style=${mode}. Keep summary SHORT and CRM-friendly.`,
+  ].join("\n");
 }
 
-function twilioRecordingMp3Url(recordingSid) {
-  const sid = env.TWILIO_ACCOUNT_SID || process.env.TWILIO_ACCOUNT_SID;
-  if (!sid || !recordingSid) return "";
-  return `https://api.twilio.com/2010-04-01/Accounts/${sid}/Recordings/${recordingSid}.mp3`;
+function extractFirstJsonObject(text) {
+  const s = String(text || "");
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return "";
+  return s.slice(first, last + 1);
 }
 
-async function startTwilioCallRecording(callSid) {
-  try {
-    const sid = env.TWILIO_ACCOUNT_SID || process.env.TWILIO_ACCOUNT_SID;
-    const token = process.env.TWILIO_AUTH_TOKEN;
-    if (!sid || !token) return "";
-
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Calls/${encodeURIComponent(
-      callSid
-    )}/Recordings.json`;
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        authorization: twilioBasicAuthHeader(),
-        "content-type": "application/x-www-form-urlencoded"
-      },
-      body: new URLSearchParams({
-        RecordingChannels: "dual",
-        RecordingStatusCallbackEvent: "completed"
-      }).toString()
-    });
-
-    if (!resp.ok) {
-      const t = await resp.text().catch(() => "");
-      logger.warn("Twilio startRecording failed", { callSid, status: resp.status, body: t.slice(0, 300) });
-      return "";
-    }
-
-    const j = await resp.json().catch(() => null);
-    const recSid = j?.sid ? String(j.sid) : "";
-    return recSid;
-  } catch (e) {
-    logger.warn("Twilio startRecording exception", { callSid, error: String(e?.message || e) });
-    return "";
-  }
-}
-
-function webhookUrlFor(eventType) {
-  if (eventType === "CALL_LOG") return process.env.CALL_LOG_WEBHOOK_URL || "";
-  if (eventType === "FINAL") return process.env.FINAL_WEBHOOK_URL || "";
-  if (eventType === "ABANDONED") return process.env.ABANDONED_URL || "";
-  return "";
-}
-
-async function deliverWebhook(eventType, payload) {
-  const url = webhookUrlFor(eventType);
-  if (!url) return;
+async function deliverWebhook(url, payload, eventType) {
+  const target = safeStr(url);
+  if (!target) return;
 
   try {
-    const resp = await fetch(url, {
+    const res = await fetch(target, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     logger.info("Webhook delivered", {
       eventType,
-      status: resp.status,
-      attempt: 1
+      status: res.status,
+      attempt: 1,
     });
   } catch (e) {
-    logger.warn("Webhook delivery failed", { eventType, error: String(e?.message || e) });
+    logger.info("Webhook failed", { eventType, error: e.message });
   }
 }
 
-// -----------------------------
-// Lead Parser (postcall)
-// -----------------------------
+async function runLeadParser({ meta, ssot, lead, transcriptText }) {
+  if (!isTruthy(env.LEAD_PARSER_ENABLED)) return null;
+  if (safeStr(env.LEAD_PARSER_MODE).toLowerCase() !== "postcall") return null;
 
-function buildLeadParserPrompt(style) {
-  // keep deterministic schema so Make can map reliably
-  const base =
-    "Return JSON ONLY. No markdown. No extra text.\n" +
-    "Schema:\n" +
-    "{\n" +
-    '  "subject": string,\n' +
-    '  "request": string,\n' +
-    '  "details": string,\n' +
-    '  "action_needed": string,\n' +
-    '  "urgency": "low"|"normal"|"high",\n' +
-    '  "entities": { "years": string[], "documents": string[], "topics": string[] }\n' +
-    "}\n" +
-    "Rules: do not hallucinate. If unknown, use empty string/arrays.\n";
-
-  if (style === "crm_short") {
-    return (
-      base +
-      "Write very short CRM-friendly fields (1-2 sentences per field). Prefer Hebrew if the call is Hebrew."
-    );
+  const model = safeStr(env.LEAD_PARSER_MODEL);
+  if (!model) {
+    logger.info("Lead parser skipped (missing LEAD_PARSER_MODEL)", meta);
+    return null;
   }
 
-  return base + "Write concise CRM fields.";
-}
+  // require basic lead data before parsing
+  if (!safeStr(lead?.name) || !safeStr(lead?.phone)) return null;
 
-async function runLeadParserPostcall({ model, style, call, transcriptText }) {
-  const enabled = String(process.env.LEAD_PARSER_ENABLED || "").toLowerCase() === "true";
-  const mode = String(process.env.LEAD_PARSER_MODE || "").toLowerCase();
-  if (!enabled) return null;
-  if (mode && mode !== "postcall") return null;
+  const prompt = buildLeadParserPrompt(env.LEAD_SUMMARY_STYLE);
 
-  const key = env.GEMINI_API_KEY || process.env.GEMINI_API_KEY;
-  if (!key) return null;
-
-  const m = model || process.env.LEAD_PARSER_MODEL || "gemini-1.5-flash";
-  const prompt = buildLeadParserPrompt(style || process.env.LEAD_SUMMARY_STYLE || "crm_short");
+  const body = {
+    model,
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: prompt },
+          { text: "\n---\nLEAD:\n" + JSON.stringify(lead) },
+          { text: "\n---\nTRANSCRIPT:\n" + (transcriptText || "") },
+        ],
+      },
+    ],
+  };
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      m
-    )}:generateContent?key=${encodeURIComponent(key)}`;
-
-    const body = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text:
-                `${prompt}\n\nCALL:\n${JSON.stringify(call)}\n\nTRANSCRIPT:\n` +
-                transcriptText.slice(0, 14000)
-            }
-          ]
-        }
-      ],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 700 }
-    };
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-
-    const j = await resp.json().catch(() => null);
-    const txt = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-    const trimmed = String(txt || "").trim();
-
-    if (trimmed.startsWith("{")) {
-      return JSON.parse(trimmed);
+    const key = env.GEMINI_API_KEY;
+    if (!key) {
+      logger.info("Lead parser skipped (missing GEMINI_API_KEY)", meta);
+      return null;
     }
 
-    return null;
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const json = await res.json();
+    const txt =
+      json?.candidates?.[0]?.content?.parts?.map((p) => p?.text).filter(Boolean).join("\n") || "";
+
+    const jsonText = extractFirstJsonObject(txt);
+    if (!jsonText) return null;
+
+    try {
+      return JSON.parse(jsonText);
+    } catch (e) {
+      logger.info("Lead parser JSON parse failed", { ...meta, error: e.message });
+      return null;
+    }
   } catch (e) {
-    logger.warn("Lead parser failed", { error: String(e?.message || e) });
+    logger.info("Lead parser failed", { ...meta, error: e.message });
     return null;
   }
 }
 
-// -----------------------------
-// WS install
-// -----------------------------
+// -----------------------------------------------------------------------------
+// Main WS installer
+// -----------------------------------------------------------------------------
 
-function installTwilioMediaWs(server) {
-  const wss = new WebSocket.Server({ noServer: true });
-
-  server.on("upgrade", (req, socket, head) => {
-    if (!req.url || !req.url.startsWith("/twilio-media-stream")) return;
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  });
-
-  wss.on("connection", (twilioWs) => {
+function installTwilioMediaWs(app) {
+  app.ws("/twilio-media-stream", async (ws, req) => {
     logger.info("Twilio media WS connected");
 
-    // Call/session state (do not affect audio pipeline)
+    // per-call state
     let streamSid = null;
     let callSid = null;
-    let customParameters = {};
-    let gemini = null;
+    let finalized = false;
 
-    const startedAtMs = nowMs();
-    const startedAtIso = nowIso();
+    const ssot = await loadSSOT();
 
-    const callerInfo = { value: "", withheld: true };
     const lead = {
       name: "",
       phone: "",
-      request_text: "", // what caller needs
-      transcript: [] // {role,text}
+      notes: "",
+    };
+
+    const callerInfo = {
+      caller: "",
+      called: "",
+      source: "VoiceBot_Blank",
+      caller_withheld: false,
+    };
+
+    const transcript = {
+      bot: [],
+      user: [],
     };
 
     const recording = {
-      provider: "",
+      recording_provider: "",
       recording_sid: "",
-      recording_url_public: ""
+      recording_url_public: "",
     };
 
-    function sendToTwilioMedia(ulaw8kB64) {
-      if (!streamSid) return;
-      const payload = {
-        event: "media",
+    function metaBase() {
+      return {
         streamSid,
-        media: { payload: ulaw8kB64 }
+        callSid,
+        caller: callerInfo.caller,
+        called: callerInfo.called,
+        source: callerInfo.source,
       };
-      try {
-        twilioWs.send(JSON.stringify(payload));
-      } catch {}
     }
 
-    async function finalizeCall(finalizeReason) {
-      const endedAtMs = nowMs();
-      const endedAtIso = nowIso();
-      const durationMs = Math.max(0, endedAtMs - startedAtMs);
+    function pushTranscript(who, text) {
+      const t = safeStr(text);
+      if (!t) return;
+      transcript[who].push(`${who.toUpperCase()}: ${t}`);
+      // keep bounded
+      if (transcript[who].length > 120) transcript[who] = transcript[who].slice(-120);
+    }
 
-      const call = {
-        callSid: callSid || "",
-        streamSid: streamSid || "",
-        caller: callerInfo.value || safeStr(customParameters?.caller),
-        called: safeStr(customParameters?.called),
-        source: safeStr(customParameters?.source) || "VoiceBot_Blank",
-        started_at: startedAtIso,
-        ended_at: endedAtIso,
-        duration_ms: durationMs,
-        caller_withheld: !!callerInfo.withheld,
-        recording_provider: recording.provider || "",
-        recording_sid: recording.recording_sid || "",
-        recording_url_public: recording.recording_url_public || "",
-        finalize_reason: finalizeReason || ""
+    function fullTranscriptText() {
+      // interleave approximately: keep it simple (append by time order isn't available reliably)
+      // For parsing, concatenating both arrays is usually sufficient.
+      return [...transcript.bot, ...transcript.user].join("\n").trim();
+    }
+
+    const gemini = new GeminiLiveSession({
+      ssot,
+      meta: metaBase(),
+      onGeminiAudioUlaw8kBase64: (ulawB64) => {
+        try {
+          ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: ulawB64 },
+            })
+          );
+        } catch {}
+      },
+      onGeminiText: (t) => {
+        logger.debug("Gemini text", { ...metaBase(), t });
+      },
+      onTranscript: ({ who, text, normalized, lang }) => {
+        // deterministic logs already handled in vendor; here we build transcript for parsing/webhook
+        if (who === "bot") pushTranscript("bot", text);
+        if (who === "user") pushTranscript("user", text);
+
+        // lead capture (deterministic + minimal)
+        if (who === "user") {
+          const nlp = normalizeUtterance(text || "");
+          const candidateName = extractNameHe(nlp.normalized || nlp.raw || "");
+          const candidatePhone = extractPhoneAny(nlp.normalized || nlp.raw || "");
+
+          if (!lead.name && candidateName) lead.name = candidateName;
+          if (!lead.phone && candidatePhone) lead.phone = normalizePhoneE164(candidatePhone);
+
+          // keep last user request short for fallback notes
+          if (nlp.normalized || nlp.raw) lead.notes = safeStr(nlp.normalized || nlp.raw);
+
+          // keep intent log deterministically (Stage2 behavior)
+          try {
+            const intent = detectIntent({
+              text: nlp.normalized || nlp.raw,
+              intents: ssot?.intents || [],
+            });
+            logger.info("INTENT_DETECTED", { ...metaBase(), text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang, intent });
+          } catch {}
+        }
+      },
+    });
+
+    async function finalizeCall(reason) {
+      if (finalized) return;
+      finalized = true;
+
+      const ended_at = nowIso();
+
+      const callPayloadBase = {
+        callSid,
+        streamSid,
+        caller: callerInfo.caller,
+        called: callerInfo.called,
+        source: callerInfo.source,
+        started_at: callerInfo.started_at || "",
+        ended_at,
+        duration_ms: callerInfo.started_at_ms ? Date.now() - callerInfo.started_at_ms : 0,
+        caller_withheld: callerInfo.caller_withheld,
+        recording_provider: recording.recording_provider,
+        recording_sid: recording.recording_sid,
+        recording_url_public: recording.recording_url_public,
+        finalize_reason: reason || "",
       };
 
-      // CALL_LOG (END)
-      await deliverWebhook("CALL_LOG", { event: "CALL_LOG", phase: "end", call });
+      // Decide FINAL vs ABANDONED (minimal deterministic gate)
+      const leadComplete = !!safeStr(lead.name) && !!safeStr(lead.phone);
 
-      const transcriptText = lead.transcript.map((x) => `${x.role}: ${x.text}`).join("\n").trim();
-
-      const leadComplete = Boolean(lead.name && (lead.request_text || "").trim());
-      const eventType = leadComplete ? "FINAL" : "ABANDONED";
-
-      let lead_parser = null;
+      let leadParser = null;
       if (leadComplete) {
-        lead_parser = await runLeadParserPostcall({
-          model: process.env.LEAD_PARSER_MODEL || process.env.LEAD_PARSER_MODEL,
-          style: process.env.LEAD_SUMMARY_STYLE || "crm_short",
-          call,
-          transcriptText
+        leadParser = await runLeadParser({
+          meta: metaBase(),
+          ssot,
+          lead,
+          transcriptText: fullTranscriptText(),
         });
       }
 
-      // What goes to CRM:
-      // - notes should be summary-oriented (NOT full transcript)
-      // - full transcript can be optionally included with env flag
-      const includeTranscript = String(process.env.LEAD_INCLUDE_TRANSCRIPT || "").toLowerCase() === "true";
+      // Build CRM-friendly notes (SHORT)
+      const notesFromParser = safeStr(leadParser?.summary);
+      const topic = safeStr(leadParser?.topic);
+      const requested = safeStr(leadParser?.requested_action);
 
-      const notesFromParser =
-        lead_parser && typeof lead_parser === "object"
-          ? [
-              lead_parser.subject ? `נושא: ${lead_parser.subject}` : "",
-              lead_parser.request ? `בקשה: ${lead_parser.request}` : "",
-              lead_parser.details ? `פרטים: ${lead_parser.details}` : "",
-              lead_parser.action_needed ? `מה צריך: ${lead_parser.action_needed}` : "",
-              lead_parser.urgency ? `דחיפות: ${lead_parser.urgency}` : ""
-            ]
-              .filter(Boolean)
-              .join("\n")
-          : "";
+      const shortNotesParts = [];
+      if (topic) shortNotesParts.push(`נושא: ${topic}`);
+      if (requested) shortNotesParts.push(`בקשה: ${requested}`);
+      if (notesFromParser) shortNotesParts.push(`סיכום: ${notesFromParser}`);
+
+      const notesFallback = safeStr(lead.notes);
+      const notesFinal = shortNotesParts.length ? shortNotesParts.join(" | ") : notesFallback;
 
       const payload = {
-        event: eventType,
-        call,
+        call: callPayloadBase,
         lead: {
-          name: lead.name || "",
-          phone: lead.phone || "",
-          // IMPORTANT: do not dump full transcript by default
-          notes: notesFromParser || lead.request_text || "",
-          lead_parser: lead_parser || null,
-          ...(includeTranscript ? { transcript: transcriptText } : {})
-        }
+          name: safeStr(lead.name),
+          phone: safeStr(lead.phone) || normalizePhoneE164(callerInfo.caller),
+          notes: notesFinal,
+          lead_parser: leadParser || null,
+        },
       };
 
-      await deliverWebhook(eventType, payload);
+      // 1) CALL_LOG (end only)
+      await deliverWebhook(env.CALL_LOG_WEBHOOK_URL, { event: "CALL_LOG", phase: "end", ...payload }, "CALL_LOG");
+
+      // 2) FINAL/ABANDONED
+      if (leadComplete) {
+        await deliverWebhook(env.FINAL_WEBHOOK_URL, { event: "FINAL", ...payload }, "FINAL");
+      } else {
+        // ABANDONED should still include caller phone if known
+        if (!payload.lead.phone) payload.lead.phone = normalizePhoneE164(callerInfo.caller);
+        await deliverWebhook(env.ABANDONED_URL, { event: "ABANDONED", ...payload }, "ABANDONED");
+      }
     }
 
-    twilioWs.on("message", async (data) => {
+    ws.on("message", async (msgBuf) => {
       let msg;
       try {
-        msg = JSON.parse(data.toString("utf8"));
+        msg = JSON.parse(msgBuf.toString("utf8"));
       } catch {
         return;
       }
 
-      const ev = msg.event;
+      const event = msg?.event;
 
-      if (ev === "connected") {
-        logger.info("Twilio WS event", { event: "connected", streamSid: null, callSid: null });
+      if (event === "connected") {
+        logger.info("Twilio WS event", { meta: { event, streamSid: msg?.streamSid ?? null, callSid: msg?.start?.callSid ?? null } });
         return;
       }
 
-      if (ev === "start") {
-        streamSid = msg?.start?.streamSid || null;
+      if (event === "start") {
+        streamSid = msg?.start?.streamSid || msg?.streamSid || null;
         callSid = msg?.start?.callSid || null;
-        customParameters = msg?.start?.customParameters || {};
 
-        // normalize caller now
-        const c = normalizeCallerId(customParameters?.caller);
-        callerInfo.value = c.value;
-        callerInfo.withheld = c.withheld;
+        const cp = msg?.start?.customParameters || {};
+        callerInfo.caller = safeStr(cp.caller || "");
+        callerInfo.called = safeStr(cp.called || "");
+        callerInfo.source = safeStr(cp.source || "VoiceBot_Blank");
+        callerInfo.started_at = nowIso();
+        callerInfo.started_at_ms = Date.now();
 
-        // set default callback phone if not withheld
-        if (!callerInfo.withheld && c.value) {
-          lead.phone = c.value;
-        }
+        callerInfo.caller_withheld = !callerInfo.caller || /anonymous|restricted|withheld/i.test(callerInfo.caller);
 
-        logger.info("Twilio stream start", { streamSid, callSid, customParameters });
+        logger.info("Twilio stream start", { meta: { streamSid, callSid, customParameters: cp } });
 
-        // SSOT already preloaded in server; keep non-breaking
-        const ssot = getSSOT();
-
-        // Start recording best-effort
-        if (String(process.env.MB_ENABLE_RECORDING || "").toLowerCase() === "true" && callSid) {
-          const recSid = await startTwilioCallRecording(callSid);
+        // Start recording (server-side); public URL = our proxy route
+        if (isTruthy(env.MB_ENABLE_RECORDING) && callSid) {
+          const recSid = await startCallRecording(callSid, logger);
           if (recSid) {
-            recording.provider = "twilio";
+            recording.recording_provider = "twilio";
             recording.recording_sid = recSid;
-            recording.recording_url_public = twilioRecordingMp3Url(recSid);
+            recording.recording_url_public = publicRecordingUrl(recSid);
           }
         }
 
-        // Create Gemini session exactly like Stage3 (same methods)
+        // Start Gemini
         try {
-          gemini = new GeminiLiveSession({
-            meta: {
-              streamSid,
-              callSid,
-              caller: customParameters?.caller,
-              called: customParameters?.called,
-              source: customParameters?.source
-            },
-            ssot,
-            onGeminiAudioUlaw8kBase64: (ulawB64) => sendToTwilioMedia(ulawB64),
-            onGeminiText: (t) => logger.debug("Gemini text", { streamSid, callSid, t }),
-            onTranscript: ({ who, text, normalized }) => {
-              // keep your existing transcript logs
-              logger.info(`TRANSCRIPT ${who}`, { streamSid, callSid, text });
-
-              // capture minimal lead state WITHOUT affecting audio
-              const s = (normalized || text || "").trim();
-
-              if (who === "user") {
-                // 1) name capture
-                if (!lead.name) {
-                  const nm = extractNameHe(s);
-                  if (nm) lead.name = nm;
-                } else {
-                  // 2) after name, capture request text (first meaningful user content)
-                  if (!lead.request_text && s.length >= 3) {
-                    lead.request_text = s;
-                  } else if (lead.request_text && s.length >= 3) {
-                    // keep last meaningful line as "latest request"
-                    lead.request_text = s;
-                  }
-
-                  // 3) if caller withheld and user says number, capture phone
-                  if (callerInfo.withheld && !lead.phone) {
-                    const ph = extractPhoneAny(s);
-                    if (ph) lead.phone = ph;
-                  }
-                }
-              }
-
-              // store short transcript always (for parser), cap size
-              const role = who === "bot" ? "BOT" : "USER";
-              if (s) {
-                lead.transcript.push({ role, text: s });
-                if (lead.transcript.length > 120) lead.transcript.shift();
-              }
-            }
-          });
-
+          gemini.meta = metaBase();
           gemini.start();
         } catch (e) {
-          logger.error("Failed to start Gemini session", { streamSid, callSid, error: String(e?.message || e) });
+          logger.info("Gemini session start failed", { ...metaBase(), error: e.message });
         }
 
         return;
       }
 
-      if (ev === "media") {
-        const b64 = msg?.media?.payload;
-        if (b64 && gemini) gemini.sendUlaw8kFromTwilio(b64);
+      if (event === "media") {
+        const payload = msg?.media?.payload;
+        if (payload) {
+          try {
+            gemini.sendUlaw8kFromTwilio(payload);
+          } catch {}
+        }
         return;
       }
 
-      if (ev === "stop") {
-        logger.info("Twilio stream stop", { streamSid, callSid });
+      if (event === "stop") {
+        logger.info("Twilio stream stop", { meta: { streamSid, callSid } });
 
         try {
-          if (gemini) {
-            gemini.endInput();
-            gemini.stop();
-          }
+          gemini.endInput();
+          gemini.stop();
         } catch {}
 
-        // finalize (STOP is the canonical "final" point)
         await finalizeCall("stop_called");
-
+        try {
+          ws.close();
+        } catch {}
         return;
       }
     });
 
-    twilioWs.on("close", async () => {
-      logger.info("Twilio media WS closed", { streamSid, callSid });
-
+    ws.on("close", async () => {
+      logger.info("Twilio media WS closed", { meta: { streamSid, callSid } });
       try {
-        if (gemini) gemini.stop();
+        gemini.endInput();
+        gemini.stop();
       } catch {}
 
-      // If WS closed without stop, still finalize once
-      // (Twilio usually sends stop, but be defensive)
       await finalizeCall("ws_closed");
     });
 
-    twilioWs.on("error", (err) => {
-      logger.error("Twilio media WS error", { streamSid, callSid, error: err.message });
-      try {
-        if (gemini) gemini.stop();
-      } catch {}
+    ws.on("error", async (err) => {
+      logger.info("Twilio media WS error", { meta: { streamSid, callSid }, error: err.message });
+      await finalizeCall("ws_error");
     });
   });
-
-  return wss;
 }
 
 module.exports = { installTwilioMediaWs };
