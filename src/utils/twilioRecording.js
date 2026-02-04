@@ -1,143 +1,124 @@
-"use strict";
+'use strict';
 
-const https = require("https");
-const querystring = require("querystring");
-const { env } = require("../config/env");
-const { logger } = require("../utils/logger");
+const { Readable } = require('node:stream');
 
-/**
- * Start a Twilio Call Recording.
- * Returns: { recordingSid, recordingUrl } (Twilio API URL), or null if failed.
- */
-async function startCallRecording(callSid) {
-  if (!callSid) return null;
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return null;
+function twilioAuthHeader() {
+  const sid = process.env.TWILIO_ACCOUNT_SID || '';
+  const token = process.env.TWILIO_AUTH_TOKEN || '';
+  const basic = Buffer.from(`${sid}:${token}`).toString('base64');
+  return `Basic ${basic}`;
+}
 
-  // Twilio: POST /Calls/{CallSid}/Recordings.json
-  // https://www.twilio.com/docs/voice/api/recording#record-a-call
-  const body = querystring.stringify({
-    RecordingStatusCallbackEvent: "completed",
-    RecordingChannels: "dual",
-    RecordingTrack: "both"
-  });
+function twilioBase() {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  return `https://api.twilio.com/2010-04-01/Accounts/${sid}`;
+}
 
-  const path = `/2010-04-01/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(
-    callSid
-  )}/Recordings.json`;
-
-  const auth = Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64");
-
-  const opts = {
-    hostname: "api.twilio.com",
-    method: "POST",
-    path,
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Content-Length": Buffer.byteLength(body)
-    }
-  };
-
-  return new Promise((resolve) => {
-    const req = https.request(opts, (res) => {
-      let raw = "";
-      res.on("data", (d) => (raw += d.toString("utf8")));
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(raw || "{}");
-          const recordingSid = json.sid || "";
-          const recordingUrl = json.uri ? `https://api.twilio.com${json.uri}` : "";
-          if (recordingSid) {
-            resolve({ recordingSid, recordingUrl });
-          } else {
-            resolve(null);
-          }
-        } catch (e) {
-          resolve(null);
-        }
-      });
+async function startCallRecording(callSid, logger) {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    logger?.warn?.('TWILIO creds missing; cannot start recording');
+    return { ok: false, recordingSid: null };
+  }
+  try {
+    const url = `${twilioBase()}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
+    const body = new URLSearchParams({
+      RecordingChannels: 'dual',
+      RecordingTrack: 'both',
     });
 
-    req.on("error", () => resolve(null));
-    req.write(body);
-    req.end();
-  });
-}
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: twilioAuthHeader(),
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    });
 
-/**
- * Build a "public" URL to the recording.
- *
- * Modes (ENV: MB_RECORDING_URL_MODE):
- * - "twilio_auth" (default): returns a Twilio media URL with embedded basic-auth credentials.
- *   ✅ Works immediately without changing server routes, but exposes credentials in the URL.
- * - "twilio": returns the Twilio media URL (requires auth to fetch).
- * - "proxy": returns PUBLIC_BASE_URL/recordings/{sid}.mp3 (requires you to implement a proxy route in your server).
- */
-function publicRecordingUrl(recordingSid) {
-  if (!recordingSid) return "";
-
-  const mode = String(env.MB_RECORDING_URL_MODE || "twilio_auth").toLowerCase();
-  const acct = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-
-  const mediaPath = `/2010-04-01/Accounts/${encodeURIComponent(acct)}/Recordings/${encodeURIComponent(
-    recordingSid
-  )}.mp3`;
-
-  if (mode === "proxy") {
-    const base = (env.PUBLIC_BASE_URL || "").replace(/\/+$/g, "");
-    if (!base) return "";
-    return `${base}/recordings/${recordingSid}.mp3`;
-  }
-
-  if (mode === "twilio") {
-    return `https://api.twilio.com${mediaPath}`;
-  }
-
-  // default: twilio_auth
-  if (!acct || !token) return `https://api.twilio.com${mediaPath}`;
-  return `https://${encodeURIComponent(acct)}:${encodeURIComponent(token)}@api.twilio.com${mediaPath}`;
-}
-
-/**
- * Optional: proxy endpoint helper (not used unless you add a route in server).
- * This fetches from Twilio with Basic Auth and streams the MP3.
- */
-async function proxyRecordingMp3(recordingSid, res) {
-  if (!recordingSid) return res.status(400).send("missing recordingSid");
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return res.status(500).send("missing twilio creds");
-
-  const path = `/2010-04-01/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/Recordings/${encodeURIComponent(
-    recordingSid
-  )}.mp3`;
-
-  const auth = Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64");
-
-  const opts = {
-    hostname: "api.twilio.com",
-    method: "GET",
-    path,
-    headers: {
-      Authorization: `Basic ${auth}`
+    const txt = await resp.text();
+    if (!resp.ok) {
+      logger?.warn?.('Twilio start recording failed', { status: resp.status, body: txt?.slice?.(0, 300) });
+      return { ok: false, recordingSid: null };
     }
-  };
 
-  const req = https.request(opts, (twRes) => {
-    res.status(twRes.statusCode || 502);
-    res.setHeader("Content-Type", "audio/mpeg");
-    twRes.pipe(res);
-  });
+    const j = JSON.parse(txt);
+    return { ok: true, recordingSid: j.sid || null };
+  } catch (e) {
+    logger?.warn?.('Twilio start recording exception', { err: String(e) });
+    return { ok: false, recordingSid: null };
+  }
+}
 
-  req.on("error", (e) => {
-    logger.error("proxyRecordingMp3 error", { error: e.message });
-    res.status(502).send("upstream error");
-  });
+function publicRecordingUrl(recordingSid) {
+  const base = process.env.PUBLIC_BASE_URL || '';
+  if (!base || !recordingSid) return null;
+  return `${base.replace(/\/$/, '')}/recordings/${recordingSid}.mp3`;
+}
 
-  req.end();
+async function hangupCall(callSid, logger) {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
+  try {
+    const url = `${twilioBase()}/Calls/${encodeURIComponent(callSid)}.json`;
+    const body = new URLSearchParams({ Status: 'completed' });
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: twilioAuthHeader(),
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      logger?.warn?.('Twilio hangup failed', { status: resp.status, body: t?.slice?.(0, 250) });
+      return false;
+    }
+    return true;
+  } catch (e) {
+    logger?.warn?.('Twilio hangup exception', { err: String(e) });
+    return false;
+  }
+}
+
+async function proxyRecordingMp3(recordingSid, res, logger) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  if (!accountSid || !process.env.TWILIO_AUTH_TOKEN) {
+    res.statusCode = 503;
+    res.end('twilio_not_configured');
+    return;
+  }
+
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { authorization: twilioAuthHeader() },
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text();
+      res.statusCode = resp.status;
+      res.end(t);
+      return;
+    }
+
+    res.setHeader('content-type', 'audio/mpeg');
+    const nodeStream = Readable.fromWeb(resp.body);
+    nodeStream.on('error', (e) => {
+      logger?.warn?.('recording proxy stream error', { err: String(e) });
+      try { res.end(); } catch (_) {}
+    });
+    nodeStream.pipe(res);
+  } catch (e) {
+    logger?.warn?.('recording proxy exception', { err: String(e) });
+    res.statusCode = 500;
+    res.end('proxy_error');
+  }
 }
 
 module.exports = {
   startCallRecording,
   publicRecordingUrl,
-  proxyRecordingMp3
+  hangupCall,
+  proxyRecordingMp3,
 };
