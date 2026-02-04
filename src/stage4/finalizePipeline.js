@@ -1,8 +1,10 @@
 "use strict";
 
 /**
- * Stage 4 – Canonical Call Finalization
- * FINAL / ABANDONED decision is deterministic and transcript-independent
+ * Stage 4 – Canonical Call Finalization (Adapter + SSOT)
+ * - Supports snapshot-based invocation (current runtime)
+ * - CALL_LOG always
+ * - FINAL xor ABANDONED (deterministic LeadGate)
  */
 
 function nowIso() {
@@ -42,37 +44,40 @@ function computeLeadGate(lead) {
 }
 
 /**
- * finalizeCall – SINGLE SOURCE OF TRUTH
+ * finalizeCall – canonical (callState-based)
  */
 async function finalizeCall({ reason, callState, env, logger, senders }) {
-  // ------------------------------------------------------------
-  // 0. Guard – run exactly once
-  // ------------------------------------------------------------
+  if (!callState || typeof callState !== "object") {
+    throw new TypeError("finalizeCall: callState is missing/invalid");
+  }
+
+  // 0) Guard – run exactly once
   if (callState.finalized) {
     logger?.debug?.("finalizeCall: already finalized");
     return;
   }
   callState.finalized = true;
 
-  // ------------------------------------------------------------
-  // 1. Close timing
-  // ------------------------------------------------------------
+  // 1) Close timing
   const endedAt = nowIso();
   callState.ended_at = endedAt;
 
-  const durationMs = Date.now() - new Date(callState.started_at).getTime();
+  const startedAtMs = new Date(callState.started_at || Date.now()).getTime();
+  const durationMs = Date.now() - startedAtMs;
 
-  // ------------------------------------------------------------
-  // 2. Resolve recording (best-effort, blocking)
-  // ------------------------------------------------------------
+  // 2) Resolve recording (best-effort, blocking)
   let recording = {
     recording_provider: "",
     recording_sid: "",
     recording_url_public: ""
   };
 
-  if (env?.MB_ENABLE_RECORDING && senders?.resolveRecording) {
-    try {
+  // IMPORTANT: keep it best-effort; do not block webhooks if resolveRecording fails.
+  try {
+    const enableRecording =
+      !!env?.MB_ENABLE_RECORDING || String(env?.MB_ENABLE_RECORDING || "").toLowerCase() === "true";
+
+    if (enableRecording && senders?.resolveRecording) {
       const r = await senders.resolveRecording();
       if (r && typeof r === "object") {
         recording = {
@@ -81,32 +86,28 @@ async function finalizeCall({ reason, callState, env, logger, senders }) {
           recording_url_public: safeStr(r.recording_url_public)
         };
       }
-    } catch (e) {
-      logger?.warn?.("Recording resolve failed", { error: String(e) });
     }
+  } catch (e) {
+    logger?.warn?.("Recording resolve failed", { error: String(e) });
   }
 
-  // ------------------------------------------------------------
-  // 3. LeadGate – deterministic decision
-  // ------------------------------------------------------------
-  const gate = computeLeadGate(callState.lead || {});
+  // 3) LeadGate – deterministic decision
+  const gate = computeLeadGate(callState.lead);
 
-  // ------------------------------------------------------------
-  // 4. Build base payload
-  // ------------------------------------------------------------
+  // 4) Build base payload (stable contract)
   const basePayload = {
     event: null,
 
     call: {
-      callSid: callState.callSid,
-      streamSid: callState.streamSid,
-      caller: callState.caller,
-      called: callState.called,
-      source: callState.source,
+      callSid: safeStr(callState.callSid),
+      streamSid: safeStr(callState.streamSid),
+      caller: safeStr(callState.caller),
+      called: safeStr(callState.called),
+      source: safeStr(callState.source),
 
       caller_withheld: !!callState.caller_withheld,
 
-      started_at: callState.started_at,
+      started_at: safeStr(callState.started_at),
       ended_at: endedAt,
       duration_ms: durationMs,
 
@@ -123,43 +124,28 @@ async function finalizeCall({ reason, callState, env, logger, senders }) {
     recording_url_public: recording.recording_url_public
   };
 
-  // ------------------------------------------------------------
-  // 5. CALL_LOG – always
-  // ------------------------------------------------------------
+  // 5) CALL_LOG – always
   try {
     if (senders?.sendCallLog) {
-      await senders.sendCallLog({
-        ...basePayload,
-        event: "CALL_LOG"
-      });
+      await senders.sendCallLog({ ...basePayload, event: "CALL_LOG" });
     }
   } catch (e) {
     logger?.warn?.("CALL_LOG webhook failed", { error: String(e) });
   }
 
-  // ------------------------------------------------------------
-  // 6. FINAL xor ABANDONED
-  // ------------------------------------------------------------
+  // 6) FINAL xor ABANDONED
   if (gate.ok) {
-    // FINAL
     try {
       if (senders?.sendFinal) {
-        await senders.sendFinal({
-          ...basePayload,
-          event: "FINAL"
-        });
+        await senders.sendFinal({ ...basePayload, event: "FINAL" });
       }
     } catch (e) {
       logger?.warn?.("FINAL webhook failed", { error: String(e) });
     }
   } else {
-    // ABANDONED
     try {
       if (senders?.sendAbandoned) {
-        await senders.sendAbandoned({
-          ...basePayload,
-          event: "ABANDONED"
-        });
+        await senders.sendAbandoned({ ...basePayload, event: "ABANDONED" });
       }
     } catch (e) {
       logger?.warn?.("ABANDONED webhook failed", { error: String(e) });
@@ -168,11 +154,50 @@ async function finalizeCall({ reason, callState, env, logger, senders }) {
 }
 
 /**
- * finalizePipeline – compatibility wrapper
- * geminiLiveSession.js calls finalizePipeline(...)
+ * finalizePipeline – ADAPTER (snapshot-based)
+ * This matches the current runtime call site in geminiLiveSession.js
  */
-async function finalizePipeline(args) {
-  return finalizeCall(args);
+async function finalizePipeline({ reason, snapshot, env, logger, senders } = {}) {
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new TypeError("finalizePipeline: snapshot is missing/invalid");
+  }
+
+  // allow caller to store guard on snapshot
+  if (snapshot.__finalized_stage4) {
+    logger?.debug?.("finalizePipeline: snapshot already finalized");
+    return;
+  }
+  snapshot.__finalized_stage4 = true;
+
+  const call = snapshot.call || {};
+  const lead = snapshot.lead || {};
+
+  const callState = {
+    finalized: false,
+
+    callSid: call.callSid,
+    streamSid: call.streamSid,
+    caller: call.caller,
+    called: call.called,
+    source: call.source,
+
+    caller_withheld: !!call.caller_withheld,
+
+    started_at: call.started_at || nowIso(),
+    ended_at: call.ended_at || null,
+
+    lead
+  };
+
+  const effectiveReason = safeStr(reason || call.finalize_reason || call.reason || "unknown");
+
+  return finalizeCall({
+    reason: effectiveReason,
+    callState,
+    env,
+    logger,
+    senders
+  });
 }
 
 module.exports = {
