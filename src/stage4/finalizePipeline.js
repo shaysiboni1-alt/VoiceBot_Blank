@@ -1,241 +1,218 @@
+// src/stage4/finalizePipeline.js
 "use strict";
 
-/**
- * Stage 4 – Finalize Pipeline (GilSport-style)
- * - Post-call LLM parsing (CRM-ready)
- * - Deterministic FINAL / ABANDONED
- * - Recording resolved AFTER call end
- * - Does NOT touch media / voice / realtime
- */
+/*
+  Stage 4: Finalize pipeline
 
-const fetch = global.fetch || require("node-fetch");
+  Goals (GilSport-style):
+  - Send CALL_LOG (always, per env)
+  - Send FINAL xor ABANDONED (deterministic)
+  - Include recording_url_public/recording_sid/recording_provider when possible
+  - Post-call smart parsing (LLM) to fill lead fields from transcript
 
-function nowIso() {
-  return new Date().toISOString();
-}
+  IMPORTANT: This runs after the media stream stops (post-call). It should not affect audio.
+*/
+
+const { parseLeadPostcall } = require("./postcallLeadParser");
 
 function safeStr(v) {
-  return v === undefined || v === null ? "" : String(v).trim();
+  const s = typeof v === "string" ? v.trim() : "";
+  return s || null;
 }
 
-function wordsCount(s) {
-  return safeStr(s).split(/\s+/).filter(Boolean).length;
+function secondsFromMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n / 1000);
 }
 
-/**
- * Deterministic LeadGate (same philosophy as GilSport)
- */
-function computeLeadGate(lead) {
-  if (!lead) return { ok: false, reason: "missing_lead" };
-
-  const name = safeStr(lead.full_name);
-  const reason = safeStr(lead.reason);
-  const notes = safeStr(lead.notes);
-
-  if (!name || name.length < 2) {
-    return { ok: false, reason: "missing_name" };
-  }
-
-  if (!reason && !notes) {
-    return { ok: false, reason: "missing_reason" };
-  }
-
-  return { ok: true, reason: "lead_complete" };
-}
-
-/**
- * Run LLM Lead Parser (GilSport-style, post-call)
- */
-async function runLeadParser({ env, prompt, transcriptText }) {
-  if (!env.LEAD_PARSER_ENABLED) return null;
-  if (!prompt) return null;
-
-  const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-
-  const model = env.LEAD_PARSER_MODEL || "gemini-1.5-flash";
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text:
-              prompt +
-              "\n\nTRANSCRIPT:\n" +
-              transcriptText
-          }
-        ]
-      }
-    ],
-    generationConfig: {
-      temperature: 0.2,
-      maxOutputTokens: 600
-    }
-  };
-
+function formatDateTimeParts(date, timeZone) {
   try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body)
-      }
-    );
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
 
-    const json = await resp.json();
-    const text =
-      json?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text)
-        .join("") || "";
-
-    const trimmed = text.trim();
-
-    // Direct JSON
-    if (trimmed.startsWith("{")) {
-      return JSON.parse(trimmed);
-    }
-
-    // Fenced JSON
-    const m = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    if (m && m[1]) {
-      return JSON.parse(m[1].trim());
-    }
+    const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+    const call_date = `${map.year}-${map.month}-${map.day}`;
+    const call_time = `${map.hour}:${map.minute}:${map.second}`;
+    return { call_date, call_time };
   } catch {
-    return null;
+    const iso = date.toISOString();
+    return { call_date: iso.slice(0, 10), call_time: iso.slice(11, 19) };
   }
-
-  return null;
 }
 
-/**
- * FINALIZE PIPELINE – SINGLE ENTRY POINT
- */
-async function finalizePipeline({
-  snapshot,
-  env,
-  logger,
-  senders,
-  state
-}) {
-  if (state?.finalized) return;
-  if (state) state.finalized = true;
+function deriveSubjectAndReason(parsed) {
+  // We keep this simple and deterministic:
+  // - subject: short headline (if model returns one)
+  // - reason: slightly longer problem statement (if model returns one)
+  return {
+    subject: safeStr(parsed?.subject),
+    reason: safeStr(parsed?.reason),
+  };
+}
 
-  const call = snapshot.call || {};
-  const transcriptArr = snapshot.transcript || [];
+function shouldFinalizeAsLead(lead) {
+  // Deterministic LeadGate:
+  // must have full_name AND (subject OR reason) OR a non-empty parsing_summary.
+  const hasName = !!safeStr(lead?.full_name);
+  const hasTopic = !!safeStr(lead?.subject) || !!safeStr(lead?.reason);
+  const hasSummary = !!safeStr(lead?.parsing_summary);
+  return hasName && (hasTopic || hasSummary);
+}
 
-  const transcriptText = transcriptArr
-    .map((t) => `${String(t.who || "").toUpperCase()}: ${t.text}`)
-    .join("\n");
+function decisionReason(lead) {
+  if (!safeStr(lead?.full_name)) return "missing_name";
+  if (!safeStr(lead?.subject) && !safeStr(lead?.reason) && !safeStr(lead?.parsing_summary)) {
+    return "missing_topic";
+  }
+  return "ok";
+}
 
-  // ------------------------------------------------------------
-  // 1. Resolve Recording (AFTER call end, best-effort)
-  // ------------------------------------------------------------
-  let recording = {
-    recording_provider: "",
-    recording_sid: "",
-    recording_url_public: ""
+function buildFinalPayload({ event, call, lead, recording }) {
+  const tz = call?.timeZone || "UTC";
+  const { call_date, call_time } = formatDateTimeParts(new Date(call?.ended_at || Date.now()), tz);
+
+  return {
+    event,
+    full_name: safeStr(lead?.full_name),
+    subject: safeStr(lead?.subject),
+    reason: safeStr(lead?.reason),
+    caller_id_e164: safeStr(call?.caller),
+    phone_additional: safeStr(lead?.phone_additional),
+    parsing_summary: safeStr(lead?.parsing_summary),
+    recording_url_public: safeStr(recording?.recording_url_public),
+    call_date,
+    call_time,
+    callSid: safeStr(call?.callSid),
+    duration_sec: call?.duration_sec ?? null,
+    // Optional (ignored by Make if not used):
+    recording_provider: safeStr(recording?.recording_provider),
+    recording_sid: safeStr(recording?.recording_sid),
+    decision_reason: safeStr(lead?.decision_reason),
+  };
+}
+
+async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
+  const log = logger || console;
+
+  // 0) Build call context
+  const call = {
+    callSid: snapshot?.call?.callSid || snapshot?.callSid || null,
+    streamSid: snapshot?.call?.streamSid || snapshot?.streamSid || null,
+    caller: snapshot?.call?.caller || snapshot?.caller || null,
+    called: snapshot?.call?.called || snapshot?.called || null,
+    source: snapshot?.call?.source || snapshot?.source || "VoiceBot_Blank",
+    started_at: snapshot?.call?.started_at || snapshot?.started_at || null,
+    ended_at: snapshot?.call?.ended_at || snapshot?.ended_at || null,
+    duration_ms: snapshot?.call?.duration_ms ?? snapshot?.duration_ms ?? null,
+    duration_sec: snapshot?.call?.duration_sec ?? secondsFromMs(snapshot?.call?.duration_ms ?? snapshot?.duration_ms),
+    finalize_reason: snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
+    timeZone: env.TIME_ZONE || "UTC",
   };
 
-  if (env.MB_ENABLE_RECORDING && senders?.resolveRecording) {
-    try {
-      const r = await senders.resolveRecording();
-      if (r) {
-        recording = {
-          recording_provider: safeStr(r.recording_provider),
-          recording_sid: safeStr(r.recording_sid),
-          recording_url_public: safeStr(r.recording_url_public)
-        };
+  // 1) CALL_LOG (always, if enabled)
+  try {
+    if (env.CALL_LOG_AT_START === "true" && env.CALL_LOG_MODE === "start") {
+      // Already sent at start by other stage; do nothing.
+    }
+    if (env.CALL_LOG_AT_END === "true") {
+      const payload = {
+        event: "CALL_LOG",
+        call: {
+          callSid: call.callSid,
+          streamSid: call.streamSid,
+          caller: call.caller,
+          called: call.called,
+          source: call.source,
+          started_at: call.started_at,
+          ended_at: call.ended_at,
+          duration_ms: call.duration_ms,
+          duration_sec: call.duration_sec,
+          finalize_reason: call.finalize_reason,
+        },
+      };
+      if (env.CALL_LOG_WEBHOOK_URL && senders?.sendCallLog) {
+        await senders.sendCallLog(payload);
       }
-    } catch {}
+    }
+  } catch (e) {
+    log.warn?.("CALL_LOG webhook failed", e?.message || e);
   }
 
-  // ------------------------------------------------------------
-  // 2. LLM Parsing (GilSport style)
-  // ------------------------------------------------------------
+  // 2) Post-call smart parsing (LLM) -> lead fields
   let parsed = null;
   try {
-    parsed = await runLeadParser({
-      env,
-      prompt: snapshot.ssot?.prompts?.LEAD_PARSER_PROMPT,
-      transcriptText
-    });
-  } catch {}
+    const transcriptText = snapshot?.lead?.transcriptText || snapshot?.transcriptText || "";
+    const shouldParse = env.LEAD_PARSER_ENABLED === "true";
 
-  const lead = {
-    full_name: parsed?.full_name ?? null,
-    phone_number: parsed?.phone_number ?? null,
-    prefers_caller_id: parsed?.prefers_caller_id ?? null,
-    intent: parsed?.intent ?? "unknown",
-    reason: parsed?.reason ?? "",
-    notes: parsed?.notes ?? ""
-  };
-
-  // ------------------------------------------------------------
-  // 3. LeadGate
-  // ------------------------------------------------------------
-  const gate = computeLeadGate(lead);
-
-  // ------------------------------------------------------------
-  // 4. Base Payload
-  // ------------------------------------------------------------
-  const basePayload = {
-    call: {
-      callSid: call.callSid,
-      streamSid: call.streamSid,
-      caller: call.caller,
-      called: call.called,
-      source: call.source,
-      started_at: call.started_at,
-      ended_at: call.ended_at,
-      duration_ms: call.duration_ms,
-      finalize_reason: call.finalize_reason || ""
-    },
-    lead: {
-      ...lead,
-      decision_reason: gate.reason
-    },
-    recording_provider: recording.recording_provider,
-    recording_sid: recording.recording_sid,
-    recording_url_public: recording.recording_url_public
-  };
-
-  // ------------------------------------------------------------
-  // 5. CALL_LOG (always)
-  // ------------------------------------------------------------
-  try {
-    if (senders?.sendCallLog) {
-      await senders.sendCallLog({
-        event: "CALL_LOG",
-        ...basePayload
+    if (shouldParse) {
+      parsed = await parseLeadPostcall({
+        transcriptText,
+        ssot,
+        env,
+        logger: log,
       });
     }
-  } catch {}
-
-  // ------------------------------------------------------------
-  // 6. FINAL xor ABANDONED
-  // ------------------------------------------------------------
-  if (gate.ok) {
-    try {
-      if (senders?.sendFinal) {
-        await senders.sendFinal({
-          event: "FINAL",
-          ...basePayload
-        });
-      }
-    } catch {}
-  } else {
-    try {
-      if (senders?.sendAbandoned) {
-        await senders.sendAbandoned({
-          event: "ABANDONED",
-          ...basePayload
-        });
-      }
-    } catch {}
+  } catch (e) {
+    log.warn?.("Lead postcall parsing failed", e?.message || e);
   }
+
+  const parsedDerived = deriveSubjectAndReason(parsed || {});
+
+  const lead = {
+    full_name: safeStr(parsed?.full_name) || safeStr(snapshot?.lead?.full_name) || null,
+    subject: parsedDerived.subject || safeStr(snapshot?.lead?.subject) || null,
+    reason: parsedDerived.reason || safeStr(snapshot?.lead?.reason) || null,
+    phone_additional: safeStr(parsed?.phone_additional) || null,
+    parsing_summary: safeStr(parsed?.parsing_summary) || safeStr(snapshot?.lead?.notes) || null,
+  };
+
+  // 3) Resolve recording (best-effort)
+  let recording = {
+    recording_provider: null,
+    recording_sid: null,
+    recording_url_public: null,
+  };
+  try {
+    if (env.MB_ENABLE_RECORDING === "true" && typeof senders.resolveRecording === "function") {
+      recording = await senders.resolveRecording(call.callSid);
+    }
+  } catch (e) {
+    log.warn?.("Resolve recording failed", e?.message || e);
+  }
+
+  // 4) Deterministic LeadGate -> FINAL xor ABANDONED
+  const isFinal = !!shouldFinalizeAsLead(lead) && env.FINAL_ON_STOP === "true";
+  lead.decision_reason = decisionReason(lead);
+
+  const finalPayload = buildFinalPayload({
+    event: isFinal ? "FINAL" : "ABANDONED",
+    call,
+    lead,
+    recording,
+  });
+
+  // 5) Deliver FINAL / ABANDONED
+  if (isFinal) {
+    if (env.FINAL_WEBHOOK_URL && typeof senders.sendFinal === "function") {
+      await senders.sendFinal(finalPayload);
+    }
+  } else {
+    if (env.ABANDONED_WEBHOOK_URL && typeof senders.sendAbandoned === "function") {
+      await senders.sendAbandoned(finalPayload);
+    }
+  }
+
+  // 6) Force hangup is handled by Twilio side; this is post-call.
+  return { status: "ok", event: finalPayload.event };
 }
 
 module.exports = { finalizePipeline };
