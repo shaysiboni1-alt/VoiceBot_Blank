@@ -21,6 +21,9 @@ function installTwilioMediaWs(server) {
     let customParameters = {};
     let gemini = null;
 
+    // NEW (Stage 4 fix): ensure stop/finalize path runs exactly once
+    let stopped = false;
+
     function sendToTwilioMedia(ulaw8kB64) {
       if (!streamSid) return;
       const payload = {
@@ -80,7 +83,8 @@ function installTwilioMediaWs(server) {
 
       if (ev === "stop") {
         logger.info("Twilio stream stop", { streamSid, callSid });
-        if (gemini) {
+        if (!stopped && gemini) {
+          stopped = true;
           gemini.endInput();
           gemini.stop();
         }
@@ -94,12 +98,18 @@ function installTwilioMediaWs(server) {
 
     twilioWs.on("close", () => {
       logger.info("Twilio media WS closed", { streamSid, callSid });
-      if (gemini) gemini.stop();
+      if (!stopped && gemini) {
+        stopped = true;
+        gemini.stop();
+      }
     });
 
     twilioWs.on("error", (err) => {
       logger.error("Twilio media WS error", { streamSid, callSid, error: err.message });
-      if (gemini) gemini.stop();
+      if (!stopped && gemini) {
+        stopped = true;
+        gemini.stop();
+      }
     });
   });
 
