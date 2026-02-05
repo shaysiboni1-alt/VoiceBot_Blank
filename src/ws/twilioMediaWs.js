@@ -1,8 +1,8 @@
 "use strict";
 
 const WebSocket = require("ws");
-const env = require("../config/env"); // ✅ FIX: env was missing
 const { logger } = require("../utils/logger");
+const { env } = require("../config/env");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
 const { startCallRecording } = require("../utils/twilioRecordings");
 const { getSSOT } = require("../ssot/ssotClient");
@@ -23,7 +23,7 @@ function installTwilioMediaWs(server) {
     let customParameters = {};
     let gemini = null;
 
-    // ensure stop/finalize path runs exactly once
+    // NEW (Stage 4 fix): ensure stop/finalize path runs exactly once
     let stopped = false;
 
     function sendToTwilioMedia(ulaw8kB64) {
@@ -55,26 +55,17 @@ function installTwilioMediaWs(server) {
         logger.info("Twilio stream start", { streamSid, callSid, customParameters });
 
         // Start Twilio call recording early so a RecordingSid exists by the time we finalize.
-        // Non-fatal: MUST NOT break audio even if recording fails.
-        try {
-          if (env.MB_ENABLE_RECORDING && callSid) {
-            startCallRecording(callSid, logger).catch((e) => {
-              logger.warn("Failed to start call recording", {
-                callSid,
-                err: e?.message || String(e)
-              });
-            });
-          }
-        } catch (e) {
-          logger.warn("Recording start failed (non-fatal)", {
-            callSid,
-            err: e?.message || String(e)
+        // This mirrors the GilSport flow and powers recording_url_public.
+        if (env.MB_ENABLE_RECORDING && callSid) {
+          startCallRecording(callSid, logger).catch((e) => {
+            logger.warn("Failed to start call recording", { callSid, err: e?.message || String(e) });
           });
         }
 
-        const ssot = getSSOT(); // already loaded in server; if empty do not break audio
+        const ssot = getSSOT(); // כבר נטען בשרת; אם ריק – עדיין לא שוברים קול
 
         gemini = new GeminiLiveSession({
+          // meta is forwarded into logs + Gemini session; keep it small and stable
           meta: {
             streamSid,
             callSid,
@@ -104,12 +95,8 @@ function installTwilioMediaWs(server) {
         logger.info("Twilio stream stop", { streamSid, callSid });
         if (!stopped && gemini) {
           stopped = true;
-          try {
-            gemini.endInput();
-          } catch {}
-          try {
-            gemini.stop();
-          } catch {}
+          gemini.endInput();
+          gemini.stop();
         }
         return;
       }
@@ -123,9 +110,7 @@ function installTwilioMediaWs(server) {
       logger.info("Twilio media WS closed", { streamSid, callSid });
       if (!stopped && gemini) {
         stopped = true;
-        try {
-          gemini.stop();
-        } catch {}
+        gemini.stop();
       }
     });
 
@@ -133,9 +118,7 @@ function installTwilioMediaWs(server) {
       logger.error("Twilio media WS error", { streamSid, callSid, error: err.message });
       if (!stopped && gemini) {
         stopped = true;
-        try {
-          gemini.stop();
-        } catch {}
+        gemini.stop();
       }
     });
   });
