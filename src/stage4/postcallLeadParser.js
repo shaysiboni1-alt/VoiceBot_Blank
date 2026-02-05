@@ -113,10 +113,10 @@ async function parseLeadPostcall({ turns, transcriptText, ssot, known }) {
   const transcript = (typeof transcriptText === "string" && transcriptText.trim()) ? transcriptText.trim() : buildTranscript(turns);
   if (!transcript) return null;
 
-  const prompt =
-    ssot?.prompts?.LEAD_PARSER_PROMPT ||
-    ssot?.prompts?.LEAD_CAPTURE_PROMPT ||
-    defaultPrompt(known);
+  // IMPORTANT: Do NOT fall back to LEAD_CAPTURE_PROMPT here.
+  // LEAD_CAPTURE_PROMPT is for realtime dialogue and may not be JSON-only.
+  // Post-call parsing must be deterministic JSON.
+  const prompt = (ssot?.prompts?.LEAD_PARSER_PROMPT || "").trim() || defaultPrompt(known);
 
   try {
     const raw = await callGeminiForJson({ prompt, transcript });
