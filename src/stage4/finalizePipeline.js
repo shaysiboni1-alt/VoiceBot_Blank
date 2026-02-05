@@ -124,7 +124,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
   // 1) CALL_LOG (always, if enabled)
   try {
-    if (env.CALL_LOG_AT_START === "true" && env.CALL_LOG_MODE === "start") {
+    if (isTrue(env.CALL_LOG_AT_START) && String(env.CALL_LOG_MODE || "").toLowerCase() === "start") {
       // Already sent at start by other stage; do nothing.
     }
     if (isTrue(env.CALL_LOG_AT_END)) {
@@ -155,7 +155,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   let parsed = null;
   try {
     const transcriptText = snapshot?.lead?.transcriptText || snapshot?.transcriptText || "";
-    const shouldParse = env.LEAD_PARSER_ENABLED === "true";
+    const shouldParse = isTrue(env.LEAD_PARSER_ENABLED);
 
     if (shouldParse) {
       parsed = await parseLeadPostcall({
@@ -186,7 +186,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     recording_url_public: null,
   };
   try {
-    if (env.MB_ENABLE_RECORDING === "true" && typeof senders.resolveRecording === "function") {
+    if (isTrue(env.MB_ENABLE_RECORDING) && typeof senders.resolveRecording === "function") {
       recording = await senders.resolveRecording(call.callSid);
     }
   } catch (e) {
@@ -194,7 +194,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   }
 
   // 4) Deterministic LeadGate -> FINAL xor ABANDONED
-  const isFinal = !!shouldFinalizeAsLead(lead) && env.FINAL_ON_STOP === "true";
+  const isFinal = !!shouldFinalizeAsLead(lead) && isTrue(env.FINAL_ON_STOP);
   lead.decision_reason = decisionReason(lead);
 
   const finalPayload = buildFinalPayload({
