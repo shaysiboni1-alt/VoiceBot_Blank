@@ -653,11 +653,22 @@ class GeminiLiveSession {
           sendCallLog: (payload) => deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
           sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
           sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
-          resolveRecording: async () => ({
-            recording_provider: this._call.recording_sid ? "twilio" : "",
-            recording_sid: this._call.recording_sid || "",
-            recording_url_public: this._call.recording_url_public || ""
-          })
+          resolveRecording: async () => {
+            const rec = await resolveTwilioRecordingPublic({
+              callSid: this._call.callSid,
+              publicBaseUrl: env.PUBLIC_BASE_URL,
+              twilioAccountSid: env.TWILIO_ACCOUNT_SID,
+              twilioAuthToken: env.TWILIO_AUTH_TOKEN,
+              enableRecording: env.MB_ENABLE_RECORDING,
+              logger
+            });
+
+            // cache for later (best-effort)
+            if (rec?.recording_sid) this._call.recording_sid = rec.recording_sid;
+            if (rec?.recording_url_public) this._call.recording_url_public = rec.recording_url_public;
+
+            return rec;
+          }
         }
       });
     } catch (e) {
