@@ -28,13 +28,15 @@ function safeJsonExtract(text) {
   }
 }
 
-function defaultPrompt() {
+function defaultPrompt(known = {}) {
   // Target payload fields requested:
   // full_name, subject, reason, phone_additional, parsing_summary
+  const knownName = typeof known.full_name === "string" && known.full_name.trim() ? known.full_name.trim() : null;
   return (
     'החזירו JSON תקין בלבד (ללא טקסט נוסף) לפי הסכמה ' +
     '{"full_name":string|null,"subject":string|null,"reason":string|null,"phone_additional":string|null,"parsing_summary":string|null} ' +
     'על בסיס השיחה בלבד, בעברית תקנית ומנורמלת וללא המצאות. ' +
+    (knownName ? `שם ידוע מהמערכת (מועדף על פני השערות): "${knownName}". אם קיים שם ידוע מהמערכת—החזירו אותו כ-full_name אפילו אם התמלול כולל מילים קודמות שנראות כמו שם. ` : '') +
     'full_name הוא תמיד שם הפונה שמדבר כעת ורק אם נאמר במפורש שם של אדם (לא מוצר/תקלה/מושג) ואם אין ודאות גבוהה—null. ' +
     'subject הוא כותרת קצרה לנושא הפנייה כפי שנאמר בפועל. אם לא ברור—null. ' +
     'reason הוא משפט קצר וברור שמתאר את מהות הפנייה בפועל, ללא משפטי מערכת. אם לא ברור—null. ' +
@@ -106,15 +108,15 @@ function normalizeParsedLead(raw) {
   return out;
 }
 
-async function parseLeadPostcall({ turns, ssot }) {
+async function parseLeadPostcall({ turns, transcriptText, ssot, known }) {
   if (!env.LEAD_PARSER_ENABLED) return null;
-  const transcript = buildTranscript(turns);
+  const transcript = (typeof transcriptText === "string" && transcriptText.trim()) ? transcriptText.trim() : buildTranscript(turns);
   if (!transcript) return null;
 
   const prompt =
-    ssot?.prompts?.LEAD_CAPTURE_PROMPT ||
     ssot?.prompts?.LEAD_PARSER_PROMPT ||
-    defaultPrompt();
+    ssot?.prompts?.LEAD_CAPTURE_PROMPT ||
+    defaultPrompt(known);
 
   try {
     const raw = await callGeminiForJson({ prompt, transcript });
