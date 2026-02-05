@@ -15,6 +15,10 @@
 
 const { parseLeadPostcall } = require("./postcallLeadParser");
 
+function isTrue(v) {
+  return v === true || String(v).toLowerCase() === "true";
+}
+
 function safeStr(v) {
   const s = typeof v === "string" ? v.trim() : "";
   return s || null;
@@ -123,7 +127,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     if (env.CALL_LOG_AT_START === "true" && env.CALL_LOG_MODE === "start") {
       // Already sent at start by other stage; do nothing.
     }
-    if (env.CALL_LOG_AT_END === "true") {
+    if isTrue(env.CALL_LOG_AT_END) {
       const payload = {
         event: "CALL_LOG",
         call: {
