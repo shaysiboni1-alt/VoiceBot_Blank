@@ -65,6 +65,49 @@ async function resolveTwilioRecording(callSid) {
   }
 }
 
+
+async function startCallRecordingIfEnabled({
+  callSid,
+  twilioAccountSid,
+  twilioAuthToken,
+  enableRecording,
+  logger
+}) {
+  if (!enableRecording) return { started: false, reason: "disabled" };
+  if (!callSid || !twilioAccountSid || !twilioAuthToken) return { started: false, reason: "missing_credentials" };
+
+  const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64");
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSid}/Calls/${callSid}/Recordings.json`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        RecordingChannels: "dual",
+        RecordingTrack: "both",
+        RecordingStatusCallbackEvent: "completed"
+      })
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      logger?.warn?.("Twilio start recording failed", { callSid, status: res.status, body: t?.slice?.(0, 200) });
+      return { started: false, reason: `http_${res.status}` };
+    }
+
+    const data = await res.json().catch(() => null);
+    logger?.info?.("Twilio recording started", { callSid, recordingSid: data?.sid });
+    return { started: true, recordingSid: data?.sid || "" };
+  } catch (e) {
+    logger?.warn?.("Twilio start recording exception", { callSid, err: String(e) });
+    return { started: false, reason: "exception" };
+  }
+}
+
 module.exports = {
   resolveTwilioRecording,
 };
