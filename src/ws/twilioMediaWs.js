@@ -3,6 +3,7 @@
 const WebSocket = require("ws");
 const { logger } = require("../utils/logger");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
+const { startCallRecording } = require("../utils/twilioRecordings");
 const { getSSOT } = require("../ssot/ssotClient");
 
 function installTwilioMediaWs(server) {
@@ -51,6 +52,14 @@ function installTwilioMediaWs(server) {
         callSid = msg?.start?.callSid || null;
         customParameters = msg?.start?.customParameters || {};
         logger.info("Twilio stream start", { streamSid, callSid, customParameters });
+
+        // Start Twilio call recording early so a RecordingSid exists by the time we finalize.
+        // This mirrors the GilSport flow and powers recording_url_public.
+        if (env.MB_ENABLE_RECORDING && callSid) {
+          startCallRecording(callSid, logger).catch((e) => {
+            logger.warn("Failed to start call recording", { callSid, err: e?.message || String(e) });
+          });
+        }
 
         const ssot = getSSOT(); // כבר נטען בשרת; אם ריק – עדיין לא שוברים קול
 
