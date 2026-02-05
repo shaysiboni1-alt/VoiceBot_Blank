@@ -192,7 +192,8 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     recording_url_public: null,
   };
   try {
-    if (env.MB_ENABLE_RECORDING === "true" && typeof senders.resolveRecording === "function") {
+    // env.MB_ENABLE_RECORDING is normalized to boolean in src/config/env.js
+    if (env.MB_ENABLE_RECORDING && typeof senders.resolveRecording === "function") {
       recording = await senders.resolveRecording(call.callSid);
     }
   } catch (e) {
@@ -200,7 +201,8 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   }
 
   // 4) Deterministic LeadGate -> FINAL xor ABANDONED
-  const isFinal = !!shouldFinalizeAsLead(lead) && env.FINAL_ON_STOP === "true";
+  // env.FINAL_ON_STOP is normalized to boolean in src/config/env.js
+  const isFinal = !!shouldFinalizeAsLead(lead) && !!env.FINAL_ON_STOP;
   lead.decision_reason = decisionReason(lead);
 
   const finalPayload = buildFinalPayload({
