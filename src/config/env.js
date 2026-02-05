@@ -76,6 +76,10 @@ const env = {
   MB_LOG_TURNS_MAX_CHARS: optInt("MB_LOG_TURNS_MAX_CHARS", 900),
   MB_LOG_ASSISTANT_TEXT: optBool("MB_LOG_ASSISTANT_TEXT", false),
 
+  // Twilio call recording
+  // IMPORTANT: Name is locked (MB_ENABLE_RECORDING). This flag controls whether we create/resolve a Twilio Recording.
+  MB_ENABLE_RECORDING: optBool("MB_ENABLE_RECORDING", false),
+
   // Lead parser (future)
   LEAD_PARSER_ENABLED: optBool("LEAD_PARSER_ENABLED", true),
   LEAD_PARSER_MODE: opt("LEAD_PARSER_MODE", "postcall"),
