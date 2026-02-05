@@ -183,10 +183,61 @@ function normalizeCallerId(caller) {
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
-  const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
-  if (m && m[1]) return m[1].trim();
-  if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
-  return "";
+  // Prefer explicit self-identification patterns.
+  // Examples: "קוראים לי שי", "שמי שי", "השם שלי שי", "אני שי".
+  const m = t.match(/(?:קוראים לי|השם שלי(?:\s+זה)?|שמי|אני)\s+([^\n,.!?]{1,40})/);
+  if (m && m[1]) {
+    const candidate = m[1].trim();
+    // keep at most 3 tokens ("שי סיבוני" etc.)
+    return candidate.split(/\s+/).slice(0, 3).join(" ");
+  }
+
+  // As a fallback, accept a very short Hebrew token as a name (but only if it's clean).
+  const compact = t.replace(/^אה+[, ]*/g, "").replace(/["'`.,!?;:()\[\]{}<>]/g, "").trim();
+  if (!compact) return "";
+  if (/[0-9]/.test(compact)) return "";
+  const words = compact.split(/\s+/).filter(Boolean);
+  if (words.length > 2) return "";
+  if (compact.length > 25) return "";
+  return compact;
+}
+
+function stripNamePhrases(text) {
+  let t = (text || "").trim();
+  if (!t) return "";
+  // Remove self-identification clauses to leave the actual request/message.
+  // "... קוראים לי שי" / "שמי שי" / "השם שלי שי" / "אני שי".
+  t = t.replace(/(?:,|\s)*(?:קוראים לי|שמי|השם שלי(?:\s+זה)?|אני)\s+[^\n,.!?]{1,40}/g, " ");
+  return t.replace(/\s+/g, " ").trim();
+}
+
+function extractNameDeterministic(text, { allowFallbackShortToken = false } = {}) {
+  const raw = (text || "").trim();
+  if (!raw) return "";
+
+  // Hebrew present -> use Hebrew extractor.
+  if (/[\u0590-\u05FF]/.test(raw)) return extractNameHe(raw);
+
+  // Common transliterations for "שי" seen from STT.
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/["'`.,!?;:()\[\]{}<>]/g, "")
+    .trim();
+
+  if (["shai", "sai", "sha", "shi", "shy", "şai", "şa", "šai"].includes(cleaned)) return "שי";
+
+  if (!allowFallbackShortToken) return "";
+
+  // Last resort: accept a short, non-numeric token/phrase.
+  const compact = raw.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  if (/[0-9]/.test(compact)) return "";
+  if (compact.length > 30) return "";
+  const words = compact.split(/\s+/).filter(Boolean);
+  if (words.length > 3) return "";
+  if (/^\[?noise\]?$/i.test(compact)) return "";
+  return compact;
 }
 
 function extractPhone(text) {
@@ -310,6 +361,7 @@ class GeminiLiveSession {
       // Lead fields (decision depends ONLY on these)
       lead: {
         full_name: "",
+        awaiting_name: false,
         subject: "",
         callback_to_number: callerInfo.withheld ? "" : callerInfo.value,
         subject_min_words: subjectMinWords
@@ -485,6 +537,14 @@ class GeminiLiveSession {
 
     const nlp = normalizeUtterance(text);
 
+    // Arm deterministic name capture only when the bot explicitly asks for the name.
+    if (who === "bot") {
+      const t = (nlp.normalized || nlp.raw || "").toString();
+      if (/מה\s*השם/i.test(t)) {
+        this._call.lead.awaiting_name = true;
+      }
+    }
+
     logger.info(`UTTERANCE ${who}`, {
       ...this.meta,
       text: nlp.raw,
@@ -521,23 +581,38 @@ class GeminiLiveSession {
         const userText = (nlp.normalized || nlp.raw || "").trim();
 
         // 1) Name capture
+        // Requirement: if a name exists anywhere in the call (opening answer OR later), capture it.
         if (!this._call.lead.full_name) {
-          const name = extractNameHe(userText);
-          if (name) this._call.lead.full_name = name;
-        } else {
-          // 2) Subject capture (first meaningful request after name)
-          if (!this._call.lead.subject) {
-            const words = userText.split(/\s+/).filter(Boolean);
-            if (words.length >= (this._call.lead.subject_min_words || 3)) {
-              this._call.lead.subject = userText;
+          const allowShortFallback = !!this._call.lead.awaiting_name;
+          const name = extractNameDeterministic(userText, { allowShortFallback });
+          if (name) {
+            this._call.lead.full_name = name;
+            this._call.lead.awaiting_name = false;
+          }
+        }
+
+        // 2) Subject capture
+        // If the user says name + request in the same utterance ("... קוראים לי שי"), extract the request part.
+        if (this._call.lead.full_name && !this._call.lead.subject) {
+          const stripped = stripNamePhrase(userText);
+          const candidate = stripped || userText;
+
+          const words = candidate.split(/\s+/).filter(Boolean);
+          const minWords = this._call.lead.subject_min_words || 3;
+          if (words.length >= minWords && candidate.length >= 6) {
+            this._call.lead.subject = candidate.trim();
+          } else {
+            // Special-case common "call me back" requests so the lead isn't "empty".
+            if (/לחזור\s+אל(י|יי)|תחזור\s+אל(י|יי)|שיחזרו\s+אל(י|יי)|תתקשר(ו)?\s+אל(י|יי)/.test(candidate)) {
+              this._call.lead.subject = candidate.trim();
             }
           }
+        }
 
-          // 3) Callback number if withheld
-          if (this._call.caller_withheld && !this._call.lead.callback_to_number) {
-            const phone = extractPhone(userText);
-            if (phone) this._call.lead.callback_to_number = phone;
-          }
+        // 3) Callback number if withheld
+        if (this._call.caller_withheld && !this._call.lead.callback_to_number) {
+          const phone = extractPhone(userText);
+          if (phone) this._call.lead.callback_to_number = phone;
         }
       }
     } catch (e) {
