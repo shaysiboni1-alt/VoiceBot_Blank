@@ -48,21 +48,34 @@ async function fetchLatestRecordingByCallSid(callSid) {
 
 async function resolveTwilioRecording(callSid) {
   if (!env.MB_ENABLE_RECORDING) return null;
-  try {
-    const rec = await fetchLatestRecordingByCallSid(callSid);
-    if (!rec) {
-      logger.info({ msg: "No Twilio recordings found", meta: { callSid } });
-      return null;
+  // Twilio may take a few seconds to materialize the recording resource after the call ends.
+  // Retry with bounded backoff.
+  const maxAttempts = 10;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const rec = await fetchLatestRecordingByCallSid(callSid);
+      if (rec) {
+        logger.info({
+          msg: "Resolved Twilio recording",
+          meta: { callSid, sid: rec.recording_sid, attempt },
+        });
+        return rec;
+      }
+      logger.info({ msg: "No Twilio recordings found (yet)", meta: { callSid, attempt } });
+    } catch (e) {
+      logger.warn({
+        msg: "Resolve Twilio recording attempt failed",
+        meta: { callSid, attempt, err: e && (e.message || String(e)) },
+      });
     }
-    logger.info({ msg: "Resolved Twilio recording", meta: { callSid, sid: rec.recording_sid } });
-    return rec;
-  } catch (e) {
-    logger.warn({
-      msg: "Resolve Twilio recording failed",
-      meta: { callSid, err: e && (e.message || String(e)) },
-    });
-    return null;
+
+    // Backoff: 1.5s, 3s, 4.5s... capped.
+    const delayMs = Math.min(1500 * attempt, 8000);
+    await new Promise((r) => setTimeout(r, delayMs));
   }
+
+  logger.warn({ msg: "Resolve Twilio recording failed", meta: { callSid, attempts: maxAttempts } });
+  return null;
 }
 
 
