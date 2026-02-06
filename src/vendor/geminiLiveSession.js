@@ -193,24 +193,34 @@ function normalizeHebrewName(name) {
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
+
   // Prefer explicit self-identification patterns.
-  // Examples: "קוראים לי שי", "שמי שי", "השם שלי שי", "אני שי".
-  const m = t.match(/(?:קוראים לי|השם שלי(?:\s+זה)?|שמי|אני)\s+([^\n,.!?]{1,40})/);
+  // Examples:
+  //  - "קוראים לי שי" / "השם שלי שי" / "אני שי" / "מדבר שי"
+  //  - "השם שלי זה שי לא שגיא"  -> we should extract "שי"
+  const m = t.match(/(?:\b(?:קוראים\s*לי|השם\s*שלי(?:\s*זה)?|אני|מדבר|מדברת)\b)\s*([\u0590-\u05FF'"\-\s]{1,50})/);
   if (m && m[1]) {
-    const candidate = m[1].trim();
-    // keep at most 3 tokens ("שי סיבוני" etc.)
-    return normalizeHebrewName(candidate.split(/\s+/).slice(0, 3).join(" "));
+    const raw = String(m[1]).trim();
+    const cleaned = stripNamePhrase(raw);
+
+    // Keep only the actual name tokens.
+    // Stop at common continuation words: "לא", "ו...", etc.
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    const stopwords = new Set(["לא", "ול", "ולמסור", "וב", "וביקש", "וביקשת", "אבל", "ש", "זה"]);
+    const out = [];
+    for (const tok of tokens) {
+      if (stopwords.has(tok)) break;
+      // If token starts with 'ו' (and isn't a plausible name continuation) treat as stop.
+      if (tok.length > 1 && tok.startsWith("ו") && out.length > 0) break;
+      out.push(tok);
+      if (out.length >= 3) break;
+    }
+    return out.join(" ").trim();
   }
 
-  // As a fallback, accept a very short Hebrew token as a name (but only if it's clean).
-  const compact = t.replace(/^אה+[, ]*/g, "").replace(/["'`.,!?;:()\[\]{}<>]/g, "").trim();
-  if (!compact) return "";
-  if (/[0-9]/.test(compact)) return "";
-  const words = compact.split(/\s+/).filter(Boolean);
-  if (words.length > 2) return "";
-  if (compact.length > 25) return "";
-  return normalizeHebrewName(compact);
+  return "";
 }
+
 
 function stripNamePhrases(text) {
   let t = (text || "").trim();
@@ -595,16 +605,18 @@ class GeminiLiveSession {
       if (who === "user") {
         const userText = (nlp.normalized || nlp.raw || "").trim();
 
-        // 1) Name capture
-        // Requirement: if a name exists anywhere in the call (opening answer OR later), capture it.
-        if (!this._call.lead.full_name) {
-          const allowShortFallback = !!this._call.lead.awaiting_name;
-          const name = extractNameDeterministic(userText, { allowShortFallback });
-          if (name) {
+      // 1) Name capture: capture whenever we can, and allow explicit self-identification to override earlier mistakes.
+      {
+        const allowFallbackShortToken = !!this._call.lead.awaiting_name;
+        const explicitNamePhrase = /(קוראים לי|השם שלי|שמי|אני\s+)(?=\S)/.test(userText);
+        const name = extractNameDeterministic(userText, allowFallbackShortToken);
+        if (name) {
+          if (!this._call.lead.full_name || explicitNamePhrase) {
             this._call.lead.full_name = name;
             this._call.lead.awaiting_name = false;
           }
         }
+      }
 
         // 2) Subject capture
         // If the user says name + request in the same utterance ("... קוראים לי שי"), extract the request part.
