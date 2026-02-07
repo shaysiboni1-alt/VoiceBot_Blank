@@ -7,7 +7,7 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
-const { resolveTwilioRecordingPublic } = require("../stage4/twilioRecordings");
+const { resolveTwilioRecordingPublic, prefetchTwilioRecordingToDisk } = require("../stage4/twilioRecordings");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -769,6 +769,20 @@ class GeminiLiveSession {
             // cache for later (best-effort)
             if (rec?.recording_sid) this._call.recording_sid = rec.recording_sid;
             if (rec?.recording_url_public) this._call.recording_url_public = rec.recording_url_public;
+
+            // Best-effort prefetch so the public link opens fast and doesn't hang on "recording not ready".
+            try {
+              if (rec?.recording_sid) {
+                await prefetchTwilioRecordingToDisk({
+                  recordingSid: rec.recording_sid,
+                  twilioAccountSid: env.TWILIO_ACCOUNT_SID,
+                  twilioAuthToken: env.TWILIO_AUTH_TOKEN,
+                  logger
+                });
+              }
+            } catch (_) {
+              // ignore
+            }
 
             return rec;
           }

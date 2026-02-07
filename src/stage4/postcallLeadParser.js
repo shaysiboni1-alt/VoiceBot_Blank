@@ -1,7 +1,7 @@
 // Post-call Lead Parser
 // Aligns strictly with SSOT PROMPTS.LEAD_PARSER_PROMPT (Index VoiceBot – Betty baseline)
 
-const logger = require("../utils/logger");
+const { logger } = require("../utils/logger");
 const env = require("../config/env");
 
 function safeStr(v) {
@@ -35,7 +35,86 @@ async function geminiGenerateContent({ model, contents, systemInstruction }) {
   if (!res.ok) {
     throw new Error(`Gemini lead parser HTTP ${res.status}: ${text}`);
   }
-  return text;
+  let envelope;
+  try {
+    envelope = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Gemini lead parser: non-JSON response: ${safeStr(text).slice(0, 200)}`);
+  }
+  const parts = envelope?.candidates?.[0]?.content?.parts || [];
+  const out = parts.map((p) => safeStr(p?.text)).join("").trim();
+  if (!out) throw new Error("Gemini lead parser: empty content");
+  return out;
+}
+
+function extractJsonObject(text) {
+  const s = safeStr(text);
+  // Fast path
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    // continue
+  }
+
+  // Heuristic: extract the first {...} block
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error(`Lead parser returned no JSON object: ${s.slice(0, 200)}`);
+  }
+  const candidate = s.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (e) {
+    throw new Error(`Lead parser returned malformed JSON: ${candidate.slice(0, 200)}`);
+  }
+}
+
+async function geminiText({ model, system, user }) {
+  // Some deployments might pin an invalid/unsupported model name.
+  // We try the configured model first, then fall back to a short list.
+  const candidates = [
+    safeStr(model),
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-latest",
+  ].filter(Boolean);
+
+  let lastErr = null;
+  for (const m of candidates) {
+    try {
+      const raw = await geminiGenerateContent({
+        model: m,
+        systemInstruction: system
+          ? {
+              role: "system",
+              parts: [{ text: system }],
+            }
+          : undefined,
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: safeStr(user) }],
+          },
+        ],
+      });
+
+      // geminiGenerateContent() already returns the final concatenated text.
+      const text = safeStr(raw).trim();
+      if (!text) throw new Error("Empty Gemini response");
+      return text;
+    } catch (e) {
+      lastErr = e;
+      const msg = safeStr(e?.message);
+      // Retry only on model NOT_FOUND / unsupported
+      if (!/models\//i.test(msg) && !/NOT_FOUND/i.test(msg) && !/is not found/i.test(msg)) {
+        break;
+      }
+    }
+  }
+
+  throw lastErr || new Error("Gemini lead parser failed");
 }
 
 const ALLOWED_KEYS = new Set([
@@ -131,26 +210,27 @@ async function runPostcallLeadParser({ ssot, transcriptText, known }) {
     `KNOWN_CONTEXT (do not invent beyond this):\n${JSON.stringify(context)}\n\n` +
     `CALL_TRANSCRIPT (may include noise; extract only explicit facts):\n${safeStr(transcriptText)}`;
 
-  const raw = await geminiText({
-    model,
-    system: prompt,
-    user: input,
-    // Enforce JSON-only style as much as possible.
-    responseMimeType: "application/json",
-    temperature: 0,
-  });
+  // Strengthen the parser to include fields we need for the FINAL payload
+  // even if the SSOT prompt is older.
+  const augmentedSystem =
+    prompt +
+    "\n\nADDITIONAL REQUIREMENTS (do not mention these rules):\n" +
+    "- Return JSON only.\n" +
+    "- Also include optional keys: subject, parsing_summary.\n" +
+    "- subject: a very short title of the request (Hebrew).\n" +
+    "- parsing_summary: one concise Hebrew sentence summarizing the request.\n";
 
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`Lead parser returned non-JSON: ${String(raw).slice(0, 140)}`);
-  }
+  const raw = await geminiText({ model, system: augmentedSystem, user: input });
+
+  const parsed = parseJsonStrict(raw);
 
   const lead = normalizeParsedLead(parsed);
+  // If model returned these extra keys, keep them.
+  lead.subject = normalizeNullableStr(parsed?.subject) || null;
+  lead.parsing_summary = normalizeNullableStr(parsed?.parsing_summary) || null;
   // Derived helper fields used by webhook payloads (kept outside the strict parser schema)
-  lead.subject = deriveSubject(lead, transcriptText);
-  lead.parsing_summary = deriveParsingSummary(lead);
+  if (!lead.subject) lead.subject = deriveSubject(lead, transcriptText);
+  if (!lead.parsing_summary) lead.parsing_summary = deriveParsingSummary(lead);
 
   return lead;
 }

@@ -15,6 +15,8 @@
 */
 
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -28,6 +30,90 @@ function safeStr(v) {
 function basicAuthHeader(accountSid, authToken) {
   const raw = `${accountSid}:${authToken}`;
   return `Basic ${Buffer.from(raw).toString("base64")}`;
+}
+
+async function fetchRecordingMp3Buffer({ recordingSid, accountSid, authToken, timeoutMs = 20000 }) {
+  const rs = safeStr(recordingSid);
+  if (!rs) return null;
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    accountSid
+  )}/Recordings/${encodeURIComponent(rs)}.mp3`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      {
+        method: "GET",
+        headers: {
+          authorization: basicAuthHeader(accountSid, authToken),
+          "user-agent": "voicebot-blank/recording-prefetch",
+        },
+      },
+      (res) => {
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => reject(new Error(`Twilio media ${res.statusCode}: ${data.slice(0, 200)}`)));
+          return;
+        }
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+      }
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error("Twilio media timeout"));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function prefetchTwilioRecordingToDisk({
+  recordingSid,
+  twilioAccountSid,
+  twilioAuthToken,
+  maxWaitMs = 45000,
+  logger,
+}) {
+  const log = logger || console;
+  const accountSid = safeStr(twilioAccountSid);
+  const authToken = safeStr(twilioAuthToken);
+  const rs = safeStr(recordingSid);
+  if (!accountSid || !authToken || !rs) return null;
+
+  const dir = "/tmp/recordings";
+  const filePath = path.join(dir, `${rs}.mp3`);
+
+  try {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) return filePath;
+  } catch (_) {
+    // ignore
+  }
+
+  fs.mkdirSync(dir, { recursive: true });
+
+  const started = Date.now();
+  const delays = [0, 1000, 1500, 2500, 3500, 5000, 6500, 8000];
+
+  for (const d of delays) {
+    if (d > 0) await sleep(d);
+    try {
+      const buf = await fetchRecordingMp3Buffer({ recordingSid: rs, accountSid, authToken });
+      if (buf && buf.length > 0) {
+        fs.writeFileSync(filePath, buf);
+        log.info?.("Recording prefetched", { recordingSid: rs, bytes: buf.length });
+        return filePath;
+      }
+    } catch (e) {
+      log.debug?.("Recording prefetch retry", { recordingSid: rs, error: e?.message || String(e) });
+    }
+    if (Date.now() - started > maxWaitMs) break;
+  }
+
+  log.warn?.("Recording prefetch failed", { recordingSid: rs });
+  return null;
 }
 
 async function httpGetJson(url, headers) {
@@ -140,4 +226,5 @@ async function resolveTwilioRecordingPublic({
 
 module.exports = {
   resolveTwilioRecordingPublic,
+  prefetchTwilioRecordingToDisk,
 };

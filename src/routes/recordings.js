@@ -2,9 +2,12 @@
 "use strict";
 
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const { Readable } = require("stream");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
+const { prefetchTwilioRecordingToDisk } = require("../stage4/twilioRecordings");
 
 const recordingsRouter = express.Router();
 
@@ -26,59 +29,33 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
     return res.status(500).send("missing TWILIO creds");
   }
 
+  // First try local disk cache (prefetched at call end).
   try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
-      accountSid
-    )}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
-
-    const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
-
-    // Twilio recording media can take a short time to become available after the call ends.
-    // We retry a few times on 404/429/5xx to avoid "forever loading" behavior on the first click.
-    let r = null;
-    let lastStatus = null;
-    for (let i = 0; i < 5; i++) {
-      r = await fetch(url, {
-        method: "GET",
-        headers: {
-          authorization: `Basic ${basic}`,
-          "user-agent": "voicebot-blank/recording-proxy"
-        }
-      });
-      lastStatus = r.status;
-      if (r.ok) break;
-      if (![404, 429].includes(r.status) && r.status < 500) break;
-      await new Promise((resolve) => setTimeout(resolve, 800 * (i + 1)));
+    const dir = path.join("/tmp", "recordings");
+    const fp = path.join(dir, `${recordingSid}.mp3`);
+    if (fs.existsSync(fp)) {
+      res.status(200);
+      res.setHeader("content-type", "audio/mpeg");
+      res.setHeader("cache-control", "public, max-age=31536000, immutable");
+      fs.createReadStream(fp).pipe(res);
+      return;
     }
+  } catch (e) {
+    logger.warn("Recording cache check failed", { recordingSid, error: e?.message || String(e) });
+  }
 
-    if (!r || !r.ok) {
-      const body = await r.text().catch(() => "");
-      logger.warn("Recording proxy fetch failed", {
-        status: lastStatus,
-        recordingSid,
-        body: body?.slice(0, 240)
-      });
-      return res.status(502).send("twilio fetch failed");
+  try {
+    // If not cached yet, attempt to prefetch now (blocks once, then will be cached for future requests).
+    const { ok, filepath, status } = await prefetchTwilioRecordingToDisk(recordingSid, { timeoutMs: 25000 });
+    if (!ok || !filepath) {
+      logger.warn("Recording prefetch failed", { recordingSid, status });
+      return res.status(status === 404 ? 202 : 502).send("recording not ready");
     }
 
     res.status(200);
-    res.setHeader("content-type", r.headers.get("content-type") || "audio/mpeg");
+    res.setHeader("content-type", "audio/mpeg");
     res.setHeader("cache-control", "public, max-age=31536000, immutable");
-
-    // Stream through (do not buffer full mp3 in memory; improves TTFB and avoids long stalls)
-    if (r.body && typeof r.body.getReader === "function") {
-      const nodeStream = Readable.fromWeb(r.body);
-      nodeStream.on("error", (e) => {
-        logger.warn("Recording proxy stream error", { recordingSid, error: e?.message || String(e) });
-        try { res.end(); } catch (_) {}
-      });
-      nodeStream.pipe(res);
-      return;
-    }
-
-    // Fallback
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.send(buf);
+    fs.createReadStream(filepath).pipe(res);
   } catch (err) {
     logger.error("Recording proxy error", { recordingSid, error: err?.message || String(err) });
     res.status(500).send("proxy error");
