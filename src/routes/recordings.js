@@ -33,18 +33,28 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
 
     const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
 
-    const r = await fetch(url, {
-      method: "GET",
-      headers: {
-        authorization: `Basic ${basic}`,
-        "user-agent": "voicebot-blank/recording-proxy"
-      }
-    });
+    // Twilio recording media can take a short time to become available after the call ends.
+    // We retry a few times on 404/429/5xx to avoid "forever loading" behavior on the first click.
+    let r = null;
+    let lastStatus = null;
+    for (let i = 0; i < 5; i++) {
+      r = await fetch(url, {
+        method: "GET",
+        headers: {
+          authorization: `Basic ${basic}`,
+          "user-agent": "voicebot-blank/recording-proxy"
+        }
+      });
+      lastStatus = r.status;
+      if (r.ok) break;
+      if (![404, 429].includes(r.status) && r.status < 500) break;
+      await new Promise((resolve) => setTimeout(resolve, 800 * (i + 1)));
+    }
 
-    if (!r.ok) {
+    if (!r || !r.ok) {
       const body = await r.text().catch(() => "");
       logger.warn("Recording proxy fetch failed", {
-        status: r.status,
+        status: lastStatus,
         recordingSid,
         body: body?.slice(0, 240)
       });

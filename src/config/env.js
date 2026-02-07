@@ -80,7 +80,9 @@ const env = {
   LEAD_PARSER_ENABLED: optBool("LEAD_PARSER_ENABLED", true),
   LEAD_PARSER_MODE: opt("LEAD_PARSER_MODE", "postcall"),
   // IMPORTANT: name locked by user; keep as-is. Used by postcallLeadParser.
-  LEAD_PARSER_MODEL: opt("LEAD_PARSER_MODEL", ""),
+  // Post-call lead parser model (Gemini HTTP generateContent). Must be a valid v1beta model id.
+  // If not provided, default to a generally available production model.
+  LEAD_PARSER_MODEL: opt("LEAD_PARSER_MODEL", "gemini-2.0-flash"),
   LEAD_SUMMARY_STYLE: opt("LEAD_SUMMARY_STYLE", "crm_short"),
 
   // Recording
