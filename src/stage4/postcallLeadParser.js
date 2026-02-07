@@ -70,6 +70,36 @@ function extractJsonObject(text) {
   }
 }
 
+function parseJsonStrict(text) {
+  return extractJsonObject(text);
+}
+
+function isMostlyHebrew(s) {
+  const t = safeStr(s).trim();
+  if (!t) return false;
+  const heb = (t.match(/[֐-׿]/g) || []).length;
+  const letters = (t.match(/[A-Za-z֐-׿]/g) || []).length;
+  if (letters == 0) return false;
+  return heb / letters >= 0.6;
+}
+
+function guessHebrewNameFromConversation(conversationText) {
+  const t = safeStr(conversationText);
+  // Try to pull the name the bot used when addressing the caller.
+  const patterns = [
+    /\bהיי\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bשלום\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bהבנתי,?\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bרשמתי,?\s+([\u0590-\u05FF]{1,30})\b/u,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m && m[1]) return m[1].trim();
+  }
+  return null;
+}
+
+
 async function geminiText({ model, system, user }) {
   // Some deployments might pin an invalid/unsupported model name.
   // We try the configured model first, then fall back to a short list.
@@ -225,6 +255,14 @@ async function runPostcallLeadParser({ ssot, transcriptText, known }) {
   const parsed = parseJsonStrict(raw);
 
   const lead = normalizeParsedLead(parsed);
+
+  // STT occasionally emits the caller name in non-Hebrew scripts (e.g. Devanagari).
+  // We prefer a Hebrew name if it can be inferred from the bot's Hebrew turns.
+  if (lead.full_name && !isMostlyHebrew(lead.full_name)) {
+    const guessed = guessHebrewNameFromConversation(transcriptText);
+    if (guessed) lead.full_name = guessed;
+  }
+
   // If model returned these extra keys, keep them.
   lead.subject = normalizeNullableStr(parsed?.subject) || null;
   lead.parsing_summary = normalizeNullableStr(parsed?.parsing_summary) || null;

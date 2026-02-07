@@ -114,52 +114,46 @@ function formatDateTimeParts(date, timeZone) {
   }
 }
 
-function deriveSubjectAndReason(parsed) {
-  // We keep this simple and deterministic:
-  // - subject: short headline (if model returns one)
-  // - reason: slightly longer problem statement (if model returns one)
-  return {
-    subject: safeStr(parsed?.subject),
-    // Reason is legacy; SSOT parser prompt may not provide it.
-    reason: safeStr(parsed?.reason),
-  };
-}
+function deriveSubjectAndReason(parsed, transcriptText) {
+  const p = parsed || {};
 
-function compactTopLevel(obj) {
-  // Remove null/empty-string fields (top-level only) so downstream systems don't get "empty" noise.
-  const out = {};
-  for (const [k, v] of Object.entries(obj || {})) {
-    if (v === null || v === undefined) continue;
-    if (typeof v === "string" && !v.trim()) continue;
-    out[k] = v;
+  let subject = safeStr(p.subject) || null;
+  let reason = safeStr(p.reason) || null;
+  let notes = safeStr(p.notes) || null;
+
+  const t = safeStr(transcriptText);
+  if (t && (!subject || !reason || !notes)) {
+    const hasReports = /דוח|דוחות/.test(t);
+    const hasMasHachnasa = /מס הכנסה/.test(t);
+    const hasVat = /מע"?מ|מעמ/.test(t);
+    const years = Array.from(t.matchAll(/20\d{2}/g)).map((m) => m[0]);
+    const year = years.length ? years[years.length - 1] : null;
+    const urgent = /דחוף|בהקדם/.test(t);
+
+    if (!subject && hasReports) {
+      if (hasVat && hasMasHachnasa) subject = 'בקשת דוחות מע"מ ומס הכנסה';
+      else if (hasMasHachnasa) subject = 'בקשת דוחות מס הכנסה';
+      else if (hasVat) subject = 'בקשת דוחות מע"מ';
+      else subject = 'בקשת דוחות';
+      if (year) subject += ` ${year}`;
+    }
+
+    if (!reason && hasReports) {
+      reason = 'המתקשר ביקש דוחות';
+      if (hasVat && hasMasHachnasa) reason += ' מע"מ ומס הכנסה';
+      else if (hasMasHachnasa) reason += ' מס הכנסה';
+      else if (hasVat) reason += ' מע"מ';
+      if (year) reason += ` לשנת ${year}`;
+      if (urgent) reason += ' (דחוף)';
+    }
+
+    if (!notes && urgent) {
+      notes = 'המתקשר ציין שהבקשה דחופה.';
+    }
   }
-  return out;
-}
 
-function shouldFinalizeAsLead(lead, call) {
-  // Canonical LeadGate (NON-NEGOTIABLE):
-  // FINAL only when: has name + has a valid resolved phone (after normalization).
-  const hasName = !!safeStr(lead?.full_name);
-  const resolvedPhone = resolvePhone({
-    modelPhone: lead?.phone_number,
-    speechPhone: lead?.phone_additional,
-    callerId: call?.caller,
-  });
-  const hasPhone = !!resolvedPhone;
-  return hasName && hasPhone;
+  return { subject, reason, notes };
 }
-
-function decisionReason(lead, call) {
-  if (!safeStr(lead?.full_name)) return "missing_name";
-  const resolvedPhone = resolvePhone({
-    modelPhone: lead?.phone_number,
-    speechPhone: lead?.phone_additional,
-    callerId: call?.caller,
-  });
-  if (!resolvedPhone) return "missing_phone";
-  return "ok";
-}
-
 function buildFinalPayload({ event, call, lead, recording }) {
   const tz = call?.timeZone || "UTC";
   const { call_date, call_time } = formatDateTimeParts(new Date(call?.ended_at || Date.now()), tz);

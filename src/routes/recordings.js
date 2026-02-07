@@ -46,10 +46,10 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
 
   try {
     // If not cached yet, attempt to prefetch now (blocks once, then will be cached for future requests).
-    const { ok, filepath, status } = await prefetchTwilioRecordingToDisk(recordingSid, { timeoutMs: 25000 });
+    const { ok, filepath, status } = await prefetchTwilioRecordingToDisk(recordingSid, { timeoutMs: 25000, maxWaitMs: 180000 });
     if (!ok || !filepath) {
       logger.warn("Recording prefetch failed", { recordingSid, status });
-      return res.status(status === 404 ? 202 : 502).send("recording not ready");
+      return res.status(status === 404 ? 503 : 502).send("recording not ready");
     }
 
     res.status(200);
