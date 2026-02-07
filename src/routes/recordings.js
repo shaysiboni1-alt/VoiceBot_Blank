@@ -71,4 +71,11 @@ recordingsRouter.get("/recording/:recordingSid", (req, res) => {
   return res.redirect(302, `/recordings/${encodeURIComponent(recordingSid)}.mp3`);
 });
 
+// Canonical alias: /recording/<RecordingSid>.mp3
+recordingsRouter.get("/recording/:recordingSid.mp3", (req, res) => {
+  const recordingSid = String(req.params.recordingSid || "").trim();
+  if (!recordingSid) return res.status(400).send("missing recordingSid");
+  return res.redirect(302, `/recordings/${encodeURIComponent(recordingSid)}.mp3`);
+});
+
 module.exports = { recordingsRouter };

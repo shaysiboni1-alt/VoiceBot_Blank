@@ -7,6 +7,7 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
+const { resolveTwilioRecordingPublic } = require("../stage4/twilioRecordings");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
