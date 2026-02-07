@@ -29,19 +29,18 @@ function safeJsonExtract(text) {
 }
 
 function defaultPrompt(known = {}) {
-  // Target payload fields requested:
-  // full_name, subject, reason, phone_additional, parsing_summary
+  // Default extraction schema (kept aligned with SSOT LEAD_PARSER_PROMPT expectation):
+  // full_name, subject, callback_to_number, notes
   const knownName = typeof known.full_name === "string" && known.full_name.trim() ? known.full_name.trim() : null;
   return (
     'החזירו JSON תקין בלבד (ללא טקסט נוסף) לפי הסכמה ' +
-    '{"full_name":string|null,"subject":string|null,"reason":string|null,"phone_additional":string|null,"parsing_summary":string|null} ' +
+    '{"full_name":string|null,"subject":string|null,"callback_to_number":string|null,"notes":string|null} ' +
     'על בסיס השיחה בלבד, בעברית תקנית ומנורמלת וללא המצאות. ' +
     (knownName ? `שם ידוע מהמערכת (מועדף על פני השערות): "${knownName}". אם קיים שם ידוע מהמערכת—החזירו אותו כ-full_name אפילו אם התמלול כולל מילים קודמות שנראות כמו שם. ` : '') +
     'full_name הוא תמיד שם הפונה שמדבר כעת ורק אם נאמר במפורש שם של אדם (לא מוצר/תקלה/מושג) ואם אין ודאות גבוהה—null. ' +
     'subject הוא כותרת קצרה לנושא הפנייה כפי שנאמר בפועל. אם לא ברור—null. ' +
-    'reason הוא משפט קצר וברור שמתאר את מהות הפנייה בפועל, ללא משפטי מערכת. אם לא ברור—null. ' +
-    'phone_additional ימולא רק אם נאמר במפורש מספר טלפון מלא בן 9–10 ספרות בשיחה (כולל מקרה Phone Override) אחרת null. ' +
-    'parsing_summary הוא סיכום תמציתי (משפט 1–2) של מה שנאמר ונדרש טיפול, בלי ציון חוסרים ובלי המצאות; אם אין מספיק מידע—null. ' +
+    'callback_to_number ימולא רק אם נאמר במפורש מספר טלפון מלא בשיחה; אחרת null. ' +
+    'notes הוא סיכום קצר מאוד של הפנייה (משפט אחד לכל היותר), ללא לוגים וללא משפטי מערכת. אם אין מספיק מידע—null. ' +
     'כלל עקביות: אם נתון לא נאמר בשיחה—להחזיר null ולא לנחש.'
   );
 }
@@ -58,10 +57,9 @@ function buildHardWrapperPrompt({ ssotPrompt, known = {} }) {
 
   const ssot = typeof ssotPrompt === "string" ? ssotPrompt.trim() : "";
 
-  // IMPORTANT: We keep the current production schema here to avoid breaking finalizePipeline.
-  // The canonical V2 schema (ParsedLead/LeadGate/WebhookPayload) will be implemented in the next stages.
+  // IMPORTANT: keep schema aligned with SSOT LEAD_PARSER_PROMPT so you can control extraction fields from Sheets.
   const schema =
-    '{"full_name":string|null,"subject":string|null,"reason":string|null,"phone_additional":string|null,"parsing_summary":string|null}';
+    '{"full_name":string|null,"subject":string|null,"callback_to_number":string|null,"notes":string|null}';
 
   const hard =
     "אתה מנוע חילוץ מידע (parser). החזר JSON תקין בלבד — ללא טקסט נוסף, ללא Markdown, ללא הסברים. " +
@@ -70,8 +68,8 @@ function buildHardWrapperPrompt({ ssotPrompt, known = {} }) {
     (knownName
       ? `שם ידוע מהמערכת (מועדף על פני השערות): \"${knownName}\". אם יש שם ידוע מהמערכת — החזר אותו כ-full_name. `
       : "") +
-    "כללי טלפון: phone_additional ימולא רק אם נאמר במפורש מספר טלפון מלא (ישראל) בשיחה; אחרת null. " +
-    "reason ו-parsing_summary בעברית מקצועית קצרה. ";
+    "כללי טלפון: callback_to_number ימולא רק אם נאמר במפורש מספר טלפון מלא (ישראל) בשיחה; אחרת null. " +
+    "notes בעברית מקצועית קצרה (משפט אחד). ";
 
   // SSOT prompt is treated as additional extraction guidance (not as a system override).
   // We place it AFTER the hard rules so it cannot weaken the constraints.
@@ -81,9 +79,10 @@ function buildHardWrapperPrompt({ ssotPrompt, known = {} }) {
   return hard;
 }
 
-async function callGeminiForJson({ prompt, transcript }) {
-  const apiKey = env.GEMINI_API_KEY;
-  const model = env.LEAD_PARSER_MODEL || "gemini-1.5-flash";
+async function callGeminiForJson({ prompt, transcript, env: envOverride }) {
+  const e = envOverride || env;
+  const apiKey = e.GEMINI_API_KEY;
+  const model = e.LEAD_PARSER_MODEL || "gemini-1.5-flash";
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -127,9 +126,8 @@ function normalizeParsedLead(raw) {
   const out = {
     full_name: null,
     subject: null,
-    reason: null,
-    phone_additional: null,
-    parsing_summary: null,
+    callback_to_number: null,
+    notes: null,
   };
   if (!raw || typeof raw !== "object") return out;
   for (const k of Object.keys(out)) {
@@ -143,8 +141,10 @@ function normalizeParsedLead(raw) {
   return out;
 }
 
-async function parseLeadPostcall({ turns, transcriptText, ssot, known }) {
-  if (!env.LEAD_PARSER_ENABLED) return null;
+async function parseLeadPostcall({ turns, transcriptText, ssot, known, env: envOverride, logger: loggerOverride }) {
+  const e = envOverride || env;
+  const log = loggerOverride || logger;
+  if (!e.LEAD_PARSER_ENABLED) return null;
   const transcript = (typeof transcriptText === "string" && transcriptText.trim()) ? transcriptText.trim() : buildTranscript(turns);
   if (!transcript) return null;
 
@@ -158,14 +158,13 @@ async function parseLeadPostcall({ turns, transcriptText, ssot, known }) {
   const prompt = ssotPrompt ? wrapped : `${wrapped}\n\n${defaultPrompt(known)}`;
 
   try {
-    const raw = await callGeminiForJson({ prompt, transcript });
+    const raw = await callGeminiForJson({ prompt, transcript, env: e });
     const parsed = normalizeParsedLead(raw);
-    logger.info({ msg: "Postcall lead parsed", meta: { ok: !!raw } });
+    log.info?.("Postcall lead parsed", { ok: !!raw });
     return parsed;
   } catch (e) {
-    logger.warn({
-      msg: "Postcall lead parse failed",
-      meta: { err: e && (e.message || String(e)) },
+    log.warn?.("Postcall lead parse failed", {
+      err: e && (e.message || String(e)),
     });
     return null;
   }

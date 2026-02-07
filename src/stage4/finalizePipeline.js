@@ -120,8 +120,20 @@ function deriveSubjectAndReason(parsed) {
   // - reason: slightly longer problem statement (if model returns one)
   return {
     subject: safeStr(parsed?.subject),
+    // Reason is legacy; SSOT parser prompt may not provide it.
     reason: safeStr(parsed?.reason),
   };
+}
+
+function compactTopLevel(obj) {
+  // Remove null/empty-string fields (top-level only) so downstream systems don't get "empty" noise.
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && !v.trim()) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function shouldFinalizeAsLead(lead, call) {
@@ -152,7 +164,7 @@ function buildFinalPayload({ event, call, lead, recording }) {
   const tz = call?.timeZone || "UTC";
   const { call_date, call_time } = formatDateTimeParts(new Date(call?.ended_at || Date.now()), tz);
 
-  return {
+  const payload = {
     event,
     full_name: safeStr(lead?.full_name),
     subject: safeStr(lead?.subject),
@@ -165,11 +177,12 @@ function buildFinalPayload({ event, call, lead, recording }) {
     call_time,
     callSid: safeStr(call?.callSid),
     duration_sec: call?.duration_sec ?? null,
-    // Optional (ignored by Make if not used):
     recording_provider: safeStr(recording?.recording_provider),
     recording_sid: safeStr(recording?.recording_sid),
     decision_reason: safeStr(lead?.decision_reason),
   };
+
+  return compactTopLevel(payload);
 }
 
 async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
@@ -267,9 +280,10 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     reason: safeStr(snapshot?.lead?.reason) || parsedDerived.reason || null,
     phone_number: safeStr(parsed?.phone_number) || null,
     prefers_caller_id: typeof parsed?.prefers_caller_id === "boolean" ? parsed.prefers_caller_id : null,
-    phone_additional: safeStr(parsed?.phone_additional) || null,
+    // SSOT LEAD_PARSER_PROMPT returns callback_to_number + notes. We keep legacy field names for CRM.
+    phone_additional: safeStr(parsed?.callback_to_number) || safeStr(parsed?.phone_additional) || null,
     // GilSport parity: parsing_summary must be an LLM CRM-style summary, not raw transcript.
-    parsing_summary: safeStr(parsed?.parsing_summary) || null,
+    parsing_summary: safeStr(parsed?.notes) || safeStr(parsed?.parsing_summary) || null,
   };
 
   // 3) Resolve recording (best-effort)

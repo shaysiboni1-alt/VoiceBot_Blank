@@ -2,6 +2,7 @@
 "use strict";
 
 const express = require("express");
+const { Readable } = require("stream");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 
@@ -51,10 +52,21 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
     }
 
     res.status(200);
-    res.setHeader("content-type", "audio/mpeg");
+    res.setHeader("content-type", r.headers.get("content-type") || "audio/mpeg");
     res.setHeader("cache-control", "public, max-age=31536000, immutable");
 
-    // Stream through
+    // Stream through (do not buffer full mp3 in memory; improves TTFB and avoids long stalls)
+    if (r.body && typeof r.body.getReader === "function") {
+      const nodeStream = Readable.fromWeb(r.body);
+      nodeStream.on("error", (e) => {
+        logger.warn("Recording proxy stream error", { recordingSid, error: e?.message || String(e) });
+        try { res.end(); } catch (_) {}
+      });
+      nodeStream.pipe(res);
+      return;
+    }
+
+    // Fallback
     const buf = Buffer.from(await r.arrayBuffer());
     res.send(buf);
   } catch (err) {
