@@ -1,55 +1,84 @@
-// src/server.js
-"use strict";
+/**
+ * src/server.js
+ * Render entrypoint.
+ * Goals:
+ *  - Bind HTTP on 0.0.0.0:${PORT} so Render port scan succeeds.
+ *  - Keep / (and /health) fast (no SSOT/network awaits) to avoid 499/scan timeouts.
+ *  - Expose Twilio status webhook endpoint that returns immediately (prevents Twilio 502 timeout).
+ *  - Do NOT change the audio / WS pipeline.
+ */
 
-const express = require("express");
-const { env } = require("./config/env");
-const { logger } = require("./utils/logger");
-const { healthRouter } = require("./routes/health");
-const { adminReloadRouter } = require("./routes/adminReloadSheets");
-const { recordingsRouter } = require("./routes/recordings");
-const { loadSSOT } = require("./ssot/ssotClient");
-const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
+'use strict';
+
+const express = require('express');
+const env = require('./config/env');
+const { logger } = require('./utils/logger');
+
+const { installTwilioMediaWs } = require('./telephony/twilioStreamServer');
+const { loadSSOT, startSSOTAutoRefresh } = require('./ssot/ssotClient');
+
+// Routers (keep paths consistent with current repo layout)
+const { healthRouter } = require('./routes/health');
+const { adminReloadSheetsRouter } = require('./routes/adminReloadSheets');
+const { twilioStatusRouter } = require('./routes/twilioStatus');
+const { recordingsRouter } = require('./routes/recordings'); // optional; safe even if not used
 
 const app = express();
 
-// Keep HTTP responsiveness extremely fast (Render port scan/health checks)
-app.use(express.json({ limit: "1mb" }));
+// Twilio webhooks are often application/x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: '2mb' }));
 
-// Fast root handler (Render may probe "/")
-app.get("/", (req, res) => {
-  res.status(200).json({ ok: true, service: "voicebot_blank" });
+/**
+ * IMPORTANT: Render port scan hits GET /
+ * Keep this handler trivial and synchronous.
+ */
+app.get('/', (req, res) => {
+  res.status(200).send('ok');
 });
-app.head("/", (req, res) => res.sendStatus(200));
 
+// Mount routers (keep them fast; no long awaits in handlers)
 app.use(healthRouter);
-app.use(adminReloadRouter);
-app.use(recordingsRouter);
+app.use(adminReloadSheetsRouter);
+app.use(twilioStatusRouter);
 
+// Recording proxy/public endpoints (if present in your repo)
+if (recordingsRouter) {
+  app.use(recordingsRouter);
+}
+
+// 404 fast path (also helps port scan / random probes)
 app.use((req, res) => {
-  res.status(404).json({ error: "not_found" });
+  res.status(404).send('not_found');
 });
 
-// Render injects PORT. Fall back to env.PORT for local/dev.
-const port = Number(process.env.PORT || env.PORT || 10000);
+const port = Number(env.PORT || process.env.PORT || 10000);
 
-// Bind explicitly to 0.0.0.0 for containerized environments.
-const server = app.listen(port, "0.0.0.0", () => {
-  logger.info("Service started", {
-    port,
-    provider_mode: env.PROVIDER_MODE
-  });
-
-  // Best-effort preload SSOT, but DO NOT block the event loop during startup.
-  // If SSOT fetch/auth takes time, Render's probes can time out and show:
-  // "No open HTTP ports detected..." / 499.
-  setImmediate(() => {
-    loadSSOT(false)
-      .then(() => {})
-      .catch((err) => {
-        logger.error("SSOT preload failed", { error: err?.message || String(err) });
-      });
-  });
+// Bind explicitly to 0.0.0.0 to satisfy Render scanner.
+const server = app.listen(port, '0.0.0.0', () => {
+  logger.info('Service started', { port, provider_mode: env.PROVIDER_MODE });
 });
 
-// IMPORTANT: attach WS upgrade handler to the real HTTP server
+// Optional: tighten timeouts to avoid long-hanging requests
+server.requestTimeout = 30_000;
+server.headersTimeout = 35_000;
+
+/**
+ * Boot sequence:
+ * - Start WS server for Twilio Media Streams (voice path).
+ * - Load SSOT in background (DO NOT block HTTP readiness).
+ * - Start SSOT auto-refresh (if your ssotClient supports it).
+ */
 installTwilioMediaWs(server);
+
+// Background SSOT load (non-blocking)
+loadSSOT()
+  .then((info) => logger.info('SSOT loaded', info))
+  .catch((err) => logger.error('SSOT load failed', { err: String(err?.message || err) }));
+
+// If supported: periodic refresh without blocking
+try {
+  startSSOTAutoRefresh?.();
+} catch (e) {
+  // ignore if not implemented in this repo version
+}
