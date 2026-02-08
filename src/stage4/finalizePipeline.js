@@ -24,6 +24,20 @@ function safeStr(v) {
   return s || null;
 }
 
+// Remove empty/nullish values at the top-level only (keep 0/false), to keep webhook payloads clean.
+function compactTopLevel(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  const out = Array.isArray(obj) ? [] : {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    if (Array.isArray(v) && v.length === 0) continue;
+    if (typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function isWithheldCallerId(v) {
   const s = (typeof v === "string" ? v : "").trim().toLowerCase();
   if (!s) return true;

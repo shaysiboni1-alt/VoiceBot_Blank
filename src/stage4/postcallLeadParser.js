@@ -311,6 +311,13 @@ RULES:
   return lead;
 }
 
+// Backwards-compatible alias (GilSport-style name).
+// finalizePipeline expects `parseLeadPostcall`.
+async function parseLeadPostcall(args) {
+  return runPostcallLeadParser(args);
+}
+
 module.exports = {
   runPostcallLeadParser,
+  parseLeadPostcall,
 };
