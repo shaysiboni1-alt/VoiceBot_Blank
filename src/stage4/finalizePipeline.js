@@ -538,8 +538,10 @@ if (!isFinal) {
   lead.phone_additional = safeStr(leadPhoneE164) || null;
 }
 
+// Canonical: No "partial" leads.
+// FINAL is when we have at least a name OR a subject. Otherwise ABANDONED.
 const finalPayload = buildFinalPayload({
-  event: isFullLead ? "FINAL" : "ABANDONED",
+  event: isFinal ? "FINAL" : "ABANDONED",
   call,
   lead,
   recording,
