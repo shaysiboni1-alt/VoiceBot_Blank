@@ -57,6 +57,16 @@ function resolvePhone({ modelPhone, speechPhone, callerId }) {
   return normalizePhone(modelPhone) || normalizePhone(speechPhone) || normalizePhone(callerId) || null;
 }
 
+// Deterministic FINAL vs ABANDONED decision.
+// Keep this minimal and explicit: FINAL only when required fields exist.
+function shouldFinalizeAsLead(leadParsed) {
+  if (!leadParsed || typeof leadParsed !== "object") return false;
+  const fullName = typeof leadParsed.full_name === "string" ? leadParsed.full_name.trim() : "";
+  const subject = typeof leadParsed.subject === "string" ? leadParsed.subject.trim() : "";
+  // `notes` may be null, but we prefer having it.
+  return fullName.length > 0 && subject.length > 0;
+}
+
 function extractNameDeterministicFromTranscript(transcriptText) {
   const t = (typeof transcriptText === "string" ? transcriptText : "").trim();
   if (!t) return null;
@@ -118,11 +128,10 @@ function deriveSubjectAndReason(parsed, transcriptText) {
   const p = parsed || {};
 
   let subject = safeStr(p.subject) || null;
-  let reason = safeStr(p.reason) || null;
   let notes = safeStr(p.notes) || null;
 
   const t = safeStr(transcriptText);
-  if (t && (!subject || !reason || !notes)) {
+  if (t && (!subject || !notes)) {
     const hasReports = /דוח|דוחות/.test(t);
     const hasMasHachnasa = /מס הכנסה/.test(t);
     const hasVat = /מע"?מ|מעמ/.test(t);
@@ -138,41 +147,49 @@ function deriveSubjectAndReason(parsed, transcriptText) {
       if (year) subject += ` ${year}`;
     }
 
-    if (!reason && hasReports) {
-      reason = 'המתקשר ביקש דוחות';
-      if (hasVat && hasMasHachnasa) reason += ' מע"מ ומס הכנסה';
-      else if (hasMasHachnasa) reason += ' מס הכנסה';
-      else if (hasVat) reason += ' מע"מ';
-      if (year) reason += ` לשנת ${year}`;
-      if (urgent) reason += ' (דחוף)';
-    }
-
-    if (!notes && urgent) {
-      notes = 'המתקשר ציין שהבקשה דחופה.';
+    if (!notes) {
+      // Default to a single-sentence Hebrew note. Prefer explicit urgency if mentioned.
+      if (urgent) {
+        notes = year ? `המתקשר ביקש דוחות לשנת ${year} וציין שזה דחוף.` : 'המתקשר ציין שהבקשה דחופה.';
+      }
     }
   }
 
-  return { subject, reason, notes };
+  return { subject, notes };
 }
 function buildFinalPayload({ event, call, lead, recording }) {
   const tz = call?.timeZone || "UTC";
   const { call_date, call_time } = formatDateTimeParts(new Date(call?.ended_at || Date.now()), tz);
 
-  const payload = {
-    event,
+  const leadCompact = compactTopLevel({
     full_name: safeStr(lead?.full_name),
     subject: safeStr(lead?.subject),
-    reason: safeStr(lead?.reason),
-    caller_id_e164: safeStr(call?.caller),
-    phone_additional: safeStr(lead?.phone_additional),
-    parsing_summary: safeStr(lead?.parsing_summary),
-    recording_url_public: safeStr(recording?.recording_url_public),
-    call_date,
-    call_time,
-    callSid: safeStr(call?.callSid),
-    duration_sec: call?.duration_sec ?? null,
-    recording_provider: safeStr(recording?.recording_provider),
-    recording_sid: safeStr(recording?.recording_sid),
+    callback_to_number: safeStr(lead?.callback_to_number),
+    notes: safeStr(lead?.notes),
+  });
+
+  const payload = {
+    event,
+    call: compactTopLevel({
+      callSid: safeStr(call?.callSid),
+      streamSid: safeStr(call?.streamSid),
+      caller: safeStr(call?.caller),
+      called: safeStr(call?.called),
+      source: safeStr(call?.source),
+      started_at: safeStr(call?.started_at),
+      ended_at: safeStr(call?.ended_at),
+      duration_ms: call?.duration_ms ?? null,
+      duration_sec: call?.duration_sec ?? null,
+      finalize_reason: safeStr(call?.finalize_reason),
+      call_date,
+      call_time,
+    }),
+    lead: leadCompact,
+    recording: compactTopLevel({
+      recording_url_public: safeStr(recording?.recording_url_public),
+      recording_provider: safeStr(recording?.recording_provider),
+      recording_sid: safeStr(recording?.recording_sid),
+    }),
     decision_reason: safeStr(lead?.decision_reason),
   };
 
@@ -255,29 +272,26 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
       log.info?.("Postcall lead parser done", { callSid: call.callSid, has_full_name: !!safeStr(parsed?.full_name) });
     }
   } catch (e) {
-    log.warn?.("Lead postcall parsing failed", e?.message || e);
+    log.warn?.("Lead postcall parsing failed", {
+      callSid: call.callSid,
+      error: e?.message || String(e),
+      stack: e?.stack || null,
+    });
   }
 
-  const parsedDerived = deriveSubjectAndReason(parsed || {});
+  const parsedDerived = deriveSubjectAndReason(parsed || {}, transcriptText);
 
+  // Lead payload is SSOT-driven: we keep it minimal and forward-compatible.
+  // Required gate for FINAL is enforced by shouldFinalizeAsLead().
   const lead = {
-    // GilSport parity: prefer deterministic LeadGate values from runtime; LLM is fallback only.
     full_name:
       safeStr(snapshot?.lead?.full_name) ||
       safeStr(parsed?.full_name) ||
-      // Deterministic fallback (no LLM dependency for lead status):
-      extractNameDeterministicFromTranscript(
-        snapshot?.lead?.notes || snapshot?.lead?.transcriptText || snapshot?.transcriptText || ""
-      ) ||
+      extractNameDeterministicFromTranscript(transcriptText) ||
       null,
-    subject: safeStr(snapshot?.lead?.subject) || parsedDerived.subject || null,
-    reason: safeStr(snapshot?.lead?.reason) || parsedDerived.reason || null,
-    phone_number: safeStr(parsed?.phone_number) || null,
-    prefers_caller_id: typeof parsed?.prefers_caller_id === "boolean" ? parsed.prefers_caller_id : null,
-    // SSOT LEAD_PARSER_PROMPT returns callback_to_number + notes. We keep legacy field names for CRM.
-    phone_additional: safeStr(parsed?.callback_to_number) || safeStr(parsed?.phone_additional) || null,
-    // GilSport parity: parsing_summary must be an LLM CRM-style summary, not raw transcript.
-    parsing_summary: safeStr(parsed?.notes) || safeStr(parsed?.parsing_summary) || null,
+    subject: safeStr(parsedDerived.subject) || null,
+    callback_to_number: safeStr(parsed?.callback_to_number) || null,
+    notes: safeStr(parsedDerived.notes) || null,
   };
 
   // 3) Resolve recording (best-effort)
