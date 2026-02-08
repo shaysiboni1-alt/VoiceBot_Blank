@@ -1,3 +1,4 @@
+// src/ws/twilioMediaWs.js
 "use strict";
 
 const WebSocket = require("ws");
@@ -5,6 +6,7 @@ const { logger } = require("../utils/logger");
 const { env } = require("../config/env");
 const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
 const { startCallRecording } = require("../utils/twilioRecordings");
+const { setRecordingForCall } = require("../utils/recordingRegistry");
 const { getSSOT } = require("../ssot/ssotClient");
 
 function installTwilioMediaWs(server) {
@@ -23,7 +25,6 @@ function installTwilioMediaWs(server) {
     let customParameters = {};
     let gemini = null;
 
-    // NEW (Stage 4 fix): ensure stop/finalize path runs exactly once
     let stopped = false;
 
     function sendToTwilioMedia(ulaw8kB64) {
@@ -31,7 +32,7 @@ function installTwilioMediaWs(server) {
       const payload = {
         event: "media",
         streamSid,
-        media: { payload: ulaw8kB64 }
+        media: { payload: ulaw8kB64 },
       };
       try {
         twilioWs.send(JSON.stringify(payload));
@@ -55,30 +56,45 @@ function installTwilioMediaWs(server) {
         logger.info("Twilio stream start", { streamSid, callSid, customParameters });
 
         // Start Twilio call recording early so a RecordingSid exists by the time we finalize.
-        // This mirrors the GilSport flow and powers recording_url_public.
+        // Canonical spec: if Twilio returns a sid, store it immediately in Registry by CallSid.
         if (env.MB_ENABLE_RECORDING && callSid) {
-          startCallRecording(callSid, logger).catch((e) => {
-            logger.warn("Failed to start call recording", { callSid, err: e?.message || String(e) });
-          });
+          startCallRecording(callSid, logger)
+            .then((r) => {
+              if (r?.ok && r?.recordingSid) {
+                setRecordingForCall(callSid, { recordingSid: r.recordingSid });
+                logger.info("Recording started + stored in registry", {
+                  callSid,
+                  recordingSid: r.recordingSid,
+                });
+              } else {
+                logger.info("Recording start skipped/failed (best-effort)", {
+                  callSid,
+                  ok: r?.ok,
+                  reason: r?.reason || null,
+                });
+              }
+            })
+            .catch((e) => {
+              logger.warn("Failed to start call recording", { callSid, err: e?.message || String(e) });
+            });
         }
 
-        const ssot = getSSOT(); // כבר נטען בשרת; אם ריק – עדיין לא שוברים קול
+        const ssot = getSSOT(); // already loaded; if empty do not break voice
 
         gemini = new GeminiLiveSession({
-          // meta is forwarded into logs + Gemini session; keep it small and stable
           meta: {
             streamSid,
             callSid,
             caller: customParameters?.caller,
             called: customParameters?.called,
-            source: customParameters?.source
+            source: customParameters?.source,
           },
           ssot,
           onGeminiAudioUlaw8kBase64: (ulawB64) => sendToTwilioMedia(ulawB64),
           onGeminiText: (t) => logger.debug("Gemini text", { streamSid, callSid, t }),
           onTranscript: ({ who, text }) => {
             logger.info(`TRANSCRIPT ${who}`, { streamSid, callSid, text });
-          }
+          },
         });
 
         gemini.start();
