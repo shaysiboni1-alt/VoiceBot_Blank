@@ -15,7 +15,6 @@ const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
 
 // Lead/Recording support (does not affect audio pipeline)
 const { setRecordingForCall } = require("./utils/recordingRegistry");
-const { proxyRecordingMp3 } = require("./utils/twilioRecordings");
 
 const app = express();
 
@@ -35,20 +34,8 @@ app.get("/", (req, res) => {
 app.use(healthRouter);
 app.use(adminReloadRouter);
 
-// Public proxy endpoints (existing)
+// Public recording proxy endpoints (canonical + compatibility)
 app.use(recordingsRouter);
-
-// Canonical recording proxy endpoint (alias): /recording/:sid.mp3
-app.get("/recording/:sid.mp3", async (req, res) => {
-  const sid = String(req.params.sid || "").trim();
-  if (!sid) return res.status(400).send("missing_sid");
-  try {
-    await proxyRecordingMp3(sid, res, logger);
-  } catch (e) {
-    logger.warn("recording proxy failed", { err: String(e) });
-    if (!res.headersSent) res.status(500).send("proxy_error");
-  }
-});
 
 // Twilio async recording callback
 app.post("/twilio-recording-callback", (req, res) => {
