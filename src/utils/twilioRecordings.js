@@ -3,6 +3,10 @@
 
 const { Readable } = require("node:stream");
 
+function isTrue(v) {
+  return String(v || "").toLowerCase() === "true";
+}
+
 function twilioAuthHeader() {
   const sid = process.env.TWILIO_ACCOUNT_SID || "";
   const token = process.env.TWILIO_AUTH_TOKEN || "";
@@ -10,30 +14,33 @@ function twilioAuthHeader() {
   return `Basic ${basic}`;
 }
 
-function twilioBase() {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  return `https://api.twilio.com/2010-04-01/Accounts/${sid}`;
+function twilioBase(accountSid) {
+  return `https://api.twilio.com/2010-04-01/Accounts/${accountSid}`;
 }
 
 async function startCallRecording(callSid, logger) {
-  const enabled = String(process.env.MB_ENABLE_RECORDING || "").toLowerCase() === "true";
-  if (!enabled) return { ok: false, recordingSid: null, reason: "recording_disabled" };
+  if (!isTrue(process.env.MB_ENABLE_RECORDING)) {
+    return { ok: false, recordingSid: null, reason: "recording_disabled" };
+  }
 
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-    logger?.warn?.("TWILIO creds missing; cannot start recording");
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  if (!accountSid || !authToken) {
+    logger?.warn?.("startCallRecording: missing twilio creds");
     return { ok: false, recordingSid: null, reason: "twilio_creds_missing" };
   }
 
   const base = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
   if (!base) {
-    logger?.warn?.("PUBLIC_BASE_URL missing; cannot configure recording callback");
+    logger?.warn?.("startCallRecording: PUBLIC_BASE_URL missing");
     return { ok: false, recordingSid: null, reason: "public_base_url_missing" };
   }
 
   const callback = `${base}/twilio-recording-callback`;
 
   try {
-    const url = `${twilioBase()}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
+    const url = `${twilioBase(accountSid)}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
 
     const body = new URLSearchParams();
     body.set("RecordingStatusCallback", callback);
@@ -67,29 +74,29 @@ async function startCallRecording(callSid, logger) {
 }
 
 /**
- * Streaming public proxy for Twilio recording MP3.
- * IMPORTANT: Adds a hard timeout so Render edge won't 502 after ~60s.
+ * Public proxy for Twilio recording MP3 (streaming).
+ * Critical: add a hard timeout so Render won't hang and return 502.
+ *
+ * Optional ENV:
+ *   RECORDING_PROXY_TIMEOUT_MS (default 20000)
  */
 async function proxyRecordingMp3(recordingSid, res, logger) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
 
-  if (!accountSid || !token) {
+  if (!accountSid || !authToken) {
     res.statusCode = 503;
     res.end("twilio_not_configured");
     return;
   }
 
-  // Hard timeout (ms) — keep below common edge/proxy timeouts
-  const timeoutMs = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || 25000);
+  const timeoutMs = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || 20000);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${encodeURIComponent(
-      recordingSid
-    )}.mp3`;
+    const url = `${twilioBase(accountSid)}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
 
     const resp = await fetch(url, {
       method: "GET",
@@ -98,37 +105,38 @@ async function proxyRecordingMp3(recordingSid, res, logger) {
     });
 
     if (!resp.ok) {
-      const t = await resp.text().catch(() => "");
-      // Pass through Twilio status (404/401/403 etc)
+      const text = await resp.text().catch(() => "");
       res.statusCode = resp.status;
-      res.end(t || `twilio_${resp.status}`);
+      res.end(text || `twilio_${resp.status}`);
       return;
     }
 
+    // stream to client
     res.setHeader("content-type", "audio/mpeg");
     res.setHeader("cache-control", "public, max-age=31536000, immutable");
 
     const nodeStream = Readable.fromWeb(resp.body);
+
     nodeStream.on("error", (e) => {
-      logger?.warn?.("recording proxy stream error", { err: String(e) });
+      logger?.warn?.("recording mp3 stream error", { err: String(e), recordingSid });
       try { res.end(); } catch (_) {}
     });
 
     nodeStream.pipe(res);
   } catch (e) {
-    // Timeout / abort
-    if (String(e?.name || "").toLowerCase().includes("abort")) {
-      logger?.warn?.("recording proxy timeout", { recordingSid, timeoutMs });
+    const name = String(e?.name || "").toLowerCase();
+    if (name.includes("abort")) {
+      logger?.warn?.("recording mp3 fetch timeout", { recordingSid, timeoutMs });
       res.statusCode = 504;
       res.end("recording_fetch_timeout");
       return;
     }
 
-    logger?.warn?.("recording proxy exception", { err: String(e) });
+    logger?.warn?.("recording mp3 proxy exception", { err: String(e), recordingSid });
     res.statusCode = 500;
     res.end("proxy_error");
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(t);
   }
 }
 
