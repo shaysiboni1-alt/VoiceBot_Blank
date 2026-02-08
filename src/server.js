@@ -6,7 +6,7 @@ const { env } = require("./config/env");
 const { logger } = require("./utils/logger");
 const { healthRouter } = require("./routes/health");
 const { adminReloadRouter } = require("./routes/adminReloadSheets");
-const { recordingsRouter } = require("./routes/recordings");
+const recordingsRouter = require("./routes/recordings");
 const { loadSSOT } = require("./ssot/ssotClient");
 const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
 
