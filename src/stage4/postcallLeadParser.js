@@ -131,6 +131,9 @@ function guessHebrewNameFromConversation(conversationText) {
   const patterns = [
     /\bהיי\s+([\u0590-\u05FF]{1,30})\b/u,
     /\bשלום\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bתודה,?\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bסבבה\s+([\u0590-\u05FF]{1,30})\b/u,
+    /\bמעולה,?\s+([\u0590-\u05FF]{1,30})\b/u,
     /\bהבנתי,?\s+([\u0590-\u05FF]{1,30})\b/u,
     /\bרשמתי,?\s+([\u0590-\u05FF]{1,30})\b/u,
   ];
@@ -227,27 +230,49 @@ function normalizeParsedLead(raw) {
   // Coerce types & normalize
   const is_lead = typeof obj.is_lead === "boolean" ? obj.is_lead : null;
   const intent = normalizeNullableStr(obj.intent);
-  const full_name = normalizeNullableStr(obj.full_name);
-  const phone_number = normalizeNullableStr(obj.phone_number);
+
+  // Name: strip common prefixes like "השם שלי ..."
+  let full_name = normalizeNullableStr(obj.full_name);
+  if (full_name) {
+    full_name = full_name
+      .replace(/^(השם\s+שלי\s+|שמי\s+|אני\s+)/, "")
+      .replace(/[.،،,:;!?]+$/g, "")
+      .trim();
+    // If it looks like a sentence, discard (the parser should return only the name token)
+    if (full_name.split(/\s+/).length > 2) full_name = null;
+  }
+
+  // Subject: accept both "subject" and legacy "reason"
+  const subject =
+    normalizeNullableStr(obj.subject) || normalizeNullableStr(obj.reason);
+
+  // Callback number: accept both "callback_to_number" and legacy "phone_number"
+  const callback_to_number =
+    normalizeNullableStr(obj.callback_to_number) || normalizeNullableStr(obj.phone_number);
+
   const prefers_caller_id =
     typeof obj.prefers_caller_id === "boolean" ? obj.prefers_caller_id : null;
+
   const brand = normalizeNullableStr(obj.brand);
   const model = normalizeNullableStr(obj.model);
   const message_for = normalizeNullableStr(obj.message_for);
-  const reason = normalizeNullableStr(obj.reason);
   const notes = normalizeNullableStr(obj.notes);
 
+  // Keep legacy fields for compatibility, but primary fields are full_name/subject/callback_to_number/notes
   return {
     is_lead,
     intent,
     full_name,
-    phone_number,
+    subject,
+    callback_to_number,
     prefers_caller_id,
     brand,
     model,
     message_for,
-    reason,
     notes,
+    // legacy
+    phone_number: callback_to_number,
+    reason: subject,
   };
 }
 
