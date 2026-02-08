@@ -12,25 +12,30 @@ const twilioStatusRouter = express.Router();
  * Twilio expects this URL to return HTTP 200 quickly. If the handler hangs,
  * Twilio will show Warning 15003 / HTTP 502 (timeout ~30s).
  *
- * We keep it minimal: log the payload and respond 200 immediately.
+ * We intentionally keep this endpoint minimal and non-blocking.
  */
-twilioStatusRouter.all("/twilio/status", (req, res) => {
+function handleTwilioStatus(req, res) {
   try {
-    // Twilio often sends x-www-form-urlencoded; server.js enables urlencoded().
-    logger.info("Twilio status callback", {
-      method: req.method,
-      headers: {
-        "content-type": req.headers["content-type"],
-        "user-agent": req.headers["user-agent"],
-      },
-      body: req.body,
-      query: req.query,
-    });
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const meta = {
+      callSid: body.CallSid || body.callSid || null,
+      callStatus: body.CallStatus || body.callStatus || null,
+      from: body.From || body.from || null,
+      to: body.To || body.to || null,
+      apiVersion: body.ApiVersion || body.apiVersion || null,
+    };
+
+    logger.info("Twilio status webhook", meta);
   } catch (e) {
-    // Never break Twilio callback.
+    logger.warn("Twilio status webhook parse error", { err: String(e?.message || e) });
   }
 
-  return res.status(200).send("ok");
-});
+  // Always respond immediately.
+  res.status(200).type("text/plain").send("ok");
+}
+
+// Twilio sends POST; we also allow GET for quick manual checks.
+twilioStatusRouter.post("/twilio/status", handleTwilioStatus);
+twilioStatusRouter.get("/twilio/status", handleTwilioStatus);
 
 module.exports = { twilioStatusRouter };
