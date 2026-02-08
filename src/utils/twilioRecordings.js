@@ -15,15 +15,28 @@ function twilioBase() {
 }
 
 async function startCallRecording(callSid, logger) {
+  // Canonical: controlled by MB_ENABLE_RECORDING
+  const enabled = String(process.env.MB_ENABLE_RECORDING || "").toLowerCase() === "true";
+  if (!enabled) return { ok: false, recordingSid: null, reason: "recording_disabled" };
+
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
     logger?.warn?.('TWILIO creds missing; cannot start recording');
-    return { ok: false, recordingSid: null };
+    return { ok: false, recordingSid: null, reason: "twilio_creds_missing" };
   }
+
+  const base = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (!base) {
+    logger?.warn?.('PUBLIC_BASE_URL missing; cannot configure recording callback');
+    return { ok: false, recordingSid: null, reason: "public_base_url_missing" };
+  }
+
   try {
     const url = `${twilioBase()}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
     const body = new URLSearchParams({
+      RecordingStatusCallback: `${base}/twilio-recording-callback`,
+      RecordingStatusCallbackMethod: "POST",
+      RecordingStatusCallbackEvent: "completed",
       RecordingChannels: 'dual',
-      RecordingTrack: 'both',
     });
 
     const resp = await fetch(url, {
@@ -38,21 +51,22 @@ async function startCallRecording(callSid, logger) {
     const txt = await resp.text();
     if (!resp.ok) {
       logger?.warn?.('Twilio start recording failed', { status: resp.status, body: txt?.slice?.(0, 300) });
-      return { ok: false, recordingSid: null };
+      return { ok: false, recordingSid: null, reason: "twilio_start_failed" };
     }
 
     const j = JSON.parse(txt);
-    return { ok: true, recordingSid: j.sid || null };
+    return { ok: true, recordingSid: j.sid || null, reason: null };
   } catch (e) {
     logger?.warn?.('Twilio start recording exception', { err: String(e) });
-    return { ok: false, recordingSid: null };
+    return { ok: false, recordingSid: null, reason: "twilio_start_exception" };
   }
 }
 
 function publicRecordingUrl(recordingSid) {
   const base = process.env.PUBLIC_BASE_URL || '';
   if (!base || !recordingSid) return null;
-  return `${base.replace(/\/$/, '')}/recordings/${recordingSid}.mp3`;
+  // Canonical public URL (no Twilio auth): served by our proxy
+  return `${base.replace(/\/$/, '')}/recording/${recordingSid}.mp3`;
 }
 
 async function hangupCall(callSid, logger) {
