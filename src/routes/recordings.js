@@ -64,6 +64,14 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
 
 // Compatibility alias: /recording/<RecordingSid>
 // (GilSport-style payloads often reference this path)
+// Compatibility alias: /recordings/<RecordingSid> (no extension)
+// Some webhook consumers strip extensions; keep it working.
+recordingsRouter.get("/recordings/:recordingSid", (req, res) => {
+  const recordingSid = String(req.params.recordingSid || "").trim();
+  if (!recordingSid) return res.status(400).send("missing recordingSid");
+  return res.redirect(302, `/recordings/${encodeURIComponent(recordingSid)}.mp3`);
+});
+
 recordingsRouter.get("/recording/:recordingSid", (req, res) => {
   const recordingSid = String(req.params.recordingSid || "").trim();
   if (!recordingSid) return res.status(400).send("missing recordingSid");

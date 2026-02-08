@@ -103,6 +103,11 @@ function guessHebrewNameFromConversation(conversationText) {
 
 
 async function geminiText({ model, system, user }) {
+  if (!env.GEMINI_API_KEY) {
+    // Keep pipeline stable: skip LLM parsing if key is not configured.
+    return null;
+  }
+
   // Some deployments might pin an invalid/unsupported model name.
   // We try the configured model first, then fall back to a short list.
   const candidates = [
@@ -289,6 +294,11 @@ RULES:
     "- parsing_summary: one concise Hebrew sentence summarizing the request.\n";
 
   const raw = await geminiText({ model, system: augmentedSystem, user: input });
+
+  // If parsing is disabled (e.g., missing API key), return null and let the caller
+  // fall back to deterministic extraction.
+  if (!raw) return null;
+
 
   const parsed = parseJsonStrict(raw);
 
