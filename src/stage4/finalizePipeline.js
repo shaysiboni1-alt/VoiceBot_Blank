@@ -86,6 +86,111 @@ function shouldFinalizeAsLead(leadParsed) {
 }
 
 // Deterministic reason string for observability/CRM (stable contract).
+
+function extractNameHeuristic(transcriptText) {
+  const t = safeStr(transcriptText);
+  if (!t) return null;
+
+  // Prefer the first user utterance that looks like a name response.
+  // Examples: "שי", "השם שלי שי", "קוראים לי שי", "אני שי"
+  const userLines = t
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((s) => /^USER:\s*/i.test(s))
+    .map((s) => s.replace(/^USER:\s*/i, "").trim());
+
+  const candidates = [];
+  for (const u of userLines) {
+    const cleaned = u
+      .replace(/[\u200f\u200e]/g, "")
+      .replace(/[\.,!?…]+$/g, "")
+      .trim();
+
+    // Skip obvious non-name short confirmations
+    if (/^(כן|לא|אוקיי|ok|okay|ממ+|אה+|הלו)$/i.test(cleaned)) continue;
+
+    // Strip common Hebrew wrappers
+    let x = cleaned
+      .replace(/^\s*(השם\s+שלי|שמי|קוראים\s+לי|אני|זה)\s+/i, "")
+      .replace(/^\s*(my\s+name\s+is|i\s+am)\s+/i, "")
+      .trim();
+
+    // If the result contains multiple words, keep the last token (often the actual name)
+    const parts = x.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) x = parts[parts.length - 1];
+
+    // Accept Hebrew / Latin / Cyrillic short names
+    if (/^[\p{Script=Hebrew}\p{Script=Latin}\p{Script=Cyrillic}'"-]{1,32}$/u.test(x)) {
+      candidates.push(x);
+    }
+  }
+
+  if (!candidates.length) return null;
+
+  // Prefer Hebrew if available
+  const heb = candidates.find((c) => /\p{Script=Hebrew}/u.test(c));
+  return heb || candidates[0];
+}
+
+function cleanFullName(name) {
+  let n = safeStr(name);
+  if (!n) return null;
+
+  n = n.replace(/[\u200f\u200e]/g, "").trim();
+  n = n.replace(/[\.,!?…]+$/g, "").trim();
+
+  // Strip wrappers like "השם שלי"
+  n = n.replace(/^\s*(השם\s+שלי|שמי|קוראים\s+לי|אני|זה)\s+/i, "").trim();
+
+  // If still multiple words, keep last token unless it's clearly a two-word full name in Hebrew.
+  const parts = n.split(/\s+/).filter(Boolean);
+  if (parts.length >= 3) n = parts[parts.length - 1];
+  if (parts.length === 2) {
+    const [a, b] = parts;
+    const bothHeb = /\p{Script=Hebrew}/u.test(a) && /\p{Script=Hebrew}/u.test(b);
+    if (!bothHeb) n = b;
+  }
+
+  // Guard: if it contains verbs/phrases, it's not a name
+  if (/(השם|שלי|צריך|מבקש|רוצה|דוחות|לחזור|תשלח)/i.test(n) && n.length > 6) {
+    // fallback to last token
+    const p = n.split(/\s+/).filter(Boolean);
+    n = p[p.length - 1] || n;
+  }
+
+  return n || null;
+}
+
+function deriveSubjectFromTranscript(transcriptText) {
+  const t = safeStr(transcriptText);
+  if (!t) return null;
+
+  // Work on user-only text; bot confirmations can be misleading.
+  const userOnly = t
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((s) => /^USER:\s*/i.test(s))
+    .map((s) => s.replace(/^USER:\s*/i, "").trim())
+    .join(" ");
+
+  const u = userOnly || t;
+
+  const hasReports = /(דוחו?ת|דו"חות|דוחות|דוח)/i.test(u);
+  const hasVat = /(מע"מ|מעמ|מאמ|vat)/i.test(u);
+  const year = (u.match(/\b(19\d{2}|20\d{2})\b/) || [null])[0];
+
+  if (hasReports && hasVat) return `בקשת דוחות מע"מ${year ? " " + year : ""}`;
+  if (hasReports) return `בקשת דוחות${year ? " " + year : ""}`;
+
+  // Generic fallback: first meaningful sentence (truncate)
+  const cleaned = u.replace(/\s+/g, " ").trim();
+  if (cleaned.length >= 6) return cleaned.slice(0, 120);
+
+  return null;
+}
+
 function decisionReason({ leadParsed, hasCallerId, callerIdWithheld, hadAnyUserSpeech, leadComplete }) {
   const hasName = !!safeStr(leadParsed?.full_name);
   const hasSubject = !!safeStr(leadParsed?.subject) || !!safeStr(leadParsed?.reason);
@@ -352,6 +457,18 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     // GilSport parity: parsing_summary must be an LLM CRM-style summary, not raw transcript.
     parsing_summary: safeStr(parsed?.notes) || safeStr(parsed?.parsing_summary) || null,
   };
+
+  // Normalize / sanitize extracted fields (prevent wrappers like "השם שלי שי" leaking into full_name)
+  lead.full_name = cleanFullName(lead.full_name) || null;
+  if (!lead.full_name) {
+    const dn = extractNameDeterministicFromTranscript(transcriptText);
+    lead.full_name = cleanFullName(dn) || null;
+  }
+
+  // Derive subject deterministically if missing/empty
+  if (!safeStr(lead.subject)) {
+    lead.subject = deriveSubjectFromTranscript(transcriptText);
+  }
 
   // 3) Resolve recording (best-effort)
   let recording = {
