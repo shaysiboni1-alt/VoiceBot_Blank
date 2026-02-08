@@ -9,6 +9,7 @@ const { logger } = require("./utils/logger");
 const { healthRouter } = require("./routes/health");
 const { adminReloadRouter } = require("./routes/adminReloadSheets");
 const { recordingsRouter } = require("./routes/recordings");
+const { twilioStatusRouter } = require("./routes/twilioStatus");
 
 const { loadSSOT } = require("./ssot/ssotClient");
 const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
@@ -22,7 +23,7 @@ const app = express();
 // JSON payloads (webhooks/admin)
 app.use(express.json({ limit: "1mb" }));
 
-// Twilio RecordingStatusCallback sends x-www-form-urlencoded
+// Twilio callbacks send x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
 // IMPORTANT: Render health/probe hits GET /
@@ -34,6 +35,7 @@ app.get("/", (req, res) => {
 // --- Routers ---
 app.use(healthRouter);
 app.use(adminReloadRouter);
+app.use(twilioStatusRouter);
 
 // Public proxy endpoints (existing)
 app.use(recordingsRouter);
@@ -60,7 +62,7 @@ app.post("/twilio-recording-callback", (req, res) => {
     if (callSid) {
       setRecordingForCall(callSid, {
         recordingSid: recordingSid || null,
-        recordingUrl: recordingUrl || null
+        recordingUrl: recordingUrl || null,
       });
     }
 
@@ -80,7 +82,7 @@ app.use((req, res) => {
 const server = app.listen(env.PORT, "0.0.0.0", async () => {
   logger.info("Service started", {
     port: env.PORT,
-    provider_mode: env.PROVIDER_MODE
+    provider_mode: env.PROVIDER_MODE,
   });
 
   // Best-effort preload SSOT
