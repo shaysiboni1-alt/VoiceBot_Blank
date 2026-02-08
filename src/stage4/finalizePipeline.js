@@ -72,38 +72,55 @@ function resolvePhone({ modelPhone, speechPhone, callerId }) {
 }
 
 // Deterministic FINAL vs ABANDONED decision.
-// Keep this minimal and explicit: FINAL only when required fields exist.
+// Policy (matches GilSport-style lead gating):
+// - FINAL when we have (name AND subject) OR (a phone AND (name OR subject)).
+// - Otherwise ABANDONED.
 function shouldFinalizeAsLead(leadParsed) {
   if (!leadParsed || typeof leadParsed !== "object") return false;
   const fullName = typeof leadParsed.full_name === "string" ? leadParsed.full_name.trim() : "";
   const subject = typeof leadParsed.subject === "string" ? leadParsed.subject.trim() : "";
-  // `notes` may be null, but we prefer having it.
-  return fullName.length > 0 && subject.length > 0;
+  const phone =
+    (typeof leadParsed.phone_number === "string" ? leadParsed.phone_number.trim() : "") ||
+    (typeof leadParsed.callback_phone === "string" ? leadParsed.callback_phone.trim() : "");
+  return (fullName.length > 0 && subject.length > 0) || (phone.length > 0 && (fullName.length > 0 || subject.length > 0));
 }
 
 // Deterministic reason string for observability/CRM (stable contract).
-function decisionReason({ leadParsed, leadMode, hasCallerId, callerIdWithheld, hadAnyUserSpeech }) {
+function decisionReason({ leadParsed, hasCallerId, callerIdWithheld, hadAnyUserSpeech, leadComplete }) {
   const hasName = !!safeStr(leadParsed?.full_name);
   const hasSubject = !!safeStr(leadParsed?.subject) || !!safeStr(leadParsed?.reason);
   const hasPhone = !!safeStr(leadParsed?.phone_number) || !!safeStr(leadParsed?.callback_phone);
+  const hasAny = hasName || hasSubject || hasPhone;
 
   if (!hadAnyUserSpeech) return "no_user_speech";
-  if (leadMode && String(leadMode).toLowerCase() !== "full") {
-    // In reduced lead modes we still want deterministic reasons.
-    return hasName ? `lead_mode_${String(leadMode).toLowerCase()}_ok` : `lead_mode_${String(leadMode).toLowerCase()}_missing_name`;
+  if (!hasAny) return hasCallerId ? "only_caller_id" : "no_identifying_details";
+
+  if (leadComplete) {
+    if (callerIdWithheld && !hasPhone) return "lead_complete_but_withheld_missing_phone";
+    if (callerIdWithheld && hasPhone) return "lead_complete_withheld_callback_collected";
+    if (hasCallerId) return "lead_complete_using_caller_id";
+    if (hasPhone) return "lead_complete_phone_collected";
+    return "lead_complete";
   }
 
-  if (!hasName) return "missing_name";
-  if (!hasSubject) return "missing_subject";
+  if (!hasName) return "partial_missing_name";
+  if (!hasSubject) return "partial_missing_subject";
+  if (callerIdWithheld && !hasPhone) return "partial_missing_callback_phone_withheld";
+  return "partial_lead";
+}
 
-  // Phone policy: if caller-id is available and not withheld, we accept it as callback.
-  if (callerIdWithheld) {
-    if (!hasPhone) return "missing_callback_phone_withheld";
-    return "lead_complete_withheld_callback_collected";
+function hadMeaningfulUserSpeech(transcriptText) {
+  const t = typeof transcriptText === "string" ? transcriptText : "";
+  // Our transcript format is lines like: "USER: ..." / "BOT: ...".
+  const userLines = t
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^USER\s*:/i.test(l) || /^CALLER\s*:/i.test(l) || /^HUMAN\s*:/i.test(l));
+  for (const line of userLines) {
+    const text = line.replace(/^\w+\s*:/, "").trim();
+    if (text.length >= 2) return true;
   }
-  if (hasCallerId) return "lead_complete_using_caller_id";
-  if (hasPhone) return "lead_complete_phone_collected";
-  return "missing_callback_phone";
+  return false;
 }
 
 function extractNameDeterministicFromTranscript(transcriptText) {
@@ -352,9 +369,23 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   }
 
   // 4) Deterministic LeadGate -> FINAL xor ABANDONED
-  // env.FINAL_ON_STOP is normalized to boolean in src/config/env.js
-  const isFinal = !!shouldFinalizeAsLead(lead, call) && !!env.FINAL_ON_STOP;
-  lead.decision_reason = decisionReason(lead, call);
+  // Policy (as requested): ABANDONED only when there is *no* identifying info (no name + no subject + no phone).
+  // Anything that contains identifying info is treated as FINAL (even if partial), because it is not a "dropped" call.
+  const hadAnyUserSpeech = hadMeaningfulUserSpeech(transcriptText);
+  const callerRaw = safeStr(call.caller_id_e164) || safeStr(call.caller) || safeStr(call.from);
+  const callerIdWithheld = /anonymous|blocked|private|withheld|restricted/i.test(callerRaw);
+  const hasCallerId = !!callerRaw && !callerIdWithheld;
+
+  const hasAnyLeadInfo = Boolean(
+    safeStr(lead.full_name) ||
+      safeStr(lead.subject) ||
+      safeStr(lead.reason) ||
+      safeStr(lead.phone_number) ||
+      safeStr(lead.phone_additional)
+  );
+
+  const isFinal = hasAnyLeadInfo;
+  lead.decision_reason = decisionReason({ leadParsed: lead, hasCallerId, callerIdWithheld, hadAnyUserSpeech });
 
   const finalPayload = buildFinalPayload({
     event: isFinal ? "FINAL" : "ABANDONED",

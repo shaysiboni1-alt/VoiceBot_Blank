@@ -3,18 +3,58 @@
 
 const { logger } = require("../utils/logger");
 const env = require("../config/env");
+const { google } = require("googleapis");
+
+const fetchFn = typeof fetch === "function" ? fetch : null;
 
 function safeStr(v) {
   return typeof v === "string" ? v : v == null ? "" : String(v);
 }
 
 async function geminiGenerateContent({ model, contents, systemInstruction }) {
-  const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is missing");
+  if (!fetchFn) throw new Error("Global fetch is unavailable in this Node runtime");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const useVertex = !!env.GEMINI_VERTEX_ENABLED;
+  let url;
+  let headers = { "Content-Type": "application/json" };
+
+  if (useVertex) {
+    const b64 = env.GOOGLE_SERVICE_ACCOUNT_JSON_B64;
+    if (!b64) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON_B64 is missing (required for Vertex)");
+    let creds;
+    try {
+      const jsonText = Buffer.from(String(b64).replace(/^"|"$/g, ""), "base64").toString("utf8");
+      creds = JSON.parse(jsonText);
+    } catch (e) {
+      throw new Error("Failed to decode GOOGLE_SERVICE_ACCOUNT_JSON_B64");
+    }
+
+    const projectId = env.GEMINI_PROJECT_ID;
+    const location = env.GEMINI_LOCATION || "us-central1";
+    if (!projectId) throw new Error("GEMINI_PROJECT_ID is missing (required for Vertex)");
+
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+    });
+    const client = await auth.getClient();
+    const tokenResp = await client.getAccessToken();
+    const token = typeof tokenResp === "string" ? tokenResp : tokenResp?.token;
+    if (!token) throw new Error("Failed to obtain Vertex access token");
+
+    headers = { ...headers, Authorization: `Bearer ${token}` };
+    url = `https://${location}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(
+      projectId
+    )}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(
+      model
+    )}:generateContent`;
+  } else {
+    const apiKey = env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY is missing");
+    url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  }
 
   const body = {
     ...(systemInstruction ? { systemInstruction } : {}),
@@ -27,9 +67,9 @@ async function geminiGenerateContent({ model, contents, systemInstruction }) {
     },
   };
 
-  const res = await fetch(url, {
+  const res = await fetchFn(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
 

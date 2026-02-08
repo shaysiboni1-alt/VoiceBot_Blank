@@ -34,11 +34,32 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
     const dir = path.join("/tmp", "recordings");
     const fp = path.join(dir, `${recordingSid}.mp3`);
     if (fs.existsSync(fp)) {
-      res.status(200);
+      const stat = fs.statSync(fp);
+      const total = stat.size;
+      const range = req.headers.range;
+
       res.setHeader("content-type", "audio/mpeg");
       res.setHeader("cache-control", "public, max-age=31536000, immutable");
-      fs.createReadStream(fp).pipe(res);
-      return;
+      res.setHeader("accept-ranges", "bytes");
+
+      if (range) {
+        const m = String(range).match(/bytes=(\d+)-(\d+)?/);
+        if (m) {
+          const start = parseInt(m[1], 10);
+          const end = m[2] ? parseInt(m[2], 10) : total - 1;
+          const safeStart = Number.isFinite(start) ? Math.max(0, Math.min(start, total - 1)) : 0;
+          const safeEnd = Number.isFinite(end) ? Math.max(safeStart, Math.min(end, total - 1)) : total - 1;
+          const chunkSize = safeEnd - safeStart + 1;
+          res.status(206);
+          res.setHeader("content-range", `bytes ${safeStart}-${safeEnd}/${total}`);
+          res.setHeader("content-length", String(chunkSize));
+          return fs.createReadStream(fp, { start: safeStart, end: safeEnd }).pipe(res);
+        }
+      }
+
+      res.status(200);
+      res.setHeader("content-length", String(total));
+      return fs.createReadStream(fp).pipe(res);
     }
   } catch (e) {
     logger.warn("Recording cache check failed", { recordingSid, error: e?.message || String(e) });
@@ -52,9 +73,32 @@ recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
       return res.status(status === 404 ? 503 : 502).send("recording not ready");
     }
 
-    res.status(200);
+    // After prefetch, serve from disk with Range support (same as cache path).
+    const stat = fs.statSync(filepath);
+    const total = stat.size;
+    const range = req.headers.range;
+
     res.setHeader("content-type", "audio/mpeg");
     res.setHeader("cache-control", "public, max-age=31536000, immutable");
+    res.setHeader("accept-ranges", "bytes");
+
+    if (range) {
+      const m = String(range).match(/bytes=(\d+)-(\d+)?/);
+      if (m) {
+        const start = parseInt(m[1], 10);
+        const end = m[2] ? parseInt(m[2], 10) : total - 1;
+        const safeStart = Number.isFinite(start) ? Math.max(0, Math.min(start, total - 1)) : 0;
+        const safeEnd = Number.isFinite(end) ? Math.max(safeStart, Math.min(end, total - 1)) : total - 1;
+        const chunkSize = safeEnd - safeStart + 1;
+        res.status(206);
+        res.setHeader("content-range", `bytes ${safeStart}-${safeEnd}/${total}`);
+        res.setHeader("content-length", String(chunkSize));
+        return fs.createReadStream(filepath, { start: safeStart, end: safeEnd }).pipe(res);
+      }
+    }
+
+    res.status(200);
+    res.setHeader("content-length", String(total));
     fs.createReadStream(filepath).pipe(res);
   } catch (err) {
     logger.error("Recording proxy error", { recordingSid, error: err?.message || String(err) });
