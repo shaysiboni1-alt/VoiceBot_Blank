@@ -67,6 +67,31 @@ function shouldFinalizeAsLead(leadParsed) {
   return fullName.length > 0 && subject.length > 0;
 }
 
+// Deterministic reason string for observability/CRM (stable contract).
+function decisionReason({ leadParsed, leadMode, hasCallerId, callerIdWithheld, hadAnyUserSpeech }) {
+  const hasName = !!safeStr(leadParsed?.full_name);
+  const hasSubject = !!safeStr(leadParsed?.subject) || !!safeStr(leadParsed?.reason);
+  const hasPhone = !!safeStr(leadParsed?.phone_number) || !!safeStr(leadParsed?.callback_phone);
+
+  if (!hadAnyUserSpeech) return "no_user_speech";
+  if (leadMode && String(leadMode).toLowerCase() !== "full") {
+    // In reduced lead modes we still want deterministic reasons.
+    return hasName ? `lead_mode_${String(leadMode).toLowerCase()}_ok` : `lead_mode_${String(leadMode).toLowerCase()}_missing_name`;
+  }
+
+  if (!hasName) return "missing_name";
+  if (!hasSubject) return "missing_subject";
+
+  // Phone policy: if caller-id is available and not withheld, we accept it as callback.
+  if (callerIdWithheld) {
+    if (!hasPhone) return "missing_callback_phone_withheld";
+    return "lead_complete_withheld_callback_collected";
+  }
+  if (hasCallerId) return "lead_complete_using_caller_id";
+  if (hasPhone) return "lead_complete_phone_collected";
+  return "missing_callback_phone";
+}
+
 function extractNameDeterministicFromTranscript(transcriptText) {
   const t = (typeof transcriptText === "string" ? transcriptText : "").trim();
   if (!t) return null;
@@ -128,10 +153,11 @@ function deriveSubjectAndReason(parsed, transcriptText) {
   const p = parsed || {};
 
   let subject = safeStr(p.subject) || null;
+  let reason = safeStr(p.reason) || null;
   let notes = safeStr(p.notes) || null;
 
   const t = safeStr(transcriptText);
-  if (t && (!subject || !notes)) {
+  if (t && (!subject || !reason || !notes)) {
     const hasReports = /דוח|דוחות/.test(t);
     const hasMasHachnasa = /מס הכנסה/.test(t);
     const hasVat = /מע"?מ|מעמ/.test(t);
@@ -147,49 +173,41 @@ function deriveSubjectAndReason(parsed, transcriptText) {
       if (year) subject += ` ${year}`;
     }
 
-    if (!notes) {
-      // Default to a single-sentence Hebrew note. Prefer explicit urgency if mentioned.
-      if (urgent) {
-        notes = year ? `המתקשר ביקש דוחות לשנת ${year} וציין שזה דחוף.` : 'המתקשר ציין שהבקשה דחופה.';
-      }
+    if (!reason && hasReports) {
+      reason = 'המתקשר ביקש דוחות';
+      if (hasVat && hasMasHachnasa) reason += ' מע"מ ומס הכנסה';
+      else if (hasMasHachnasa) reason += ' מס הכנסה';
+      else if (hasVat) reason += ' מע"מ';
+      if (year) reason += ` לשנת ${year}`;
+      if (urgent) reason += ' (דחוף)';
+    }
+
+    if (!notes && urgent) {
+      notes = 'המתקשר ציין שהבקשה דחופה.';
     }
   }
 
-  return { subject, notes };
+  return { subject, reason, notes };
 }
 function buildFinalPayload({ event, call, lead, recording }) {
   const tz = call?.timeZone || "UTC";
   const { call_date, call_time } = formatDateTimeParts(new Date(call?.ended_at || Date.now()), tz);
 
-  const leadCompact = compactTopLevel({
-    full_name: safeStr(lead?.full_name),
-    subject: safeStr(lead?.subject),
-    callback_to_number: safeStr(lead?.callback_to_number),
-    notes: safeStr(lead?.notes),
-  });
-
   const payload = {
     event,
-    call: compactTopLevel({
-      callSid: safeStr(call?.callSid),
-      streamSid: safeStr(call?.streamSid),
-      caller: safeStr(call?.caller),
-      called: safeStr(call?.called),
-      source: safeStr(call?.source),
-      started_at: safeStr(call?.started_at),
-      ended_at: safeStr(call?.ended_at),
-      duration_ms: call?.duration_ms ?? null,
-      duration_sec: call?.duration_sec ?? null,
-      finalize_reason: safeStr(call?.finalize_reason),
-      call_date,
-      call_time,
-    }),
-    lead: leadCompact,
-    recording: compactTopLevel({
-      recording_url_public: safeStr(recording?.recording_url_public),
-      recording_provider: safeStr(recording?.recording_provider),
-      recording_sid: safeStr(recording?.recording_sid),
-    }),
+    full_name: safeStr(lead?.full_name),
+    subject: safeStr(lead?.subject),
+    reason: safeStr(lead?.reason),
+    caller_id_e164: safeStr(call?.caller),
+    phone_additional: safeStr(lead?.phone_additional),
+    parsing_summary: safeStr(lead?.parsing_summary),
+    recording_url_public: safeStr(recording?.recording_url_public),
+    call_date,
+    call_time,
+    callSid: safeStr(call?.callSid),
+    duration_sec: call?.duration_sec ?? null,
+    recording_provider: safeStr(recording?.recording_provider),
+    recording_sid: safeStr(recording?.recording_sid),
     decision_reason: safeStr(lead?.decision_reason),
   };
 
@@ -213,6 +231,9 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     finalize_reason: snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
     timeZone: env.TIME_ZONE || "UTC",
   };
+
+  // Keep transcriptText in outer scope (used in both success + error paths)
+  let transcriptText = "";
 
   // 1) CALL_LOG (always, if enabled)
   try {
@@ -248,7 +269,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   try {
     // In this runtime, we store the full transcript in snapshot.lead.notes
     // (see vendor/geminiLiveSession.js). Keep backwards-compatible fallbacks.
-    const transcriptText =
+    transcriptText =
       snapshot?.lead?.transcriptText ||
       snapshot?.lead?.notes ||
       snapshot?.transcriptText ||
@@ -279,19 +300,26 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     });
   }
 
-  const parsedDerived = deriveSubjectAndReason(parsed || {}, transcriptText);
+  const parsedDerived = deriveSubjectAndReason(parsed || {});
 
-  // Lead payload is SSOT-driven: we keep it minimal and forward-compatible.
-  // Required gate for FINAL is enforced by shouldFinalizeAsLead().
   const lead = {
+    // GilSport parity: prefer deterministic LeadGate values from runtime; LLM is fallback only.
     full_name:
       safeStr(snapshot?.lead?.full_name) ||
       safeStr(parsed?.full_name) ||
-      extractNameDeterministicFromTranscript(transcriptText) ||
+      // Deterministic fallback (no LLM dependency for lead status):
+      extractNameDeterministicFromTranscript(
+        snapshot?.lead?.notes || snapshot?.lead?.transcriptText || snapshot?.transcriptText || ""
+      ) ||
       null,
-    subject: safeStr(parsedDerived.subject) || null,
-    callback_to_number: safeStr(parsed?.callback_to_number) || null,
-    notes: safeStr(parsedDerived.notes) || null,
+    subject: safeStr(snapshot?.lead?.subject) || parsedDerived.subject || null,
+    reason: safeStr(snapshot?.lead?.reason) || parsedDerived.reason || null,
+    phone_number: safeStr(parsed?.phone_number) || null,
+    prefers_caller_id: typeof parsed?.prefers_caller_id === "boolean" ? parsed.prefers_caller_id : null,
+    // SSOT LEAD_PARSER_PROMPT returns callback_to_number + notes. We keep legacy field names for CRM.
+    phone_additional: safeStr(parsed?.callback_to_number) || safeStr(parsed?.phone_additional) || null,
+    // GilSport parity: parsing_summary must be an LLM CRM-style summary, not raw transcript.
+    parsing_summary: safeStr(parsed?.notes) || safeStr(parsed?.parsing_summary) || null,
   };
 
   // 3) Resolve recording (best-effort)
