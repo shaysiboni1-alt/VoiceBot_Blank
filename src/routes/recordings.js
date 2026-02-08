@@ -16,19 +16,19 @@ function normalizeSid(raw) {
 }
 
 async function handleProxy(req, res) {
-  const sid = normalizeSid(req.params.recordingSid || req.params.sid);
-  if (!sid) return res.status(400).send("missing_recordingSid");
+  const sid = normalizeSid(req.params.sid || req.params.recordingSid);
+  if (!sid) return res.status(400).type("text/plain").send("missing_recordingSid");
 
   try {
     // streaming proxy (no buffering)
     await proxyRecordingMp3(sid, res, logger);
   } catch (e) {
     logger.warn("recording proxy handler failed", { sid, err: String(e) });
-    if (!res.headersSent) res.status(500).send("proxy_error");
+    if (!res.headersSent) res.status(500).type("text/plain").send("proxy_error");
   }
 }
 
-// Canonical per spec (what you want to send to CRM)
+// Canonical (what you want to send to CRM)
 recordingsRouter.get("/recording/:sid.mp3", handleProxy);
 recordingsRouter.get("/recording/:sid", (req, res) => {
   const sid = normalizeSid(req.params.sid);
@@ -36,7 +36,7 @@ recordingsRouter.get("/recording/:sid", (req, res) => {
   return res.redirect(302, `/recording/${encodeURIComponent(sid)}.mp3`);
 });
 
-// Compatibility with your current shared links
+// Compatibility (your current links)
 recordingsRouter.get("/recordings/:recordingSid.mp3", handleProxy);
 recordingsRouter.get("/recordings/:recordingSid", (req, res) => {
   const sid = normalizeSid(req.params.recordingSid);
