@@ -133,33 +133,43 @@ function extractNameHeuristic(transcriptText) {
   return heb || candidates[0];
 }
 
-function cleanFullName(name) {
-  let n = safeStr(name);
+function cleanFullName(s) {
+  if (!s) return null;
+
+  // Normalize common punctuation/spaces
+  let n = String(s)
+    .replace(/[“”"']/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
   if (!n) return null;
 
-  n = n.replace(/[\u200f\u200e]/g, "").trim();
-  n = n.replace(/[\.,!?…]+$/g, "").trim();
-
-  // Strip wrappers like "השם שלי"
-  n = n.replace(/^\s*(השם\s+שלי|שמי|קוראים\s+לי|אני|זה)\s+/i, "").trim();
-
-  // If still multiple words, keep last token unless it's clearly a two-word full name in Hebrew.
-  const parts = n.split(/\s+/).filter(Boolean);
-  if (parts.length >= 3) n = parts[parts.length - 1];
-  if (parts.length === 2) {
-    const [a, b] = parts;
-    const bothHeb = /\p{Script=Hebrew}/u.test(a) && /\p{Script=Hebrew}/u.test(b);
-    if (!bothHeb) n = b;
+  // If the model returned a sentence, take the last token (common failure mode: "השם שלי שי")
+  if (n.split(" ").length > 3) {
+    const parts = n.split(" ").filter(Boolean);
+    n = parts[parts.length - 1] || n;
   }
 
-  // Guard: if it contains verbs/phrases, it's not a name
-  if (/(השם|שלי|צריך|מבקש|רוצה|דוחות|לחזור|תשלח)/i.test(n) && n.length > 6) {
-    // fallback to last token
-    const p = n.split(/\s+/).filter(Boolean);
-    n = p[p.length - 1] || n;
+  // Reject names that are clearly not Hebrew or Latin (e.g., Bengali script)
+  const hasHebrew = /[\u0590-\u05FF]/.test(n);
+  const hasLatin = /[A-Za-z]/.test(n);
+
+  // Keep short Hebrew / Latin names, including 2 letters as requested
+  if (hasHebrew) {
+    // Remove leading Hebrew glue words like "וש" only if they appear as a prefix before 2+ letters
+    n = n.replace(/^ו(?=[\u0590-\u05FF]{2,})/, "");
+    n = n.trim();
+    return n.length >= 1 ? n : null;
   }
 
-  return n || null;
+  if (hasLatin) {
+    // basic cleanup for latin names (keep letters, spaces, hyphen)
+    n = n.replace(/[^A-Za-z \-]/g, "").trim();
+    return n.length >= 1 ? n : null;
+  }
+
+  // Otherwise: unknown script => null to allow deterministic fallback from transcript
+  return null;
 }
 
 function deriveSubjectFromTranscript(transcriptText) {
@@ -179,8 +189,10 @@ function deriveSubjectFromTranscript(transcriptText) {
 
   const hasReports = /(דוחו?ת|דו"חות|דוחות|דוח)/i.test(u);
   const hasVat = /(מע"מ|מעמ|מאמ|vat)/i.test(u);
+  const hasIncomeTax = /(מס\s*הכנסה|מסהכנסה|income\s*tax)/i.test(u);
   const year = (u.match(/\b(19\d{2}|20\d{2})\b/) || [null])[0];
 
+  if (hasReports && hasIncomeTax) return `בקשת דוחות מס הכנסה${year ? " " + year : ""}`;
   if (hasReports && hasVat) return `בקשת דוחות מע"מ${year ? " " + year : ""}`;
   if (hasReports) return `בקשת דוחות${year ? " " + year : ""}`;
 
@@ -246,13 +258,13 @@ function extractNameDeterministicFromTranscript(transcriptText) {
     const m = line.match(/\bהשם\s+שלי\s+([^,.!?]+)[,.!?]?/);
     if (m && m[1]) {
       const cand = m[1].trim();
-      if (cand.length >= 2 && cand.length <= 40 && !/\d/.test(cand)) return cand;
+      if (cand.length >= 2 && cand.length <= 40 && !/\d/.test(cand) && /[A-Za-z\u0590-\u05FF]/.test(cand)) return cand;
     }
   }
 
   // 2) First user answer after the name question is usually just the name.
   const cand = userLines[0].replace(/["'“”]/g, "").trim();
-  if (cand.length >= 2 && cand.length <= 40 && !/\d/.test(cand)) return cand;
+  if (cand.length >= 2 && cand.length <= 40 && !/\d/.test(cand) && /[A-Za-z\u0590-\u05FF]/.test(cand)) return cand;
   return null;
 }
 
@@ -485,31 +497,47 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     log.warn?.("Resolve recording failed", e?.message || e);
   }
 
-  // 4) Deterministic LeadGate -> FINAL xor ABANDONED
-  // Policy (as requested): ABANDONED only when there is *no* identifying info (no name + no subject + no phone).
-  // Anything that contains identifying info is treated as FINAL (even if partial), because it is not a "dropped" call.
-  const hadAnyUserSpeech = hadMeaningfulUserSpeech(transcriptText);
-  const callerRaw = safeStr(call.caller_id_e164) || safeStr(call.caller) || safeStr(call.from);
-  const callerIdWithheld = /anonymous|blocked|private|withheld|restricted/i.test(callerRaw);
-  const hasCallerId = !!callerRaw && !callerIdWithheld;
+// 4) Deterministic LeadGate -> FINAL xor ABANDONED (strict)
+// Definition:
+// - FULL lead: full_name + subject + phone
+//   * phone is caller_id_e164 if present and NOT withheld; otherwise must come from phone_additional/phone_number.
+// - ABANDONED: anything that is NOT a full lead (we do NOT emit "partial" leads).
+const hadAnyUserSpeech = hadMeaningfulUserSpeech(transcriptText);
+const callerRaw = safeStr(call.caller_id_e164) || safeStr(call.caller) || safeStr(call.from) || null;
+const callerIdWithheld = /anonymous|blocked|private|withheld|restricted/i.test(String(callerRaw || ""));
+const hasCallerId = !!callerRaw && !callerIdWithheld;
 
-  const hasAnyLeadInfo = Boolean(
-    safeStr(lead.full_name) ||
-      safeStr(lead.subject) ||
-      safeStr(lead.reason) ||
-      safeStr(lead.phone_number) ||
-      safeStr(lead.phone_additional)
-  );
+const leadPhoneE164 =
+  (hasCallerId ? safeStr(call.caller_id_e164) || safeStr(call.caller) || safeStr(call.from) : null) ||
+  safeStr(lead.phone_additional) ||
+  safeStr(lead.phone_number) ||
+  null;
 
-  const isFinal = hasAnyLeadInfo;
-  lead.decision_reason = decisionReason({ leadParsed: lead, hasCallerId, callerIdWithheld, hadAnyUserSpeech });
+const isFullLead = Boolean(safeStr(lead.full_name) && safeStr(lead.subject) && safeStr(leadPhoneE164));
 
-  const finalPayload = buildFinalPayload({
-    event: isFinal ? "FINAL" : "ABANDONED",
-    call,
-    lead,
-    recording,
-  });
+lead.decision_reason = isFullLead
+  ? "full_lead"
+  : (!hadAnyUserSpeech ? "no_user_speech" : (!safeStr(lead.full_name) ? "missing_name" : (!safeStr(lead.subject) ? "missing_subject" : "missing_phone")));
+
+// Enforce ABANDONED payload semantics (phone only)
+if (!isFullLead) {
+  lead.full_name = null;
+  lead.subject = null;
+  lead.reason = null;
+  lead.parsing_summary = null;
+  lead.phone_number = null;
+  lead.phone_additional = null;
+} else {
+  // Always store the lead phone in phone_additional for downstream CRM compatibility
+  lead.phone_additional = safeStr(leadPhoneE164) || null;
+}
+
+const finalPayload = buildFinalPayload({
+  event: isFullLead ? "FINAL" : "ABANDONED",
+  call,
+  lead,
+  recording,
+});
 
   // 5) Deliver FINAL / ABANDONED
   if (isFinal) {
