@@ -7,6 +7,8 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
+const { startCallRecording, publicRecordingUrl } = require("../utils/twilioRecordings");
+const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -180,102 +182,6 @@ function normalizeCallerId(caller) {
   return { value: s, withheld: digits.length < 5 };
 }
 
-function normalizeHebrewName(name) {
-  const n = (name || "").trim();
-  if (!n) return "";
-  // Collapse repeated Hebrew letters (e.g. "שיי" -> "שי")
-  if (/^[\u0590-\u05FF\s-]+$/.test(n)) {
-    return n.replace(/([\u0590-\u05FF])\1+/g, "$1");
-  }
-  return n;
-}
-
-function extractNameHe(text) {
-  const t = (text || "").trim();
-  if (!t) return "";
-
-  // Prefer explicit self-identification patterns.
-  // Examples:
-  //  - "קוראים לי שי" / "השם שלי שי" / "אני שי" / "מדבר שי"
-  //  - "השם שלי זה שי לא שגיא"  -> we should extract "שי"
-  const m = t.match(/(?:\b(?:קוראים\s*לי|השם\s*שלי(?:\s*זה)?|אני|מדבר|מדברת)\b)\s*([\u0590-\u05FF'"\-\s]{1,50})/);
-  if (m && m[1]) {
-    const raw = String(m[1]).trim();
-    const cleaned = stripNamePhrase(raw);
-
-    // Keep only the actual name tokens.
-    // Stop at common continuation words: "לא", "ו...", etc.
-    const tokens = cleaned.split(/\s+/).filter(Boolean);
-    const stopwords = new Set(["לא", "ול", "ולמסור", "וב", "וביקש", "וביקשת", "אבל", "ש", "זה"]);
-    const out = [];
-    for (const tok of tokens) {
-      if (stopwords.has(tok)) break;
-      // If token starts with 'ו' (and isn't a plausible name continuation) treat as stop.
-      if (tok.length > 1 && tok.startsWith("ו") && out.length > 0) break;
-      out.push(tok);
-      if (out.length >= 3) break;
-    }
-    return out.join(" ").trim();
-  }
-
-  return "";
-}
-
-
-function stripNamePhrases(text) {
-  let t = (text || "").trim();
-  if (!t) return "";
-  // Remove self-identification clauses to leave the actual request/message.
-  // "... קוראים לי שי" / "שמי שי" / "השם שלי שי" / "אני שי".
-  t = t.replace(/(?:,|\s)*(?:קוראים לי|שמי|השם שלי(?:\s+זה)?|אני)\s+[^\n,.!?]{1,40}/g, " ");
-  return t.replace(/\s+/g, " ").trim();
-}
-
-// Backward-compatible alias (older call-site used a singular name)
-function stripNamePhrase(text) {
-  return stripNamePhrases(text);
-}
-
-function extractNameDeterministic(text, { allowFallbackShortToken = false } = {}) {
-  const raw = (text || "").trim();
-  if (!raw) return "";
-
-  // Hebrew present -> use Hebrew extractor.
-  if (/[\u0590-\u05FF]/.test(raw)) return extractNameHe(raw);
-
-  // Common transliterations for "שי" seen from STT.
-  const cleaned = raw
-    .toLowerCase()
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/["'`.,!?;:()\[\]{}<>]/g, "")
-    .trim();
-
-  if (["shai", "sai", "sha", "shi", "shy", "şai", "şa", "šai"].includes(cleaned)) return "שי";
-
-  if (!allowFallbackShortToken) return "";
-
-  // Last resort: accept a short, non-numeric token/phrase.
-  const compact = raw.replace(/\s+/g, " ").trim();
-  if (!compact) return "";
-  if (/[0-9]/.test(compact)) return "";
-  if (compact.length > 30) return "";
-  const words = compact.split(/\s+/).filter(Boolean);
-  if (words.length > 3) return "";
-  if (/^\[?noise\]?$/i.test(compact)) return "";
-  return compact;
-}
-
-function extractPhone(text) {
-  const digits = (text || "").replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.length >= 9 && digits.length <= 13) {
-    if (digits.startsWith("972") && digits.length === 12) return `+${digits}`;
-    if (digits.startsWith("0") && digits.length === 10) return `+972${digits.slice(1)}`;
-    return digits;
-  }
-  return "";
-}
-
 function isTruthyEnv(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes" || s === "y";
@@ -290,7 +196,7 @@ async function safeJson(resp) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage4 dependencies (safe, best-effort)
+// Webhook delivery (best-effort)
 // -----------------------------------------------------------------------------
 
 async function deliverWebhook(url, payload, label) {
@@ -305,45 +211,6 @@ async function deliverWebhook(url, payload, label) {
   } catch (e) {
     logger.warn("Webhook delivery failed", { label, error: String(e) });
   }
-}
-
-async function twilioStartRecording(callSid) {
-  if (!callSid) return "";
-  if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) return "";
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return "";
-
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
-      env.TWILIO_ACCOUNT_SID
-    )}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
-
-    const body = new URLSearchParams();
-    body.set("RecordingStatusCallbackEvent", "completed");
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        authorization:
-          "Basic " +
-          Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
-        "content-type": "application/x-www-form-urlencoded"
-      },
-      body
-    });
-
-    const j = await safeJson(resp);
-    return j?.sid ? String(j.sid) : "";
-  } catch (e) {
-    logger.warn("Twilio startRecording failed", { callSid, error: String(e) });
-    return "";
-  }
-}
-
-function twilioPublicRecordingUrl(recordingSid) {
-  if (!recordingSid) return "";
-  const baseUrl = safeStr(env.PUBLIC_BASE_URL) || "";
-  if (!baseUrl) return "";
-  return `${baseUrl.replace(/\/+$/, "")}/recordings/${recordingSid}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -364,14 +231,13 @@ class GeminiLiveSession {
     this.closed = false;
     this._greetingSent = false;
 
-    // Transcript aggregation (readability only; decision does NOT depend on it)
+    // Transcript aggregation
     this._trBuf = { user: "", bot: "" };
     this._trLastChunk = { user: "", bot: "" };
     this._trTimer = { user: null, bot: null };
 
-    // Stage4 call state
+    // Call state (conversation log + metadata). Lead extraction is POST-CALL via LLM.
     const callerInfo = normalizeCallerId(this.meta?.caller || "");
-    const subjectMinWords = Number(this.ssot?.settings?.SUBJECT_MIN_WORDS ?? 3) || 3;
 
     this._call = {
       callSid: safeStr(this.meta?.callSid),
@@ -383,21 +249,12 @@ class GeminiLiveSession {
       started_at: nowIso(),
       ended_at: null,
 
-      // Lead fields (decision depends ONLY on these)
-      lead: {
-        full_name: "",
-        awaiting_name: false,
-        subject: "",
-        callback_to_number: callerInfo.withheld ? "" : callerInfo.value,
-        subject_min_words: subjectMinWords
-      },
+      // Conversation log (GilSport-style)
+      // { role: 'user'|'assistant', text: string, ts: iso }
+      conversationLog: [],
 
-      // transcript buffer for CRM parser later (not used for decision)
-      transcript: [],
-
-      // recording
+      // recording (best-effort)
       recording_sid: "",
-      recording_url_public: "",
 
       finalized: false
     };
@@ -413,8 +270,15 @@ class GeminiLiveSession {
       logger.info("Gemini Live WS connected", this.meta);
 
       // Recording: start best-effort (must NOT affect voice)
-      this._call.recording_sid = await twilioStartRecording(this._call.callSid);
-      this._call.recording_url_public = twilioPublicRecordingUrl(this._call.recording_sid);
+      try {
+        const r = await startCallRecording(this._call.callSid, logger);
+        if (r?.ok && r.recordingSid) {
+          this._call.recording_sid = String(r.recordingSid);
+          setRecordingForCall(this._call.callSid, { recordingSid: this._call.recording_sid });
+        }
+      } catch (e) {
+        logger.warn("startCallRecording failed", { err: String(e) });
+      }
 
       const systemText = buildSystemInstructionFromSSOT(this.ssot);
 
@@ -524,7 +388,7 @@ class GeminiLiveSession {
 
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
 
-      // Stage4 finalize: always best-effort, never throws outward
+      // Finalize: always best-effort, never throws outward
       await this._finalizeOnce("gemini_ws_close");
     });
 
@@ -562,13 +426,11 @@ class GeminiLiveSession {
 
     const nlp = normalizeUtterance(text);
 
-    // Arm deterministic name capture only when the bot explicitly asks for the name.
-    if (who === "bot") {
-      const t = (nlp.normalized || nlp.raw || "").toString();
-      if (/מה\s*השם/i.test(t)) {
-        this._call.lead.awaiting_name = true;
-      }
-    }
+    // Append to conversation log (GilSport-style)
+    try {
+      const role = who === "user" ? "user" : "assistant";
+      this._call.conversationLog.push({ role, text: nlp.raw, ts: nowIso() });
+    } catch { /* ignore */ }
 
     logger.info(`UTTERANCE ${who}`, {
       ...this.meta,
@@ -592,59 +454,8 @@ class GeminiLiveSession {
       });
     }
 
-    // ---- Stage4: capture lead fields deterministically (decision does NOT depend on transcript existence) ----
-    try {
-      this._call.transcript.push({
-        who,
-        text: nlp.raw,
-        normalized: nlp.normalized,
-        lang: nlp.lang,
-        ts: nowIso()
-      });
-
-      if (who === "user") {
-        const userText = (nlp.normalized || nlp.raw || "").trim();
-
-      // 1) Name capture: capture whenever we can, and allow explicit self-identification to override earlier mistakes.
-      {
-        const allowFallbackShortToken = !!this._call.lead.awaiting_name;
-        const explicitNamePhrase = /(קוראים לי|השם שלי|שמי|אני\s+)(?=\S)/.test(userText);
-        const name = extractNameDeterministic(userText, allowFallbackShortToken);
-        if (name) {
-          if (!this._call.lead.full_name || explicitNamePhrase) {
-            this._call.lead.full_name = name;
-            this._call.lead.awaiting_name = false;
-          }
-        }
-      }
-
-        // 2) Subject capture
-        // If the user says name + request in the same utterance ("... קוראים לי שי"), extract the request part.
-        if (this._call.lead.full_name && !this._call.lead.subject) {
-          const stripped = stripNamePhrase(userText);
-          const candidate = stripped || userText;
-
-          const words = candidate.split(/\s+/).filter(Boolean);
-          const minWords = this._call.lead.subject_min_words || 3;
-          if (words.length >= minWords && candidate.length >= 6) {
-            this._call.lead.subject = candidate.trim();
-          } else {
-            // Special-case common "call me back" requests so the lead isn't "empty".
-            if (/לחזור\s+אל(י|יי)|תחזור\s+אל(י|יי)|שיחזרו\s+אל(י|יי)|תתקשר(ו)?\s+אל(י|יי)/.test(candidate)) {
-              this._call.lead.subject = candidate.trim();
-            }
-          }
-        }
-
-        // 3) Callback number if withheld
-        if (this._call.caller_withheld && !this._call.lead.callback_to_number) {
-          const phone = extractPhone(userText);
-          if (phone) this._call.lead.callback_to_number = phone;
-        }
-      }
-    } catch (e) {
-      logger.debug("Stage4 lead capture failed", { error: String(e) });
-    }
+    // NOTE: deterministic lead capture removed by design.
+    // Lead extraction happens post-call via SSOT LEAD_PARSER_PROMPT.
 
     if (this.onTranscript) {
       this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
@@ -711,10 +522,6 @@ class GeminiLiveSession {
       this._call.ended_at = nowIso();
       const durationMs = Date.now() - new Date(this._call.started_at).getTime();
 
-      const transcriptText = this._call.transcript
-        .map((x) => `${String(x.who || "").toUpperCase()}: ${x.text}`)
-        .join("\n");
-
       const callMeta = {
         callSid: this._call.callSid,
         streamSid: this._call.streamSid,
@@ -740,15 +547,12 @@ class GeminiLiveSession {
 
       const snapshot = {
         call: callMeta,
-        lead: {
-          ...this._call.lead,
-          // Keep notes for now (you can later swap to crm_short summary in Stage4.2)
-          notes: transcriptText
-        }
+        conversationLog: this._call.conversationLog || []
       };
 
       await finalizePipeline({
         snapshot,
+        ssot: this.ssot,
         env,
         logger,
         senders: {
@@ -756,21 +560,25 @@ class GeminiLiveSession {
           sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
           sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
           resolveRecording: async () => {
-            const rec = await resolveTwilioRecordingPublic({
-              callSid: this._call.callSid,
-              publicBaseUrl: env.PUBLIC_BASE_URL,
-              twilioAccountSid: env.TWILIO_ACCOUNT_SID,
-              twilioAuthToken: env.TWILIO_AUTH_TOKEN,
-              enableRecording: env.MB_ENABLE_RECORDING,
-              logger
-            });
+            if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) {
+              return { recording_provider: null, recording_sid: null, recording_url_public: null };
+            }
+
+            // Wait a bit for Twilio callback to arrive (best-effort)
+            await waitForRecording(this._call.callSid, 12000);
+            const rec = getRecordingForCall(this._call.callSid);
+            const sid = safeStr(rec?.recordingSid || this._call.recording_sid) || null;
+            const url = sid ? publicRecordingUrl(sid) : null;
 
             // cache for later (best-effort)
-            if (rec?.recording_sid) this._call.recording_sid = rec.recording_sid;
-            if (rec?.recording_url_public) this._call.recording_url_public = rec.recording_url_public;
+            if (sid) this._call.recording_sid = sid;
 
-            return rec;
-          }
+            return {
+              recording_provider: sid ? "twilio" : null,
+              recording_sid: sid,
+              recording_url_public: url,
+            };
+          },
         }
       });
     } catch (e) {
@@ -779,7 +587,7 @@ class GeminiLiveSession {
   }
 
   stop() {
-    // Stage4: finalize (best-effort), then close Gemini WS.
+    // Finalize (best-effort), then close Gemini WS.
     this._finalizeOnce("stop_called").catch(() => {});
 
     if (!this.ws) return;
