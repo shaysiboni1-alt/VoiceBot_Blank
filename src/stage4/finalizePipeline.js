@@ -74,6 +74,86 @@ function decideEvent(lead) {
   return { event: "ABANDONED", decision_reason: "missing_phone" };
 }
 
+function uniq(arr) {
+  return Array.from(new Set(arr.filter(Boolean)));
+}
+
+function enhanceSubjectDeterministic({ subject, conversationLog }) {
+  const base = safeStr(subject);
+  const rows = Array.isArray(conversationLog) ? conversationLog : [];
+  const userText = rows
+    .filter((r) => String(r?.role || "") === "user")
+    .map((r) => String(r?.text || "").trim())
+    .filter(Boolean)
+    .join(" \n");
+
+  if (!userText) return base;
+
+  const t = userText.replace(/\s+/g, " ").trim();
+  const tl = t.toLowerCase();
+
+  const flags = {
+    reports: /(\bדוח|\bדוחות|דו"?חות)/.test(t),
+    vat: /(מע"?מ|מעמ)/.test(t),
+    incomeTax: /(מס\s*הכנסה)/.test(t),
+    urgent: /(דחוף|בהקדם)/.test(t),
+  };
+
+  // Years like 2024
+  const years = uniq((t.match(/\b(19|20)\d{2}\b/g) || []));
+
+  // Period fragments / ranges (keep as-is; do NOT guess)
+  const periodFragments = uniq((t.match(/\b\d{1,2}\s*-\s*\d{1,2}\b/g) || []).map((s) => s.replace(/\s+/g, "")));
+  const weirdFragments = uniq((t.match(/\b\d{2}\s*-\s*\d\b/g) || []).map((s) => s.replace(/\s+/g, "")));
+  const singleDigits = uniq((t.match(/\b\d\b/g) || []));
+
+  const parts = [];
+
+  // Build a richer subject (still concise) from what was actually said.
+  if (flags.reports) {
+    const taxParts = [];
+    if (flags.vat) taxParts.push('מע"מ');
+    if (flags.incomeTax) taxParts.push("מס הכנסה");
+    const taxStr = taxParts.length ? ` (${taxParts.join(" + ")})` : "";
+    parts.push(`דוחות${taxStr}`);
+  }
+
+  if (years.length) parts.push(`שנה/ים: ${years.join(", ")}`);
+
+  // If we have explicit ranges, prefer those. If we only have fragments like 20-2 + 5, keep them verbatim.
+  const allPeriods = uniq([...periodFragments, ...weirdFragments]);
+  if (allPeriods.length) {
+    parts.push(`תקופות: ${allPeriods.join(", ")}`);
+  } else {
+    // Only add single digits if there's context around "תקופות" to avoid noise.
+    if (tl.includes("תקופ") && singleDigits.length) {
+      parts.push(`תקופות (כפי שנאמר): ${singleDigits.join(", ")}`);
+    }
+  }
+
+  if (flags.urgent) parts.push("דחוף");
+
+  // If we built nothing new, keep as-is.
+  if (!parts.length) return base;
+
+  const enriched = parts.join(" – ");
+
+  // Merge with existing subject if it contains additional useful info.
+  if (base) {
+    const baseNorm = base.toLowerCase();
+    // If base already includes most of what we built, keep base.
+    const overlap = parts.every((p) => baseNorm.includes(p.toLowerCase().split(" ")[0]));
+    if (overlap && base.length >= enriched.length) return base;
+    // Otherwise: combine without duplicating.
+    if (baseNorm.includes("דוח") || baseNorm.includes("דוחות")) {
+      return `${base} – ${enriched}`.slice(0, 180);
+    }
+    return `${enriched} – ${base}`.slice(0, 180);
+  }
+
+  return enriched.slice(0, 180);
+}
+
 async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   const log = logger || console;
 
@@ -136,6 +216,12 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   }
 
   const parsedLead = normalizeParsedLead(parsedRaw || {}, call);
+
+  // Deterministic enrichment: make subject include key details actually said (without guessing).
+  parsedLead.subject = enhanceSubjectDeterministic({
+    subject: parsedLead.subject,
+    conversationLog,
+  });
 
   // 3) Payload base (shared by all webhooks)
   const payloadBase = {
