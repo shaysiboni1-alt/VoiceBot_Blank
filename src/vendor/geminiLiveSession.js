@@ -7,7 +7,7 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
-const { startCallRecording, publicRecordingUrl } = require("../utils/twilioRecordings");
+const { startCallRecording, publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
 const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
@@ -38,6 +38,20 @@ function liveWsUrl() {
 function safeStr(x) {
   if (x === undefined || x === null) return "";
   return String(x).trim();
+}
+
+function isClosingUtterance(text) {
+  const t = safeStr(text);
+  if (!t) return false;
+
+  // Hebrew closings
+  if (/(תודה\s*ו?להתראות|להתראות|ביי|נתראה)/.test(t)) return true;
+
+  // English closings
+  const tl = t.toLowerCase();
+  if (/(thank(s)?\b.*(bye|goodbye)|\bbye\b|\bgoodbye\b)/.test(tl)) return true;
+
+  return false;
 }
 
 function applyTemplate(tpl, vars) {
@@ -258,6 +272,9 @@ class GeminiLiveSession {
 
       finalized: false
     };
+
+    // Canonical: after CLOSING is fully spoken, we initiate hangup from our side.
+    this._hangupScheduled = false;
   }
 
   start() {
@@ -438,6 +455,19 @@ class GeminiLiveSession {
       normalized: nlp.normalized,
       lang: nlp.lang
     });
+
+    // Canonical: after the closing is spoken, initiate a proactive hangup.
+    // We only do this once per call, with a short delay to avoid cutting the audio.
+    if (who === "bot" && !this._hangupScheduled && isClosingUtterance(nlp.raw)) {
+      const callSid = safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
+      if (callSid) {
+        this._hangupScheduled = true;
+        setTimeout(() => {
+          hangupCall(callSid, logger).catch(() => {});
+        }, 1800);
+        logger.info("Proactive hangup scheduled", { ...this.meta, callSid, delay_ms: 1800 });
+      }
+    }
 
     if (who === "user") {
       const intent = detectIntent({
