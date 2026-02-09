@@ -87,6 +87,8 @@ const env = {
   // IMPORTANT: name locked by user; keep as-is. Used by ws/twilioMediaWs + stage4/twilioRecordings.
   MB_ENABLE_RECORDING: optBool("MB_ENABLE_RECORDING", false),
   FORCE_HANGUP_AFTER_CLOSE: optBool("FORCE_HANGUP_AFTER_CLOSE", true),
+  // Grace period before proactive hangup after a closing utterance (ms). User requested >= 15000.
+  HANGUP_AFTER_CLOSE_GRACE_MS: optInt("HANGUP_AFTER_CLOSE_GRACE_MS", 15000),
 
   // Voice (optional)
   VOICE_NAME_OVERRIDE: opt("VOICE_NAME_OVERRIDE", "Kore")
