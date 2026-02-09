@@ -35,7 +35,12 @@ async function waitForRecording(call_id, timeoutMs = 12000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const rec = getRecordingForCall(key);
-    if (rec.recordingSid || rec.recordingUrl) return rec;
+    // IMPORTANT:
+    // Twilio may return a RecordingSid immediately when recording is started,
+    // but the MP3 is not necessarily ready yet. The canonical completion signal
+    // we can rely on is RecordingUrl arriving via RecordingStatusCallback.
+    // לכן — מחכים ל-recordingUrl, ולא חוזרים מיד רק בגלל recordingSid.
+    if (rec.recordingUrl) return rec;
     await new Promise((r) => setTimeout(r, 250));
   }
   return getRecordingForCall(key);
