@@ -55,41 +55,29 @@ async function ensureCallerMemorySchema() {
   const p = getPool();
   if (!p) return;
 
-  // If a legacy `caller_profiles` table exists without the expected `caller_id`
-  // column, every read/write will fail. CREATE TABLE IF NOT EXISTS does not
-  // repair an existing incompatible table, so we rename it out of the way and
-  // create a fresh one.
+  // If a previous deploy created a different schema (common during iteration),
+  // we'll detect it and reset the table. Caller memory is a cache, so this is safe.
   try {
-    const reg = await withTimeout(
-      p.query("SELECT to_regclass('public.caller_profiles') AS reg"),
+    const { rows } = await withTimeout(
+      p.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'caller_profiles'`
+      ),
       2_000
     );
-    const exists = Boolean(reg?.rows?.[0]?.reg);
-    if (exists) {
-      const col = await withTimeout(
-        p.query(
-          "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='caller_profiles' AND column_name='caller_id' LIMIT 1"
-        ),
-        2_000
-      );
-      const hasCallerId = (col?.rows?.length || 0) > 0;
-      if (!hasCallerId) {
-        const legacyName = `caller_profiles_legacy_${Date.now()}`;
-        await withTimeout(
-          p.query(`ALTER TABLE caller_profiles RENAME TO "${legacyName}"`),
-          3_000
-        );
-        logger.warn('Caller memory: renamed legacy caller_profiles table', {
-          legacy_table: legacyName,
-        });
-      }
+
+    const cols = new Set((rows || []).map(r => String(r.column_name || '').toLowerCase()));
+    if (cols.size > 0 && !cols.has('caller_id')) {
+      logger.warn('Caller memory schema mismatch (missing caller_id); dropping caller_profiles', {
+        columns: Array.from(cols).sort(),
+      });
+      await withTimeout(p.query('DROP TABLE IF EXISTS caller_profiles;'), 2_000);
     }
   } catch (e) {
-    // Do not block the call flow if this check fails; schema creation below may
-    // still succeed.
-    logger.warn('Caller memory schema precheck failed', {
-      error: e?.message || String(e),
-    });
+    // If probing fails, don't block call flow.
+    logger.warn('Caller memory schema probe failed', { error: String(e?.message || e) });
   }
 
   // Keep schema minimal, but also support in-place upgrades if an older
@@ -156,10 +144,7 @@ async function getCallerProfile(callerId) {
     if (!rows || rows.length === 0) return null;
     return rows[0];
   } catch (err) {
-    (typeof logger.debug === 'function' ? logger.debug : logger.warn)(
-      'Caller memory read failed',
-      { error: String(err?.message || err) }
-    );
+    logger.debug('Caller memory read failed', { error: String(err?.message || err) });
     return null;
   }
 }
@@ -206,10 +191,7 @@ async function upsertCallerProfile(callerId, patch = {}) {
     await withTimeout(p.query(sql, params));
     return true;
   } catch (err) {
-    (typeof logger.debug === 'function' ? logger.debug : logger.warn)(
-      'Caller memory write failed',
-      { error: String(err?.message || err) }
-    );
+    logger.debug('Caller memory write failed', { error: String(err?.message || err) });
     return false;
   }
 }
