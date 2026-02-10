@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-const logger = require('../utils/logger');
+const { logger } = require('../utils/logger');
 
 // Caller Memory (Postgres)
 // Goals:
@@ -55,7 +55,8 @@ async function ensureCallerMemorySchema() {
   const p = getPool();
   if (!p) return;
 
-  // Keep schema minimal and backwards compatible.
+  // Keep schema minimal, but also support in-place upgrades if an older
+  // table exists (Render Postgres persists across deploys).
   const sql = `
     CREATE TABLE IF NOT EXISTS caller_profiles (
       caller_id TEXT PRIMARY KEY,
@@ -65,6 +66,30 @@ async function ensureCallerMemorySchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS display_name TEXT;
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS meta JSONB;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN meta SET DEFAULT '{}'::jsonb;
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN created_at SET DEFAULT NOW();
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN updated_at SET DEFAULT NOW();
 
     CREATE INDEX IF NOT EXISTS caller_profiles_last_seen_idx
       ON caller_profiles(last_seen DESC);
@@ -77,7 +102,7 @@ async function getCallerProfile(callerId) {
   const p = getPool();
   if (!p) return null;
 
-  const cid = (callerId || '').trim();
+  const cid = String(callerId || '').trim();
   if (!cid) return null;
 
   try {
@@ -108,14 +133,7 @@ async function upsertCallerProfile(callerId, patch = {}) {
   const p = getPool();
   if (!p) return false;
 
-  // Backward/forward compatibility:
-  // - older call sites pass a string callerId
-  // - newer call sites may accidentally pass an object (e.g., full FINAL payload)
-  let cidRaw = callerId;
-  if (cidRaw && typeof cidRaw === 'object') {
-    cidRaw = cidRaw.caller_id || cidRaw.callerId || cidRaw.caller || cidRaw.phone || '';
-  }
-  const cid = String(cidRaw || '').trim();
+  const cid = String(callerId || '').trim();
   if (!cid) return false;
 
   const displayName = (patch.display_name ?? null);
