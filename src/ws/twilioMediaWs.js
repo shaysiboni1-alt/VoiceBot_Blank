@@ -41,7 +41,8 @@ function installTwilioMediaWs(server) {
       } catch {}
     }
 
-    twilioWs.on("message", (data) => {
+    // NOTE: must be async because we may await caller-memory lookups (Postgres).
+    twilioWs.on("message", async (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
