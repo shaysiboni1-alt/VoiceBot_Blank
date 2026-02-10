@@ -14,6 +14,9 @@ const { twilioStatusRouter } = require("./routes/twilioStatus");
 const { loadSSOT } = require("./ssot/ssotClient");
 const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
 
+// Optional Postgres (caller memory). Enabled automatically when DATABASE_URL is present.
+const { ensureSchema: ensureCallerMemorySchema } = require("./memory/callerMemory");
+
 // Lead/Recording support (does not affect audio pipeline)
 const { setRecordingForCall } = require("./utils/recordingRegistry");
 const { proxyRecordingMp3 } = require("./utils/twilioRecordings");
@@ -90,6 +93,15 @@ const server = app.listen(env.PORT, "0.0.0.0", async () => {
     await loadSSOT(false);
   } catch (err) {
     logger.error("SSOT preload failed", { error: err?.message || String(err) });
+  }
+
+  // Best-effort init caller-memory schema (must never block service start)
+  try {
+    await ensureCallerMemorySchema();
+  } catch (err) {
+    logger.warn("Caller memory schema init failed", {
+      error: err?.message || String(err)
+    });
   }
 });
 
