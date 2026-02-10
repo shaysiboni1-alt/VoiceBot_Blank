@@ -47,9 +47,9 @@ function getPool() {
   if (_pool) return _pool;
 
   const connectionString = process.env.DATABASE_URL || process.env.DATABASE;
-  if (!connectionString) {
-    throw new Error('DATABASE_URL (or DATABASE) env var is missing');
-  }
+  // Caller-memory is optional. If DB is not configured, return null and let
+  // the runtime continue without memory.
+  if (!connectionString) return null;
 
   const ssl = buildSslOption(connectionString);
 
@@ -65,4 +65,17 @@ function getPool() {
   return _pool;
 }
 
-module.exports = { getPool };
+function hasDb() {
+  return Boolean(process.env.DATABASE_URL || process.env.DATABASE);
+}
+
+function withTimeout(promise, ms, label = 'db') {
+  if (!ms || ms <= 0) return promise;
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+module.exports = { getPool, hasDb, withTimeout };

@@ -63,4 +63,7 @@ module.exports = {
   getCallerMemory,
   getCallerMemoryFast,
   upsertCallerMemory,
+  // Backwards-compatible aliases (older call sites)
+  getCallerProfile: getCallerMemory,
+  upsertCallerProfile: upsertCallerMemory,
 };
