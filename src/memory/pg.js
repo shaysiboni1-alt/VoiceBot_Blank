@@ -1,58 +1,57 @@
-const { Pool } = require('pg');
+"use strict";
 
-let _pool = null;
+const { Pool } = require("pg");
 
-function hasDb() {
-  return !!process.env.DATABASE_URL;
+// Create a singleton Pool.
+// Notes:
+// - Render Postgres commonly requires TLS; we default to ssl={rejectUnauthorized:false}
+//   unless explicitly disabled via PGSSL_DISABLE=true.
+// - We accept DATABASE_URL (preferred) and DATABASE as a fallback.
+
+let pool = null;
+
+function parseBool(v) {
+  if (v == null) return false;
+  return String(v).toLowerCase() === "true" || String(v) === "1";
 }
 
-function shouldEnableSsl(connectionString) {
-  const forceSsl = (process.env.PGSSL || '').toLowerCase() === 'true';
-  const urlWantsSsl = /sslmode=require/i.test(connectionString);
+function getConnectionString() {
+  return process.env.DATABASE_URL || process.env.DATABASE || null;
+}
 
-  // Render Postgres hostnames usually start with "dpg-" and require SSL when accessed externally.
-  const looksLikeRenderPostgres = /\/\/[^@]+@dpg-[^/]+/i.test(connectionString);
-
-  // Render sets environment variables like RENDER and RENDER_SERVICE_ID.
-  const isRenderRuntime = !!process.env.RENDER || !!process.env.RENDER_SERVICE_ID || !!process.env.RENDER_INSTANCE_ID;
-
-  return forceSsl || urlWantsSsl || looksLikeRenderPostgres || isRenderRuntime;
+function shouldUseSSL(connStr) {
+  if (parseBool(process.env.PGSSL_DISABLE)) return false;
+  // If URL explicitly requests sslmode, respect it.
+  if (connStr && /sslmode=require/i.test(connStr)) return true;
+  // Default to true to work on hosted Postgres providers.
+  return true;
 }
 
 function getPool() {
-  if (!hasDb()) return null;
-  if (_pool) return _pool;
+  if (pool) return pool;
 
-  const url = process.env.DATABASE_URL;
-  const sslEnabled = shouldEnableSsl(url);
-
-  const ssl = sslEnabled ? { rejectUnauthorized: false } : undefined;
-
-  _pool = new Pool({
-    connectionString: url,
-    ssl,
-    max: 5,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 5_000,
-  });
-
-  return _pool;
-}
-
-async function withTimeout(promise, ms, label = 'timeout') {
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(label)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(t);
+  const connectionString = getConnectionString();
+  if (!connectionString) {
+    throw new Error("Missing DATABASE_URL (or DATABASE) env var for Postgres memory store");
   }
+
+  const ssl = shouldUseSSL(connectionString) ? { rejectUnauthorized: false } : undefined;
+
+  pool = new Pool({
+    connectionString,
+    ssl,
+    max: Number(process.env.PG_POOL_MAX || 5),
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 10_000),
+    connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS || 5_000),
+  });
+
+  pool.on("error", (err) => {
+    // Avoid crashing the process, but surface the issue in logs upstream.
+    // This event fires for idle clients errors.
+    // We keep it quiet here; callers should log failures per operation.
+  });
+
+  return pool;
 }
 
-module.exports = {
-  hasDb,
-  getPool,
-  withTimeout,
-};
+module.exports = { getPool };
