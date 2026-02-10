@@ -59,7 +59,7 @@ function extractPhone(text) {
   return "";
 }
 
-function createPassiveCallContext({ callSid, streamSid, caller, called, source }) {
+function createPassiveCallContext({ callSid, streamSid, caller, called, source, caller_profile }) {
   const callerInfo = normalizeCallerId(caller);
 
   return {
@@ -71,6 +71,12 @@ function createPassiveCallContext({ callSid, streamSid, caller, called, source }
     called: called || "",
     started_at: nowIso(),
     ended_at: null,
+
+    // Optional caller recognition (DB-backed)
+    returning_caller: !!caller_profile,
+    returning_name: caller_profile?.full_name || "",
+    returning_last_subject: caller_profile?.last_subject || "",
+    returning_last_ended_at: caller_profile?.last_ended_at || null,
 
     // Lead fields
     name: "",
@@ -126,8 +132,34 @@ function finalizeCtx(ctx) {
   return ctx;
 }
 
+// Backwards-compatible helper expected by geminiLiveSession.
+// Produces the passive context object that is injected into prompts/webhooks.
+function buildPassiveContext({ meta, ssot }) {
+  const callMeta = meta || {};
+  const ctx = createPassiveCallContext({
+    callSid: callMeta.callSid,
+    streamSid: callMeta.streamSid,
+    caller: callMeta.caller,
+    called: callMeta.called,
+    source: callMeta.source,
+    caller_profile: callMeta.caller_profile || null,
+  });
+
+  // Attach start time if available
+  if (callMeta.startTs) ctx.started_at = new Date(callMeta.startTs).toISOString();
+
+  // Also expose a small settings context (no secrets)
+  if (ssot && typeof ssot.getSetting === "function") {
+    ctx.time_zone = ssot.getSetting("TIME_ZONE") || null;
+    ctx.supported_languages = ssot.getSetting("SUPPORTED_LANGUAGES") || null;
+  }
+
+  return ctx;
+}
+
 module.exports = {
   createPassiveCallContext,
+  buildPassiveContext,
   appendUtterance,
   finalizeCtx,
 };
