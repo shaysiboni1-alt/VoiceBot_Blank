@@ -271,7 +271,13 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         callSid: finalPayload?.call?.callSid,
       });
     } catch (e) {
-      log.debug?.("Caller memory update failed", e?.message || e);
+      log.debug?.("Caller memory update failed", {
+        message: e?.message || String(e),
+        code: e?.code,
+        detail: e?.detail,
+        hint: e?.hint,
+        where: e?.where,
+      });
     }
   } else {
     if (env.ABANDONED_WEBHOOK_URL && typeof senders?.sendAbandoned === "function") {
@@ -288,7 +294,13 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         callSid: finalPayload?.call?.callSid,
       });
     } catch (e) {
-      log.debug?.("Caller memory update failed", e?.message || e);
+      log.debug?.("Caller memory update failed", {
+        message: e?.message || String(e),
+        code: e?.code,
+        detail: e?.detail,
+        hint: e?.hint,
+        where: e?.where,
+      });
     }
   }
 

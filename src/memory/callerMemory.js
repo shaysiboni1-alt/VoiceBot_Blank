@@ -1,83 +1,66 @@
-"use strict";
+const { getPool, hasDb, withTimeout } = require('./pg');
 
-const { getPool } = require("./pg");
-const { logger } = require("../utils/logger");
+// Lightweight caller "memory" to support caller recognition.
+// No new ENV flags: if DATABASE_URL is present, memory is enabled.
 
-// Simple caller memory store in Postgres.
-// Table: caller_profiles(caller TEXT PRIMARY KEY, profile_json JSONB, updated_at TIMESTAMPTZ)
-
-let _initPromise = null;
-
-async function ensureSchema(pool) {
+async function ensureSchema() {
+  if (!hasDb()) return;
+  const pool = getPool();
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS caller_profiles (
-      caller TEXT PRIMARY KEY,
-      profile_json JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS caller_memory (
+      caller_e164 TEXT PRIMARY KEY,
+      last_full_name TEXT NULL,
+      last_subject TEXT NULL,
+      last_notes TEXT NULL,
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 }
 
-async function ensureInitialized() {
-  if (_initPromise) return _initPromise;
-
+async function getCallerMemory(callerE164) {
+  if (!hasDb() || !callerE164) return null;
   const pool = getPool();
-  _initPromise = ensureSchema(pool).catch((err) => {
-    // Reset so we can retry later if transient.
-    _initPromise = null;
-    throw err;
-  });
-
-  return _initPromise;
+  const res = await pool.query(
+    `SELECT caller_e164, last_full_name, last_subject, last_notes, last_seen_at
+     FROM caller_memory
+     WHERE caller_e164 = $1
+     LIMIT 1`,
+    [callerE164]
+  );
+  return res.rows[0] || null;
 }
 
-async function getCallerProfile(caller) {
-  if (!caller) return null;
+async function upsertCallerMemory({ callerE164, fullName, subject, notes }) {
+  if (!hasDb() || !callerE164) return;
+  const pool = getPool();
 
+  // We only overwrite fields when we actually have data.
+  await pool.query(
+    `INSERT INTO caller_memory (caller_e164, last_full_name, last_subject, last_notes, last_seen_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (caller_e164)
+     DO UPDATE SET
+       last_full_name = COALESCE(EXCLUDED.last_full_name, caller_memory.last_full_name),
+       last_subject = COALESCE(EXCLUDED.last_subject, caller_memory.last_subject),
+       last_notes = COALESCE(EXCLUDED.last_notes, caller_memory.last_notes),
+       last_seen_at = NOW()`,
+    [callerE164, fullName || null, subject || null, notes || null]
+  );
+}
+
+async function getCallerMemoryFast(callerE164, timeoutMs = 150) {
+  if (!hasDb() || !callerE164) return null;
   try {
-    await ensureInitialized();
-    const pool = getPool();
-    const res = await pool.query(
-      "SELECT profile_json FROM caller_profiles WHERE caller=$1",
-      [caller]
-    );
-    return res.rows?.[0]?.profile_json ?? null;
-  } catch (err) {
-    logger.debug("Caller memory get failed", {
-      caller,
-      err: String(err?.message || err),
-    });
+    return await withTimeout(getCallerMemory(callerE164), timeoutMs, 'caller_memory_timeout');
+  } catch {
     return null;
   }
 }
 
-async function upsertCallerProfile(caller, profile) {
-  if (!caller || !profile) return false;
-
-  try {
-    await ensureInitialized();
-    const pool = getPool();
-    await pool.query(
-      `
-      INSERT INTO caller_profiles (caller, profile_json, updated_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (caller) DO UPDATE
-        SET profile_json = EXCLUDED.profile_json,
-            updated_at = NOW()
-      `,
-      [caller, profile]
-    );
-    return true;
-  } catch (err) {
-    logger.debug("Caller memory upsert failed", {
-      caller,
-      err: String(err?.message || err),
-    });
-    return false;
-  }
-}
-
 module.exports = {
-  getCallerProfile,
-  upsertCallerProfile,
+  ensureSchema,
+  getCallerMemory,
+  getCallerMemoryFast,
+  upsertCallerMemory,
 };
