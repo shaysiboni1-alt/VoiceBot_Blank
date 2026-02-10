@@ -98,6 +98,7 @@ const server = app.listen(env.PORT, "0.0.0.0", async () => {
   // Best-effort init caller-memory schema (must never block service start)
   try {
     await ensureCallerMemorySchema();
+    logger.info("Caller memory schema ready");
   } catch (err) {
     logger.warn("Caller memory schema init failed", {
       error: err?.message || String(err)

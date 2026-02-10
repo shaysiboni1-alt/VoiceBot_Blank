@@ -1,93 +1,157 @@
-// Caller memory is OPTIONAL. We load the DB helper defensively so the service
-// never breaks if the DB helper is missing or exported in an unexpected shape.
-const pgMod = require('./pg');
+const { Pool } = require('pg');
+const logger = require('../utils/logger');
 
-// Support both shapes:
-// 1) module.exports = { getPool, hasDb, withTimeout }
-// 2) module.exports = getPool (or any other function/object)
-// In all cases, we expose safe fallbacks.
-// If the helper isn't present, we treat DB as unavailable (even if DATABASE_URL exists),
-// because we can't safely operate without a pool.
-const _hasPoolHelper = typeof pgMod.getPool === 'function';
-const getPool = _hasPoolHelper ? pgMod.getPool : (() => null);
+// Caller Memory (Postgres)
+// Goals:
+// - Never break the runtime if DB is missing/unavailable.
+// - Stable API: ensureCallerMemorySchema / getCallerProfile / upsertCallerProfile
+// - Use short timeouts so DB work never blocks call flow.
 
-// withTimeout helper signature in this repo is: withTimeout(label, ms, fn)
-const withTimeout = (typeof pgMod.withTimeout === 'function')
-  ? pgMod.withTimeout
-  : async (_label, _ms, fn) => fn();
+const DEFAULT_TIMEOUT_MS = 1500;
 
-const hasDb = (typeof pgMod.hasDb === 'function')
-  ? pgMod.hasDb
-  : () => (_hasPoolHelper && Boolean(process.env.DATABASE_URL));
+let pool = null;
 
-// Lightweight caller "memory" to support caller recognition.
-// No new ENV flags: if DATABASE_URL is present, memory is enabled.
-
-async function ensureSchema() {
-  if (!hasDb()) return;
-  const pool = getPool();
-  if (!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS caller_memory (
-      caller_e164 TEXT PRIMARY KEY,
-      last_full_name TEXT NULL,
-      last_subject TEXT NULL,
-      last_notes TEXT NULL,
-      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+function hasDb() {
+  return Boolean(process.env.DATABASE_URL && String(process.env.DATABASE_URL).trim());
 }
 
-async function getCallerMemory(callerE164) {
-  if (!hasDb() || !callerE164) return null;
-  const pool = getPool();
-  if (!pool) return null;
-  const res = await pool.query(
-    `SELECT caller_e164, last_full_name, last_subject, last_notes, last_seen_at
-     FROM caller_memory
-     WHERE caller_e164 = $1
-     LIMIT 1`,
-    [callerE164]
-  );
-  return res.rows[0] || null;
+function getPool() {
+  if (!hasDb()) return null;
+  if (pool) return pool;
+
+  // Render Postgres usually requires SSL; local dev often doesn't.
+  const ssl = process.env.PGSSLMODE === 'disable'
+    ? false
+    : { rejectUnauthorized: false };
+
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl,
+    max: 3,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 2_000,
+  });
+
+  pool.on('error', (err) => {
+    logger.warn('Caller memory pool error', { error: String(err?.message || err) });
+  });
+
+  return pool;
 }
 
-async function upsertCallerMemory({ callerE164, fullName, subject, notes }) {
-  if (!hasDb() || !callerE164) return;
-  const pool = getPool();
-  if (!pool) return;
-
-  // We only overwrite fields when we actually have data.
-  await pool.query(
-    `INSERT INTO caller_memory (caller_e164, last_full_name, last_subject, last_notes, last_seen_at)
-     VALUES ($1, $2, $3, $4, NOW())
-     ON CONFLICT (caller_e164)
-     DO UPDATE SET
-       last_full_name = COALESCE(EXCLUDED.last_full_name, caller_memory.last_full_name),
-       last_subject = COALESCE(EXCLUDED.last_subject, caller_memory.last_subject),
-       last_notes = COALESCE(EXCLUDED.last_notes, caller_memory.last_notes),
-       last_seen_at = NOW()`,
-    [callerE164, fullName || null, subject || null, notes || null]
-  );
-}
-
-async function getCallerMemoryFast(callerE164, timeoutMs = 150) {
-  if (!hasDb() || !callerE164) return null;
+async function withTimeout(promise, ms = DEFAULT_TIMEOUT_MS) {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`timeout_after_${ms}ms`)), ms);
+  });
   try {
-    // withTimeout signature: (label, ms, fn)
-    return await withTimeout('caller_memory_timeout', timeoutMs, () => getCallerMemory(callerE164));
-  } catch {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function ensureCallerMemorySchema() {
+  const p = getPool();
+  if (!p) return;
+
+  // Keep schema minimal and backwards compatible.
+  const sql = `
+    CREATE TABLE IF NOT EXISTS caller_profiles (
+      caller_id TEXT PRIMARY KEY,
+      display_name TEXT,
+      last_seen TIMESTAMPTZ,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS caller_profiles_last_seen_idx
+      ON caller_profiles(last_seen DESC);
+  `;
+
+  await withTimeout(p.query(sql), 3_000);
+}
+
+async function getCallerProfile(callerId) {
+  const p = getPool();
+  if (!p) return null;
+
+  const cid = (callerId || '').trim();
+  if (!cid) return null;
+
+  try {
+    const { rows } = await withTimeout(
+      p.query(
+        `SELECT caller_id, display_name, last_seen, meta
+         FROM caller_profiles
+         WHERE caller_id = $1
+         LIMIT 1`,
+        [cid]
+      )
+    );
+
+    if (!rows || rows.length === 0) return null;
+    return rows[0];
+  } catch (err) {
+    logger.debug('Caller memory read failed', { error: String(err?.message || err) });
     return null;
   }
 }
 
+/**
+ * Upsert profile.
+ * @param {string} callerId
+ * @param {{ display_name?: string|null, meta_patch?: object|null }} patch
+ */
+async function upsertCallerProfile(callerId, patch = {}) {
+  const p = getPool();
+  if (!p) return false;
+
+  const cid = (callerId || '').trim();
+  if (!cid) return false;
+
+  const displayName = (patch.display_name ?? null);
+  const metaPatch = (patch.meta_patch && typeof patch.meta_patch === 'object') ? patch.meta_patch : null;
+
+  // jsonb merge: meta = meta || metaPatch
+  const metaExpr = metaPatch ? 'caller_profiles.meta || $3::jsonb' : 'caller_profiles.meta';
+  const params = metaPatch ? [cid, displayName, JSON.stringify(metaPatch)] : [cid, displayName];
+
+  const sql = metaPatch
+    ? `
+      INSERT INTO caller_profiles (caller_id, display_name, last_seen, meta)
+      VALUES ($1, $2, NOW(), $3::jsonb)
+      ON CONFLICT (caller_id) DO UPDATE SET
+        display_name = COALESCE(EXCLUDED.display_name, caller_profiles.display_name),
+        last_seen = NOW(),
+        meta = ${metaExpr},
+        updated_at = NOW();
+    `
+    : `
+      INSERT INTO caller_profiles (caller_id, display_name, last_seen)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (caller_id) DO UPDATE SET
+        display_name = COALESCE(EXCLUDED.display_name, caller_profiles.display_name),
+        last_seen = NOW(),
+        updated_at = NOW();
+    `;
+
+  try {
+    await withTimeout(p.query(sql, params));
+    return true;
+  } catch (err) {
+    logger.debug('Caller memory write failed', { error: String(err?.message || err) });
+    return false;
+  }
+}
+
 module.exports = {
-  ensureSchema,
-  getCallerMemory,
-  getCallerMemoryFast,
-  upsertCallerMemory,
-  // Backwards-compatible aliases (older call sites)
-  getCallerProfile: getCallerMemory,
-  upsertCallerProfile: upsertCallerMemory,
+  ensureCallerMemorySchema,
+  getCallerProfile,
+  upsertCallerProfile,
+  // exported for diagnostics
+  hasDb,
+  getPool,
+  withTimeout,
 };
