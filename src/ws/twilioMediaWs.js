@@ -41,8 +41,7 @@ function installTwilioMediaWs(server) {
       } catch {}
     }
 
-    // ✅ FIX: callback is async so "await" is legal
-    twilioWs.on("message", async (data) => {
+    twilioWs.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));

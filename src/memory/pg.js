@@ -6,18 +6,27 @@ function hasDb() {
   return !!process.env.DATABASE_URL;
 }
 
+function shouldEnableSsl(connectionString) {
+  const forceSsl = (process.env.PGSSL || '').toLowerCase() === 'true';
+  const urlWantsSsl = /sslmode=require/i.test(connectionString);
+
+  // Render Postgres hostnames usually start with "dpg-" and require SSL when accessed externally.
+  const looksLikeRenderPostgres = /\/\/[^@]+@dpg-[^/]+/i.test(connectionString);
+
+  // Render sets environment variables like RENDER and RENDER_SERVICE_ID.
+  const isRenderRuntime = !!process.env.RENDER || !!process.env.RENDER_SERVICE_ID || !!process.env.RENDER_INSTANCE_ID;
+
+  return forceSsl || urlWantsSsl || looksLikeRenderPostgres || isRenderRuntime;
+}
+
 function getPool() {
   if (!hasDb()) return null;
   if (_pool) return _pool;
 
   const url = process.env.DATABASE_URL;
-  const forceSsl = (process.env.PGSSL || '').toLowerCase() === 'true';
-  const urlWantsSsl = /sslmode=require/i.test(url);
+  const sslEnabled = shouldEnableSsl(url);
 
-  // Managed Postgres commonly needs SSL. When in doubt, enable it.
-  const ssl = (forceSsl || urlWantsSsl)
-    ? { rejectUnauthorized: false }
-    : undefined;
+  const ssl = sslEnabled ? { rejectUnauthorized: false } : undefined;
 
   _pool = new Pool({
     connectionString: url,
