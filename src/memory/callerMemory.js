@@ -108,7 +108,14 @@ async function upsertCallerProfile(callerId, patch = {}) {
   const p = getPool();
   if (!p) return false;
 
-  const cid = (callerId || '').trim();
+  // Backward/forward compatibility:
+  // - older call sites pass a string callerId
+  // - newer call sites may accidentally pass an object (e.g., full FINAL payload)
+  let cidRaw = callerId;
+  if (cidRaw && typeof cidRaw === 'object') {
+    cidRaw = cidRaw.caller_id || cidRaw.callerId || cidRaw.caller || cidRaw.phone || '';
+  }
+  const cid = String(cidRaw || '').trim();
   if (!cid) return false;
 
   const displayName = (patch.display_name ?? null);

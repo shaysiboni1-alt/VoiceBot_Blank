@@ -70,7 +70,15 @@ function decideEvent(lead) {
   const hasName = !!safeStr(lead?.full_name);
   const hasSubject = !!safeStr(lead?.subject);
 
-  if (hasPhone && hasName && hasSubject) return { event: "FINAL", decision_reason: "ok" };
+  // FINAL policy (deterministic):
+  // We require at least two strong lead signals. For this bot, a “message/callback” flow
+  // is considered a valid FINAL even if the model didn't produce a perfect subject.
+  const score = (hasPhone ? 1 : 0) + (hasName ? 1 : 0) + (hasSubject ? 1 : 0);
+  if (score >= 2) {
+    const reason = hasPhone && hasName && hasSubject ? "ok" : "partial_but_sufficient";
+    return { event: "FINAL", decision_reason: reason };
+  }
+
   if (hasPhone) return { event: "ABANDONED", decision_reason: "phone_only" };
   return { event: "ABANDONED", decision_reason: "missing_phone" };
 }
@@ -109,6 +117,14 @@ function enhanceSubjectDeterministic({ subject, conversationLog }) {
   const singleDigits = uniq((t.match(/\b\d\b/g) || []));
 
   const parts = [];
+
+  // Common deterministic “message / callback” phrases for this bot.
+  // We prefer stable labels over inventing details.
+  const callbackRequested = /(לחזור אלי|לחזור אליי|שיחזור אלי|שיחזור אליי|תחזרי אלי|תחזרי אליי|שיחה חוזרת|בקשת חזרה|תתקשר אלי|תתקשר אליי|תתקשרו אלי|תתקשרו אליי|callback|call\s*back)/i.test(t);
+  const messageRequested = /(למסור|תמסרי|תמסור|שימסרו|שימסר|הודעה)/i.test(t);
+
+  if (callbackRequested) parts.push("בקשת חזרה");
+  if (!callbackRequested && messageRequested) parts.push("בקשה למסור הודעה");
 
   // Build a richer subject (still concise) from what was actually said.
   if (flags.reports) {

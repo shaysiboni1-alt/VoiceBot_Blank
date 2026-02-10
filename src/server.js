@@ -15,7 +15,7 @@ const { loadSSOT } = require("./ssot/ssotClient");
 const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
 
 // Optional Postgres (caller memory). Enabled automatically when DATABASE_URL is present.
-const { ensureSchema: ensureCallerMemorySchema } = require("./memory/callerMemory");
+const { ensureCallerMemorySchema } = require("./memory/callerMemory");
 
 // Lead/Recording support (does not affect audio pipeline)
 const { setRecordingForCall } = require("./utils/recordingRegistry");
