@@ -161,7 +161,11 @@ function computeGreetingHebrew(timeZone) {
 
 function getOpeningScriptFromSSOT(ssot, vars) {
   const settings = ssot?.settings || {};
-  const tpl = safeStr(settings.OPENING_SCRIPT) || "שלום! איך נוכל לעזור?";
+  // If the caller is recognized (returning caller), prefer OPENING_SCRIPT_RETURNING when available.
+  const isReturning = Boolean(vars?.RETURNING_CALLER) || Boolean(vars?.returning_caller);
+  const returningTpl = safeStr(settings.OPENING_SCRIPT_RETURNING);
+  const defaultTpl = safeStr(settings.OPENING_SCRIPT);
+  const tpl = (isReturning && returningTpl) ? returningTpl : (defaultTpl || "שלום! איך נוכל לעזור?");
 
   const merged = {
     BUSINESS_NAME: safeStr(settings.BUSINESS_NAME),
@@ -504,7 +508,18 @@ class GeminiLiveSession {
     const tz = env.TIME_ZONE || "Asia/Jerusalem";
     const greeting = computeGreetingHebrew(tz);
 
-    const opening = getOpeningScriptFromSSOT(this.ssot, { GREETING: greeting });
+    const callerProfile = this.meta?.caller_profile || null;
+    const callerName = safeStr(callerProfile?.display_name) || "";
+    // Consider "returning" when we have a stored name and this isn't the first ever call.
+    const totalCalls = Number(callerProfile?.total_calls || 0);
+    const isReturning = Boolean(callerName) && totalCalls > 0;
+
+    const opening = getOpeningScriptFromSSOT(this.ssot, {
+      GREETING: greeting,
+      CALLER_NAME: callerName,
+      returning_caller: isReturning,
+      RETURNING_CALLER: isReturning
+    });
 
     const userKickoff =
       `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n` +
