@@ -9,6 +9,8 @@ const { startCallRecording } = require("../utils/twilioRecordings");
 const { setRecordingForCall } = require("../utils/recordingRegistry");
 const { getSSOT } = require("../ssot/ssotClient");
 
+const { getCallerProfile } = require("../memory/callerMemory");
+
 function installTwilioMediaWs(server) {
   const wss = new WebSocket.Server({ noServer: true });
 
@@ -81,14 +83,24 @@ function installTwilioMediaWs(server) {
 
         const ssot = getSSOT(); // already loaded; if empty do not break voice
 
+        const meta = {
+          streamSid,
+          callSid,
+          caller: customParameters?.caller,
+          called: customParameters?.called,
+          source: customParameters?.source,
+        };
+
+        // Best-effort caller recognition. No impact on lead parsing.
+        try {
+          const prof = await getCallerProfile(meta.caller);
+          if (prof) meta.caller_profile = prof;
+        } catch (e) {
+          // swallow
+        }
+
         gemini = new GeminiLiveSession({
-          meta: {
-            streamSid,
-            callSid,
-            caller: customParameters?.caller,
-            called: customParameters?.called,
-            source: customParameters?.source,
-          },
+          meta,
           ssot,
           onGeminiAudioUlaw8kBase64: (ulawB64) => sendToTwilioMedia(ulawB64),
           onGeminiText: (t) => logger.debug("Gemini text", { streamSid, callSid, t }),
