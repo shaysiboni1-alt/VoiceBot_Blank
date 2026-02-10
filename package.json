@@ -7,10 +7,10 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.19.2",
+    "ws": "^8.17.1",
     "googleapis": "^140.0.0",
-    "pg": "^8.11.5",
-    "ws": "^8.17.1"
+    "cors": "^2.8.5",
+    "pg": "^8.11.5"
   }
 }
