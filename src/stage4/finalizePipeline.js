@@ -17,6 +17,7 @@
 */
 
 const { parseLeadPostcall } = require("./postcallLeadParser");
+const { upsertCallerProfile } = require("../memory/callerMemory");
 
 function isTrue(v) {
   return v === true || String(v).toLowerCase() === "true";
@@ -259,9 +260,35 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     if (env.FINAL_WEBHOOK_URL && typeof senders?.sendFinal === "function") {
       await senders.sendFinal(finalPayload);
     }
+
+    // Best-effort caller memory update (does not affect leads/webhooks)
+    try {
+      await upsertCallerProfile({
+        caller: finalPayload?.call?.caller,
+        full_name: finalPayload?.parsedLead?.full_name,
+        last_subject: finalPayload?.parsedLead?.subject,
+        last_notes: finalPayload?.parsedLead?.notes,
+        callSid: finalPayload?.call?.callSid,
+      });
+    } catch (e) {
+      log.debug?.("Caller memory update failed", e?.message || e);
+    }
   } else {
     if (env.ABANDONED_WEBHOOK_URL && typeof senders?.sendAbandoned === "function") {
       await senders.sendAbandoned(finalPayload);
+    }
+
+    // Also remember abandoned calls (optional)
+    try {
+      await upsertCallerProfile({
+        caller: finalPayload?.call?.caller,
+        full_name: finalPayload?.parsedLead?.full_name,
+        last_subject: finalPayload?.parsedLead?.subject,
+        last_notes: finalPayload?.parsedLead?.notes,
+        callSid: finalPayload?.call?.callSid,
+      });
+    } catch (e) {
+      log.debug?.("Caller memory update failed", e?.message || e);
     }
   }
 
