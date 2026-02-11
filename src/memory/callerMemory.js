@@ -86,6 +86,8 @@ async function ensureCallerMemorySchema() {
     CREATE TABLE IF NOT EXISTS caller_profiles (
       caller_id TEXT PRIMARY KEY,
       display_name TEXT,
+      total_calls INTEGER NOT NULL DEFAULT 0,
+      first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_seen TIMESTAMPTZ,
       meta JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -94,6 +96,24 @@ async function ensureCallerMemorySchema() {
 
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS display_name TEXT;
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS total_calls INTEGER;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN total_calls SET DEFAULT 0;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN total_calls SET NOT NULL;
+
+    ALTER TABLE caller_profiles
+      ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN first_seen SET DEFAULT NOW();
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN first_seen SET NOT NULL;
 
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
@@ -154,15 +174,35 @@ async function getCallerProfile(callerId) {
  * @param {string} callerId
  * @param {{ display_name?: string|null, meta_patch?: object|null }} patch
  */
+// Backward-compatible signature:
+//   upsertCallerProfile(callerId: string, patch?: {display_name?, meta_patch?})
+//   upsertCallerProfile(payload: { caller: string, display_name?, meta_patch?, ... })
+// Older code paths (e.g., finalizePipeline) may call this with a single payload object.
 async function upsertCallerProfile(callerId, patch = {}) {
   const p = getPool();
   if (!p) return false;
 
-  const cid = String(callerId || '').trim();
+  // If called with a single object payload, extract caller + patch fields.
+  let cidRaw = callerId;
+  let patchObj = patch;
+  if (callerId && typeof callerId === 'object' && !Array.isArray(callerId)) {
+    const payload = callerId;
+    cidRaw = payload.caller ?? payload.caller_id ?? payload.callerId;
+    patchObj = {
+      display_name: payload.display_name ?? payload.displayName ?? null,
+      meta_patch: (payload.meta_patch && typeof payload.meta_patch === 'object')
+        ? payload.meta_patch
+        : (payload.meta && typeof payload.meta === 'object')
+          ? payload.meta
+          : null,
+    };
+  }
+
+  const cid = String(cidRaw || '').trim();
   if (!cid) return false;
 
-  const displayName = (patch.display_name ?? null);
-  const metaPatch = (patch.meta_patch && typeof patch.meta_patch === 'object') ? patch.meta_patch : null;
+  const displayName = (patchObj.display_name ?? null);
+  const metaPatch = (patchObj.meta_patch && typeof patchObj.meta_patch === 'object') ? patchObj.meta_patch : null;
 
   // jsonb merge: meta = meta || metaPatch
   const metaExpr = metaPatch ? 'caller_profiles.meta || $3::jsonb' : 'caller_profiles.meta';
@@ -170,19 +210,21 @@ async function upsertCallerProfile(callerId, patch = {}) {
 
   const sql = metaPatch
     ? `
-      INSERT INTO caller_profiles (caller_id, display_name, last_seen, meta)
-      VALUES ($1, $2, NOW(), $3::jsonb)
+      INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
+      VALUES ($1, $2, 1, NOW(), NOW(), $3::jsonb)
       ON CONFLICT (caller_id) DO UPDATE SET
         display_name = COALESCE(EXCLUDED.display_name, caller_profiles.display_name),
+        total_calls = caller_profiles.total_calls + 1,
         last_seen = NOW(),
         meta = ${metaExpr},
         updated_at = NOW();
     `
     : `
-      INSERT INTO caller_profiles (caller_id, display_name, last_seen)
-      VALUES ($1, $2, NOW())
+      INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen)
+      VALUES ($1, $2, 1, NOW(), NOW())
       ON CONFLICT (caller_id) DO UPDATE SET
         display_name = COALESCE(EXCLUDED.display_name, caller_profiles.display_name),
+        total_calls = caller_profiles.total_calls + 1,
         last_seen = NOW(),
         updated_at = NOW();
     `;
