@@ -251,53 +251,10 @@ async function upsertCallerProfile(callerId, patch = {}) {
   }
 }
 
-/**
- * Update only the display_name without incrementing total_calls.
- * This is intended for in-call name capture (UTTERANCE-based) so it must not
- * distort returning-caller detection which relies on total_calls.
- *
- * Rules:
- * - If profile does not exist, create it with total_calls=0.
- * - Only update when display_name is NULL or different.
- * - Always best-effort (short timeout).
- */
-async function updateCallerDisplayName(callerId, displayName) {
-  const p = getPool();
-  if (!p) return false;
-
-  const cid = String(callerId || '').trim();
-  const dn = String(displayName || '').trim();
-  if (!cid) return false;
-  if (!dn) return false;
-  if (dn.length < 2 || dn.length > 64) return false;
-
-  const sql = `
-    INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen)
-    VALUES ($1, $2, 0, NOW(), NOW())
-    ON CONFLICT (caller_id) DO UPDATE SET
-      display_name = CASE
-        WHEN caller_profiles.display_name IS NULL OR caller_profiles.display_name <> EXCLUDED.display_name
-          THEN EXCLUDED.display_name
-        ELSE caller_profiles.display_name
-      END,
-      last_seen = NOW(),
-      updated_at = NOW();
-  `;
-
-  try {
-    await withTimeout(p.query(sql, [cid, dn]));
-    return true;
-  } catch (err) {
-    logger.debug('Caller memory display_name update failed', { error: String(err?.message || err) });
-    return false;
-  }
-}
-
 module.exports = {
   ensureCallerMemorySchema,
   getCallerProfile,
   upsertCallerProfile,
-  updateCallerDisplayName,
   // exported for diagnostics
   hasDb,
   getPool,
