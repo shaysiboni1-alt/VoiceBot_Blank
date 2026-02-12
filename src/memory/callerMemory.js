@@ -202,7 +202,7 @@ async function upsertCallerProfile(callerId, patch = {}) {
     const payload = callerId;
     cidRaw = payload.caller ?? payload.caller_id ?? payload.callerId;
     patchObj = {
-      display_name: payload.display_name ?? payload.displayName ?? null,
+      display_name: payload.display_name ?? payload.displayName ?? payload.full_name ?? payload.fullName ?? payload.name ?? null,
       meta_patch: (payload.meta_patch && typeof payload.meta_patch === 'object')
         ? payload.meta_patch
         : (payload.meta && typeof payload.meta === 'object')
@@ -214,7 +214,7 @@ async function upsertCallerProfile(callerId, patch = {}) {
   const cid = String(cidRaw || '').trim();
   if (!cid) return false;
 
-  const displayName = (patchObj.display_name ?? null);
+  const displayName = (patchObj.display_name ?? patchObj.full_name ?? patchObj.fullName ?? patchObj.name ?? null);
   const metaPatch = (patchObj.meta_patch && typeof patchObj.meta_patch === 'object') ? patchObj.meta_patch : null;
 
   // jsonb merge: meta = meta || metaPatch
@@ -251,10 +251,47 @@ async function upsertCallerProfile(callerId, patch = {}) {
   }
 }
 
+
+async function updateCallerDisplayName(callerId, displayName, metaPatch = null) {
+  const p = getPool();
+  if (!p) return false;
+
+  const cid = String(callerId || '').trim();
+  const dn = String(displayName || '').trim();
+
+  if (!cid) return false;
+  if (!dn) return false;
+
+  // Hard guardrails (anti-hallucination / safety)
+  if (dn.length < 2 || dn.length > 40) return false;
+  if (/\d/.test(dn)) return false;
+
+  const sql = `
+    INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
+    VALUES ($1, $2, 0, NOW(), NOW(), COALESCE($3::jsonb, '{}'::jsonb))
+    ON CONFLICT (caller_id) DO UPDATE SET
+      display_name = EXCLUDED.display_name,
+      last_seen = NOW(),
+      meta = CASE
+        WHEN $3::jsonb IS NULL THEN caller_profiles.meta
+        ELSE caller_profiles.meta || $3::jsonb
+      END
+  `;
+
+  try {
+    await withTimeout(p.query(sql, [cid, dn, metaPatch ? JSON.stringify(metaPatch) : null]));
+    return true;
+  } catch (e) {
+    logger.debug('Caller memory display_name update failed', { error: String(e?.message || e) });
+    return false;
+  }
+}
+
 module.exports = {
   ensureCallerMemorySchema,
   getCallerProfile,
   upsertCallerProfile,
+  updateCallerDisplayName,
   // exported for diagnostics
   hasDb,
   getPool,

@@ -6,7 +6,9 @@ const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
+const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
+const { updateCallerDisplayName } = require("../memory/callerMemory");
 const { startCallRecording, publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
 const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
 
@@ -459,6 +461,46 @@ class GeminiLiveSession {
       normalized: nlp.normalized,
       lang: nlp.lang
     });
+
+    // Deterministic caller name capture (runs on every user utterance).
+    // Does NOT depend on the opening; only persists on high-confidence patterns.
+    if (who === "user") {
+      try {
+        const callerId = safeStr(this.meta?.caller) || "";
+        if (callerId) {
+          // Find the last assistant utterance BEFORE this user turn (conservative).
+          let lastBot = "";
+          try {
+            const logArr = Array.isArray(this._call?.conversationLog) ? this._call.conversationLog : [];
+            for (let i = logArr.length - 2; i >= 0; i--) {
+              const it = logArr[i];
+              if (it && it.role === "assistant" && it.text) { lastBot = String(it.text); break; }
+            }
+          } catch { /* ignore */ }
+
+          const found = extractCallerName({ userText: nlp.raw, lastBotUtterance: lastBot });
+          if (found && found.name) {
+            const existing = safeStr(this.meta?.caller_profile?.display_name) || "";
+            if (!existing || existing !== found.name) {
+              // Best-effort DB write, must never block call flow.
+              updateCallerDisplayName(callerId, found.name).catch(() => {});
+              // Update in-memory immediately for same-call usage.
+              if (!this.meta.caller_profile) this.meta.caller_profile = {};
+              this.meta.caller_profile.display_name = found.name;
+
+              logger.info("CALLER_NAME_CAPTURED", {
+                ...this.meta,
+                caller: callerId,
+                name: found.name,
+                confidence_reason: found.reason,
+                source_utterance: nlp.raw
+              });
+            }
+          }
+        }
+      } catch { /* swallow */ }
+    }
+
 
     // Canonical: after the closing is spoken, initiate a proactive hangup.
     // We only do this once per call. Delay is ENV-controlled to avoid cutting the audio.
