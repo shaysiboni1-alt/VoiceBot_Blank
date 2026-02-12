@@ -644,6 +644,7 @@ class GeminiLiveSession {
         caller_withheld: this._call.caller_withheld,
         finalize_reason: reason || "",
         intent_id: safeStr(this._call.intent_id) || "other",
+        caller_name: safeStr(this._call.caller_name) || safeStr(this.meta?.caller_profile?.display_name) || null,
       };
 
       // optional passive context (non-breaking)

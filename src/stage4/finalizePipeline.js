@@ -79,6 +79,37 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
   return null;
 }
 
+
+
+function deriveSubjectFromConversationLog(conversationLog, displayNameMaybe) {
+  // Deterministic fallback: pick the first meaningful user utterance that is not just a name/yes/no.
+  const rows = Array.isArray(conversationLog) ? conversationLog : [];
+  const dn = (displayNameMaybe || "").trim();
+
+  for (const r of rows) {
+    if (String(r?.role || '').toLowerCase() !== 'user') continue;
+    let t = String(r?.text || '').trim();
+    if (!t) continue;
+
+    // Strip punctuation edges
+    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '').trim();
+    if (!t) continue;
+
+    const tl = t.toLowerCase();
+    if (tl === "כן" || tl === "לא" || tl === "ok" || tl === "okay" || tl === "yes" || tl === "no") continue;
+
+    // If it's exactly the name (or contains only the name), skip
+    if (dn && (t === dn || t === `אני ${dn}` || t === `שמי ${dn}` || t === `קוראים לי ${dn}`)) continue;
+
+    // Must have at least 2 words or be a sentence-like utterance
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length < 2 && t.length < 6) continue;
+
+    return t.slice(0, 180);
+  }
+
+  return null;
+}
 function normalizeParsedLead(parsed, call) {
   const lead = {
     full_name: safeStr(parsed?.full_name),
@@ -250,6 +281,20 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
   const parsedLead = normalizeParsedLead(parsedRaw || {}, call);
 
+// Deterministic fallbacks (do NOT change payload structure):
+// - If postcall parser missed the caller's name but we captured it in-call, use it.
+const capturedCallerName = safeStr(snapshot?.call?.caller_name) || safeStr(snapshot?.call?.callerName) || null;
+if (!parsedLead.full_name && capturedCallerName) {
+  parsedLead.full_name = capturedCallerName;
+}
+
+// - If subject is missing, derive from conversation log (first meaningful user utterance).
+if (!parsedLead.subject) {
+  const derived = deriveSubjectFromConversationLog(conversationLog, parsedLead.full_name);
+  if (derived) parsedLead.subject = derived;
+}
+
+
   // Deterministic enrichment: make subject include key details actually said (without guessing).
   parsedLead.subject = enhanceSubjectDeterministic({
     subject: parsedLead.subject,
@@ -282,6 +327,21 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
   // 5) FINAL xor ABANDONED (deterministic)
   const { event, decision_reason } = decideEvent(parsedLead);
+try {
+  const hasPhone = !!safeStr(parsedLead?.callback_to_number);
+  const hasName = !!safeStr(parsedLead?.full_name);
+  const hasSubject = !!safeStr(parsedLead?.subject);
+  log.info?.("FINAL_DECISION", {
+    callSid: call.callSid,
+    event,
+    decision_reason,
+    hasPhone,
+    hasName,
+    hasSubject,
+    intent_id: safeStr(snapshot?.call?.intent_id) || "other",
+  });
+} catch { /* ignore */ }
+
   const finalPayload = {
     event,
     decision_reason,

@@ -84,6 +84,16 @@ const HE_REJECT = new Set([
 
 const EN_REJECT = new Set(["yes", "no", "ok", "okay", "hello", "hi", "thanks", "thank", "wait"]);
 
+
+
+function detectScriptLangCandidate(token) {
+  const t = stripEdgePunct(token);
+  if (!t) return null;
+  if (/[\u0590-\u05FF]/.test(t)) return "he";
+  if (/[A-Za-z]/.test(t)) return "en";
+  if (/[\u0400-\u04FFЁё]/.test(t)) return "ru";
+  return null;
+}
 const RU_REJECT = new Set(["да", "нет", "ок", "привет", "спасибо", "подожди"]);
 
 function rejectByStopwords(lang, name) {
@@ -168,7 +178,9 @@ function extractAsAnswerAfterNameQuestion(lang, userTextNorm, lastBotTextNorm) {
   const asked =
     (lang === "he" && lastBotAskedNameHe(lastBotTextNorm)) ||
     (lang === "en" && lastBotAskedNameEn(lastBotTextNorm)) ||
-    (lang === "ru" && lastBotAskedNameRu(lastBotTextNorm));
+    (lang === "ru" && lastBotAskedNameRu(lastBotTextNorm)) ||
+    (lang === "unknown" &&
+      (lastBotAskedNameHe(lastBotTextNorm) || lastBotAskedNameEn(lastBotTextNorm) || lastBotAskedNameRu(lastBotTextNorm)));
 
   if (!asked) return null;
 
@@ -176,25 +188,34 @@ function extractAsAnswerAfterNameQuestion(lang, userTextNorm, lastBotTextNorm) {
   const w = countWords(t);
   if (w < 1 || w > 2) return null;
 
-  if (lang === "he") {
+  // If lang is unknown, infer based on script (only he/en/ru are supported)
+  let effectiveLang = lang;
+  if (effectiveLang === "unknown") {
+    const inferred = detectScriptLangCandidate(t);
+    if (!inferred) return null; // reject unsupported scripts (e.g., Arabic/Devanagari/etc.)
+    effectiveLang = inferred;
+  }
+
+  if (effectiveLang === "he") {
     if (!looksLikeHebrewNameToken(t)) return null;
     if (rejectByStopwords("he", t)) return null;
-    return { name: t, reason: "answer_after_name_question_he" };
+    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_he" : "answer_after_name_question_he" };
   }
 
-  if (lang === "en") {
+  if (effectiveLang === "en") {
     if (!looksLikeEnglishNameToken(t)) return null;
     if (rejectByStopwords("en", t)) return null;
-    return { name: t, reason: "answer_after_name_question_en" };
+    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_en" : "answer_after_name_question_en" };
   }
 
-  if (lang === "ru") {
+  if (effectiveLang === "ru") {
     if (!looksLikeRussianNameToken(t)) return null;
     if (rejectByStopwords("ru", t)) return null;
-    return { name: t, reason: "answer_after_name_question_ru" };
+    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_ru" : "answer_after_name_question_ru" };
   }
 
   return null;
+}
 }
 
 /**
