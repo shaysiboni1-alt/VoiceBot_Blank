@@ -103,6 +103,12 @@ async function ensureCallerMemorySchema() {
     ALTER TABLE caller_profiles
       ALTER COLUMN total_calls SET DEFAULT 0;
 
+    -- If the column was added after rows already existed, existing rows will have NULL.
+    -- We must backfill before enforcing NOT NULL.
+    UPDATE caller_profiles
+      SET total_calls = 0
+      WHERE total_calls IS NULL;
+
     ALTER TABLE caller_profiles
       ALTER COLUMN total_calls SET NOT NULL;
 
@@ -112,11 +118,19 @@ async function ensureCallerMemorySchema() {
     ALTER TABLE caller_profiles
       ALTER COLUMN first_seen SET DEFAULT NOW();
 
+    UPDATE caller_profiles
+      SET first_seen = COALESCE(first_seen, created_at, NOW())
+      WHERE first_seen IS NULL;
+
     ALTER TABLE caller_profiles
       ALTER COLUMN first_seen SET NOT NULL;
 
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
+
+    UPDATE caller_profiles
+      SET last_seen = COALESCE(last_seen, updated_at, NOW())
+      WHERE last_seen IS NULL;
 
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS meta JSONB;

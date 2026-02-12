@@ -510,16 +510,25 @@ class GeminiLiveSession {
 
     const callerProfile = this.meta?.caller_profile || null;
     const callerName = safeStr(callerProfile?.display_name) || "";
-    // Consider "returning" when we have a stored name and this isn't the first ever call.
-    const totalCalls = Number(callerProfile?.total_calls || 0);
-    const isReturning = Boolean(callerName) && totalCalls > 0;
+    // total_calls is the number of *previously completed* calls we have stored.
+    // We want the 2nd call (total_calls >= 1) to already be treated as "returning".
+    const totalCalls = Number(callerProfile?.total_calls ?? 0);
+    const isReturning = totalCalls > 0;
 
-    const opening = getOpeningScriptFromSSOT(this.ssot, {
+    let opening = getOpeningScriptFromSSOT(this.ssot, {
       GREETING: greeting,
       CALLER_NAME: callerName,
       returning_caller: isReturning,
       RETURNING_CALLER: isReturning
     });
+
+    // If CALLER_NAME is empty, SSOT templates that include it can produce awkward punctuation/spaces.
+    // Keep this cleanup extremely conservative to avoid changing authored scripts.
+    opening = String(opening)
+      .replace(/\s{2,}/g, " ")
+      .replace(/\s+,/g, ",")
+      .replace(/,\s+,/g, ",")
+      .trim();
 
     const userKickoff =
       `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n` +
