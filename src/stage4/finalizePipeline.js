@@ -288,6 +288,16 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     ...payloadBase,
   };
 
+  // Propagate the detected intent_id into FINAL payload (required by spec).
+  // Keep ABANDONED unchanged unless explicitly requested.
+  const snapshotIntentId =
+    safeStr(snapshot?.call?.intent_id) ||
+    safeStr(snapshot?.intent_id) ||
+    null;
+  if (event === "FINAL") {
+    finalPayload.intent_id = snapshotIntentId || "other";
+  }
+
   const derivedDisplayName =
     finalPayload?.parsedLead?.full_name || deriveDisplayNameFromConversationLog(conversationLog) || null;
 
@@ -300,10 +310,12 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     try {
       await upsertCallerProfile({
         caller: finalPayload?.call?.caller,
-        full_name: derivedDisplayName,
-        last_subject: finalPayload?.parsedLead?.subject,
-        last_notes: finalPayload?.parsedLead?.notes,
-        callSid: finalPayload?.call?.callSid,
+        display_name: derivedDisplayName,
+        meta_patch: {
+          last_subject: finalPayload?.parsedLead?.subject || null,
+          last_notes: finalPayload?.parsedLead?.notes || null,
+          last_callSid: finalPayload?.call?.callSid || null,
+        },
       });
     } catch (e) {
       log.debug?.("Caller memory update failed", {
@@ -323,10 +335,12 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     try {
       await upsertCallerProfile({
         caller: finalPayload?.call?.caller,
-        full_name: derivedDisplayName,
-        last_subject: finalPayload?.parsedLead?.subject,
-        last_notes: finalPayload?.parsedLead?.notes,
-        callSid: finalPayload?.call?.callSid,
+        display_name: derivedDisplayName,
+        meta_patch: {
+          last_subject: finalPayload?.parsedLead?.subject || null,
+          last_notes: finalPayload?.parsedLead?.notes || null,
+          last_callSid: finalPayload?.call?.callSid || null,
+        },
       });
     } catch (e) {
       log.debug?.("Caller memory update failed", {

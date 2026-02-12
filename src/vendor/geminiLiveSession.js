@@ -6,9 +6,12 @@ const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
+const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
 const { startCallRecording, publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
 const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
+const { updateCallerDisplayName } = require("../memory/callerMemory");
+const { updateCallerDisplayName } = require("../memory/callerMemory");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -447,6 +450,11 @@ class GeminiLiveSession {
 
     const nlp = normalizeUtterance(text);
 
+    // Track last bot utterance (normalized) to support name capture
+    if (who === "bot") {
+      this._call.last_bot_utterance_normalized = safeStr(nlp.normalized || nlp.raw);
+    }
+
     // Append to conversation log (GilSport-style)
     try {
       const role = who === "user" ? "user" : "assistant";
@@ -480,10 +488,11 @@ class GeminiLiveSession {
     }
 
     if (who === "user") {
-      const intent = detectIntent({
-        text: nlp.normalized || nlp.raw,
-        intents: this.ssot?.intents || []
-      });
+      const intents = this.ssot?.intents || [];
+      const intent = detectIntent(nlp.normalized || nlp.raw, intents);
+
+      // Persist last detected intent for FINAL payload propagation
+      this._call.intent_id = safeStr(intent?.intent_id) || "other";
 
       logger.info("INTENT_DETECTED", {
         ...this.meta,
@@ -492,6 +501,48 @@ class GeminiLiveSession {
         lang: nlp.lang,
         intent
       });
+
+      // Deterministic name capture (does NOT depend on opening)
+      try {
+        const lastBot = safeStr(this._call.last_bot_utterance_normalized);
+        const extracted = extractCallerName(nlp, lastBot);
+        if (extracted && extracted.name) {
+          const callerId = safeStr(this._call.caller_raw) || safeStr(this.meta?.caller);
+          const current = safeStr(this.meta?.caller_profile?.display_name);
+          const next = safeStr(extracted.name);
+
+          if (callerId && next && (!current || current !== next)) {
+            // Update in-memory meta for immediate use in-session if needed
+            this._call.caller_name = next;
+            this.meta.caller_profile = this.meta.caller_profile || { caller_id: callerId };
+            this.meta.caller_profile.display_name = next;
+
+            // Save to DB (best-effort, non-blocking)
+            Promise.resolve()
+              .then(() => updateCallerDisplayName(callerId, next))
+              .then((ok) => {
+                logger.info("CALLER_NAME_CAPTURED", {
+                  ...this.meta,
+                  caller: callerId,
+                  name: next,
+                  source_utterance: nlp.raw,
+                  confidence_reason: extracted.reason,
+                  persisted: ok,
+                });
+              })
+              .catch((e) => {
+                logger.debug("CALLER_NAME_CAPTURE_FAILED", {
+                  ...this.meta,
+                  caller: callerId,
+                  name: next,
+                  error: e?.message || String(e),
+                });
+              });
+          }
+        }
+      } catch (e) {
+        logger.debug("CALLER_NAME_CAPTURE_FAILED", { ...this.meta, error: e?.message || String(e) });
+      }
     }
 
     // NOTE: deterministic lead capture removed by design.
@@ -592,7 +643,8 @@ class GeminiLiveSession {
         ended_at: this._call.ended_at,
         duration_ms: durationMs,
         caller_withheld: this._call.caller_withheld,
-        finalize_reason: reason || ""
+        finalize_reason: reason || "",
+        intent_id: safeStr(this._call.intent_id) || "other",
       };
 
       // optional passive context (non-breaking)
