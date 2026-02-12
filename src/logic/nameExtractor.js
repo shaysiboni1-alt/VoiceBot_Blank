@@ -1,243 +1,84 @@
-"use strict";
+// src/logic/nameExtractor.js
 
-// -----------------------------------------------------------------------------
-// Deterministic Caller Name Extractor (no-LLM)
-// -----------------------------------------------------------------------------
-// Goals:
-// - Extract caller's *own* name when spoken anywhere in the call.
-// - Be strict (anti-hallucination): only accept with high confidence.
-// - Support he/en/ru with simple, conservative heuristics.
-
-function safeStr(x) {
-  if (x === undefined || x === null) return "";
-  return String(x).trim();
+function containsHebrew(str) {
+  return /[\u0590-\u05FF]/.test(str);
 }
 
-function stripEdgePunct(s) {
-  return safeStr(s)
-    .replace(/[\u200e\u200f\u202a-\u202e\ufeff]/g, "")
-    .replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, "")
-    .trim();
+function containsLatin(str) {
+  return /[A-Za-z]/.test(str);
 }
 
-function hasDigits(s) {
-  return /\d/.test(s);
+function containsCyrillic(str) {
+  return /[\u0400-\u04FF]/.test(str);
 }
 
-function countWords(s) {
-  return stripEdgePunct(s).split(/\s+/).filter(Boolean).length;
+function cleanName(text) {
+  if (!text) return null;
+
+  let t = text.trim();
+
+  // remove punctuation
+  t = t.replace(/[.,!?]/g, "").trim();
+
+  // reject if digits
+  if (/\d/.test(t)) return null;
+
+  // max 2 words
+  const parts = t.split(/\s+/);
+  if (parts.length > 2) return null;
+
+  if (t.length < 2 || t.length > 20) return null;
+
+  return t;
 }
 
-function looksLikeHebrewNameToken(s) {
-  const t = stripEdgePunct(s);
-  if (!t) return false;
-  if (hasDigits(t)) return false;
-  if (!/[\u0590-\u05FF]/.test(t)) return false;
-  if (t.length < 2 || t.length > 32) return false;
-  const w = countWords(t);
-  if (w < 1 || w > 3) return false;
-  if (/[\p{P}\p{S}]/u.test(t)) return false;
-  return true;
-}
+function extractNameFromUtterance({ text, lastBotQuestion }) {
+  if (!text) return null;
 
-function looksLikeEnglishNameToken(s) {
-  const t = stripEdgePunct(s);
-  if (!t) return false;
-  if (hasDigits(t)) return false;
-  if (!/[A-Za-z]/.test(t)) return false;
-  if (t.length < 2 || t.length > 40) return false;
-  const w = countWords(t);
-  if (w < 1 || w > 3) return false;
-  // allow apostrophe/hyphen inside
-  if (!/^[A-Za-z][A-Za-z'\-\s]+[A-Za-z]$/.test(t)) return false;
-  return true;
-}
+  const cleaned = cleanName(text);
+  if (!cleaned) return null;
 
-function looksLikeRussianNameToken(s) {
-  const t = stripEdgePunct(s);
-  if (!t) return false;
-  if (hasDigits(t)) return false;
-  if (!/[\u0400-\u04FFЁё]/.test(t)) return false;
-  if (t.length < 2 || t.length > 40) return false;
-  const w = countWords(t);
-  if (w < 1 || w > 3) return false;
-  if (!/^[\u0400-\u04FFЁё\-\s]+$/.test(t)) return false;
-  return true;
-}
+  // explicit patterns
+  const patterns = [
+    /אני\s+(.+)/,
+    /קוראים לי\s+(.+)/,
+    /שמי\s+(.+)/,
+    /זה\s+(.+)/
+  ];
 
-const HE_REJECT = new Set([
-  "כן",
-  "לא",
-  "בסדר",
-  "אוקיי",
-  "אוקי",
-  "שלום",
-  "היי",
-  "הי",
-  "רגע",
-  "תודה",
-  "מה",
-  "מי",
-  "למה",
-  "איך",
-]);
-
-const EN_REJECT = new Set(["yes", "no", "ok", "okay", "hello", "hi", "thanks", "thank", "wait"]);
-
-
-
-function detectScriptLangCandidate(token) {
-  const t = stripEdgePunct(token);
-  if (!t) return null;
-  if (/[\u0590-\u05FF]/.test(t)) return "he";
-  if (/[A-Za-z]/.test(t)) return "en";
-  if (/[\u0400-\u04FFЁё]/.test(t)) return "ru";
-  return null;
-}
-const RU_REJECT = new Set(["да", "нет", "ок", "привет", "спасибо", "подожди"]);
-
-function rejectByStopwords(lang, name) {
-  const t = stripEdgePunct(name);
-  const tl = t.toLowerCase();
-  if (!t) return true;
-  if (lang === "he") return HE_REJECT.has(t);
-  if (lang === "en") return EN_REJECT.has(tl);
-  if (lang === "ru") return RU_REJECT.has(tl);
-  return false;
-}
-
-function lastBotAskedNameHe(lastBotTextNorm) {
-  const t = safeStr(lastBotTextNorm);
-  if (!t) return false;
-  // conservative indicators that the assistant asked for the caller's name
-  return (
-    t.includes("מה השם") ||
-    t.includes("איך קוראים") ||
-    t.includes("מי מדבר") ||
-    t.includes("שם מלא") ||
-    t.includes("אפשר שם") ||
-    t.includes("מה שמך")
-  );
-}
-
-function lastBotAskedNameEn(lastBotTextNorm) {
-  const t = safeStr(lastBotTextNorm).toLowerCase();
-  if (!t) return false;
-  return t.includes("your name") || t.includes("who am i speaking") || t.includes("who is this") || t.includes("may i have your name");
-}
-
-function lastBotAskedNameRu(lastBotTextNorm) {
-  const t = safeStr(lastBotTextNorm).toLowerCase();
-  if (!t) return false;
-  return t.includes("как вас зовут") || t.includes("ваше имя") || t.includes("с кем я говорю");
-}
-
-function extractBySelfIntro(lang, textNorm) {
-  const t = safeStr(textNorm);
-  if (!t) return null;
-
-  if (lang === "he") {
-    // Examples: "קוראים לי שי", "שמי שי", "אני שי", "זה שי"
-    const m = t.match(/^(?:קוראים\s+לי|שמי|אני|זה)\s+(.+)$/);
-    if (!m) return null;
-    const candidate = stripEdgePunct(m[1]);
-    if (!candidate) return null;
-    if (!looksLikeHebrewNameToken(candidate)) return null;
-    if (rejectByStopwords("he", candidate)) return null;
-    return { name: candidate, reason: "self_intro_pattern_he" };
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m && m[1]) {
+      const candidate = cleanName(m[1]);
+      if (candidate) {
+        return {
+          name: candidate,
+          confidence_reason: "explicit_pattern"
+        };
+      }
+    }
   }
 
-  if (lang === "en") {
-    const m = t.match(/^(?:my\s+name\s+is|i\s+am|this\s+is)\s+(.+)$/i);
-    if (!m) return null;
-    const candidate = stripEdgePunct(m[1]);
-    if (!candidate) return null;
-    if (!looksLikeEnglishNameToken(candidate)) return null;
-    if (rejectByStopwords("en", candidate)) return null;
-    return { name: candidate, reason: "self_intro_pattern_en" };
-  }
-
-  if (lang === "ru") {
-    const m = t.match(/^(?:меня\s+зовут)\s+(.+)$/i);
-    if (!m) return null;
-    const candidate = stripEdgePunct(m[1]);
-    if (!candidate) return null;
-    if (!looksLikeRussianNameToken(candidate)) return null;
-    if (rejectByStopwords("ru", candidate)) return null;
-    return { name: candidate, reason: "self_intro_pattern_ru" };
+  // single token answer after name question
+  if (
+    lastBotQuestion &&
+    /שם|מי מדבר|איך קוראים/.test(lastBotQuestion)
+  ) {
+    if (
+      containsHebrew(cleaned) ||
+      containsLatin(cleaned) ||
+      containsCyrillic(cleaned)
+    ) {
+      return {
+        name: cleaned,
+        confidence_reason: "direct_answer"
+      };
+    }
   }
 
   return null;
 }
 
-function extractAsAnswerAfterNameQuestion(lang, userTextNorm, lastBotTextNorm) {
-  const t = stripEdgePunct(userTextNorm);
-  if (!t) return null;
-  if (hasDigits(t)) return null;
-
-  const asked =
-    (lang === "he" && lastBotAskedNameHe(lastBotTextNorm)) ||
-    (lang === "en" && lastBotAskedNameEn(lastBotTextNorm)) ||
-    (lang === "ru" && lastBotAskedNameRu(lastBotTextNorm)) ||
-    (lang === "unknown" &&
-      (lastBotAskedNameHe(lastBotTextNorm) || lastBotAskedNameEn(lastBotTextNorm) || lastBotAskedNameRu(lastBotTextNorm)));
-
-  if (!asked) return null;
-
-  // Only accept short answers
-  const w = countWords(t);
-  if (w < 1 || w > 2) return null;
-
-  // If lang is unknown, infer based on script (only he/en/ru are supported)
-  let effectiveLang = lang;
-  if (effectiveLang === "unknown") {
-    const inferred = detectScriptLangCandidate(t);
-    if (!inferred) return null; // reject unsupported scripts (e.g., Arabic/Devanagari/etc.)
-    effectiveLang = inferred;
-  }
-
-  if (effectiveLang === "he") {
-    if (!looksLikeHebrewNameToken(t)) return null;
-    if (rejectByStopwords("he", t)) return null;
-    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_he" : "answer_after_name_question_he" };
-  }
-
-  if (effectiveLang === "en") {
-    if (!looksLikeEnglishNameToken(t)) return null;
-    if (rejectByStopwords("en", t)) return null;
-    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_en" : "answer_after_name_question_en" };
-  }
-
-  if (effectiveLang === "ru") {
-    if (!looksLikeRussianNameToken(t)) return null;
-    if (rejectByStopwords("ru", t)) return null;
-    return { name: t, reason: lang === "unknown" ? "answer_after_name_question_inferred_ru" : "answer_after_name_question_ru" };
-  }
-
-  return null;
-}
-}
-
-/**
- * Extract caller name deterministically.
- * @param {{ raw: string, normalized: string, lang: "he"|"en"|"ru"|"unknown" }} nlp
- * @param {string} lastBotUtteranceNormalized
- * @returns {{name: string, reason: string} | null}
- */
-function extractCallerName(nlp, lastBotUtteranceNormalized) {
-  const lang = safeStr(nlp?.lang) || "unknown";
-  const norm = safeStr(nlp?.normalized || nlp?.raw);
-  if (!norm) return null;
-
-  // 1) Strongest: explicit self-introduction
-  const bySelfIntro = extractBySelfIntro(lang, norm);
-  if (bySelfIntro) return bySelfIntro;
-
-  // 2) Allowed: short answer after ANY question that semantically requests a name
-  const byAnswer = extractAsAnswerAfterNameQuestion(lang, norm, lastBotUtteranceNormalized);
-  if (byAnswer) return byAnswer;
-
-  return null;
-}
-
-module.exports = { extractCallerName };
+module.exports = {
+  extractNameFromUtterance
+};
