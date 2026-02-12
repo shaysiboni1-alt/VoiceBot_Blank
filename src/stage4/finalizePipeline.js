@@ -47,6 +47,38 @@ function buildTranscriptFromConversationLog(conversationLog) {
     .join("\n");
 }
 
+function deriveDisplayNameFromConversationLog(conversationLog) {
+  // Deterministic heuristic: the first user utterance after the opening question is usually the name.
+  // We only accept short, non-numeric strings (<= 3 words, <= 24 chars) and avoid punctuation-only.
+  const rows = Array.isArray(conversationLog) ? conversationLog : [];
+
+  for (const r of rows) {
+    if (String(r?.role || '').toLowerCase() !== 'user') continue;
+    let t = String(r?.text || '').trim();
+    if (!t) continue;
+
+    // Strip common punctuation
+    t = t.replace(/[\u200e\u200f\u202a-\u202e]/g, '').trim();
+    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '').trim();
+    if (!t) continue;
+
+    // Reject obvious non-names
+    if (/[0-9]/.test(t)) continue;
+    if (t.length > 24) continue;
+
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length === 0 || words.length > 3) continue;
+
+    // Require some letters (Hebrew/Latin); avoid single-character noise.
+    if (t.length < 2) continue;
+    if (!/\p{L}/u.test(t)) continue;
+
+    return words.join(' ');
+  }
+
+  return null;
+}
+
 function normalizeParsedLead(parsed, call) {
   const lead = {
     full_name: safeStr(parsed?.full_name),
@@ -256,6 +288,9 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     ...payloadBase,
   };
 
+  const derivedDisplayName =
+    finalPayload?.parsedLead?.full_name || deriveDisplayNameFromConversationLog(conversationLog) || null;
+
   if (event === "FINAL") {
     if (env.FINAL_WEBHOOK_URL && typeof senders?.sendFinal === "function") {
       await senders.sendFinal(finalPayload);
@@ -265,7 +300,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     try {
       await upsertCallerProfile({
         caller: finalPayload?.call?.caller,
-        full_name: finalPayload?.parsedLead?.full_name,
+        full_name: derivedDisplayName,
         last_subject: finalPayload?.parsedLead?.subject,
         last_notes: finalPayload?.parsedLead?.notes,
         callSid: finalPayload?.call?.callSid,
@@ -288,7 +323,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     try {
       await upsertCallerProfile({
         caller: finalPayload?.call?.caller,
-        full_name: finalPayload?.parsedLead?.full_name,
+        full_name: derivedDisplayName,
         last_subject: finalPayload?.parsedLead?.subject,
         last_notes: finalPayload?.parsedLead?.notes,
         callSid: finalPayload?.call?.callSid,

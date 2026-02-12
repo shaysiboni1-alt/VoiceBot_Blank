@@ -97,17 +97,16 @@ async function ensureCallerMemorySchema() {
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS display_name TEXT;
 
+    -- Ensure total_calls exists and is safe to use (older DBs may have NULLs)
     ALTER TABLE caller_profiles
       ADD COLUMN IF NOT EXISTS total_calls INTEGER;
 
-    ALTER TABLE caller_profiles
-      ALTER COLUMN total_calls SET DEFAULT 0;
-
-    -- If the column was added after rows already existed, existing rows will have NULL.
-    -- We must backfill before enforcing NOT NULL.
     UPDATE caller_profiles
       SET total_calls = 0
       WHERE total_calls IS NULL;
+
+    ALTER TABLE caller_profiles
+      ALTER COLUMN total_calls SET DEFAULT 0;
 
     ALTER TABLE caller_profiles
       ALTER COLUMN total_calls SET NOT NULL;
@@ -167,7 +166,7 @@ async function getCallerProfile(callerId) {
   try {
     const { rows } = await withTimeout(
       p.query(
-        `SELECT caller_id, display_name, last_seen, meta
+        `SELECT caller_id, display_name, total_calls, first_seen, last_seen, meta
          FROM caller_profiles
          WHERE caller_id = $1
          LIMIT 1`,
