@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
+const { Readable } = require("stream");
 
 // Best-effort local cache for Twilio recordings (mp3).
 // Goals:
@@ -10,6 +10,8 @@ const axios = require("axios");
 // - Serve /recording/:sid.mp3 quickly from disk when possible.
 // - If not cached yet, stream from Twilio and tee to disk.
 // - Handle concurrent downloads safely (single in-flight per RecordingSid).
+//
+// NOTE: Uses native fetch (Node 18+) to avoid extra deps like axios.
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/tmp/recordings";
 const DEFAULT_TIMEOUT_MS = Number(process.env.RECORDING_DOWNLOAD_TIMEOUT_MS || 20000);
@@ -64,21 +66,27 @@ async function downloadToFile({ recordingSid, recordingUrl, logger, timeoutMs = 
     const tmpPath = `${finalPath}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     try {
-      const resp = await axios.get(url, {
-        auth,
-        responseType: "stream",
-        timeout: timeoutMs,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-        validateStatus: (s) => s >= 200 && s < 300,
-      });
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), timeoutMs);
+
+      const basic = Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64");
+      const resp = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Basic ${basic}` },
+        signal: ac.signal,
+      }).finally(() => clearTimeout(t));
+
+      if (!resp.ok) throw new Error(`Upstream responded ${resp.status}`);
+      if (!resp.body) throw new Error("Upstream response has no body");
+
+      const stream = Readable.fromWeb(resp.body);
 
       await new Promise((resolve, reject) => {
         const out = fs.createWriteStream(tmpPath);
-        resp.data.on("error", reject);
+        stream.on("error", reject);
         out.on("error", reject);
         out.on("finish", resolve);
-        resp.data.pipe(out);
+        stream.pipe(out);
       });
 
       // atomic-ish rename
