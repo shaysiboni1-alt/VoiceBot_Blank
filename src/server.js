@@ -20,6 +20,8 @@ const { ensureCallerMemorySchema } = require("./memory/callerMemory");
 
 // Lead/Recording support (does not affect audio pipeline)
 const recordingRegistry = require("./utils/recordingRegistry");
+const recordingCache = require("./utils/recordingCache");
+const { ensureCacheDir, getCachedRecordingPath, fileExists, downloadToFile } = recordingCache;
 const { setRecordingForCall } = recordingRegistry;
 
 /**
@@ -52,75 +54,48 @@ function twilioRecordingMp3Url(recordingSid) {
 }
 
 async function proxyTwilioMp3(req, res, recordingSid) {
+  // Cache-first proxy for Twilio recording MP3.
+  // Goals:
+  // - Fast response for repeated requests (serve from disk).
+  // - Hard timeout so we never hang Render/Twilio callbacks.
+  // - No third-party modules; keep baseline stable.
+
   const auth = getTwilioBasicAuthHeader();
   if (!auth) {
     res.status(500).json({ error: "missing_twilio_credentials" });
     return;
   }
 
-  const url = twilioRecordingMp3Url(recordingSid);
-
-  const headers = {
-    Authorization: auth
-  };
-
-  // Pass-through Range header for streaming support
-  if (req.headers.range) headers.Range = req.headers.range;
-
-  let upstream;
   try {
-    upstream = await fetch(url, { method: "GET", headers });
+    ensureCacheDir();
+    const cachedPath = getCachedRecordingPath(recordingSid);
+
+    const timeoutMs = (() => {
+      const v = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || process.env.RECORDING_DOWNLOAD_TIMEOUT_MS || 20000);
+      return Number.isFinite(v) && v > 0 ? Math.floor(v) : 20000;
+    })();
+
+    if (!(await fileExists(cachedPath))) {
+      const url = twilioRecordingMp3Url(recordingSid);
+      await downloadToFile(url, recordingSid, { timeoutMs });
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+    const fs = require("fs");
+    const stream = fs.createReadStream(cachedPath);
+    stream.on("error", (err) => {
+      logger.warn("Recording stream error", { recordingSid, err: String(err && err.message ? err.message : err) });
+      if (!res.headersSent) res.status(500).end("recording_stream_error");
+      else res.end();
+    });
+    stream.pipe(res);
   } catch (e) {
-    logger.warn("Recording proxy fetch failed", { recordingSid, err: String(e) });
-    res.status(502).json({ error: "recording_fetch_failed" });
-    return;
+    const msg = String(e && e.message ? e.message : e);
+    logger.warn("Recording proxy failed", { recordingSid, err: msg });
+    res.status(502).end("recording_unavailable");
   }
-
-  // Forward status (200/206/404/etc.)
-  res.status(upstream.status);
-
-  // Forward selected headers
-  const passthrough = [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "etag",
-    "last-modified",
-    "cache-control"
-  ];
-
-  for (const h of passthrough) {
-    const v = upstream.headers.get(h);
-    if (v) res.setHeader(h, v);
-  }
-
-  // Ensure content-type for mp3 if Twilio didn't set
-  if (!res.getHeader("content-type")) {
-    res.setHeader("content-type", "audio/mpeg");
-  }
-
-  // Public caching is safe; media is behind the unpredictability of SID
-  if (!res.getHeader("cache-control")) {
-    res.setHeader("cache-control", "public, max-age=31536000, immutable");
-  }
-
-  if (!upstream.body) {
-    const t = await upstream.text().catch(() => "");
-    res.send(t || "");
-    return;
-  }
-
-  // Convert WebStream -> Node stream
-  const nodeStream = Readable.fromWeb(upstream.body);
-  nodeStream.on("error", (e) => {
-    logger.warn("Recording proxy stream error", { recordingSid, err: String(e) });
-    try {
-      res.end();
-    } catch (_) {}
-  });
-
-  nodeStream.pipe(res);
 }
 
 const app = express();
