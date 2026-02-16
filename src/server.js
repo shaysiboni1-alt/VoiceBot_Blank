@@ -2,6 +2,7 @@
 "use strict";
 
 const express = require("express");
+const https = require("https");
 const { Readable } = require("stream");
 
 const { env } = require("./config/env");
@@ -197,12 +198,13 @@ async function start() {
   await ensureCallerMemorySchema({ logger });
 
   // Twilio Media WebSocket server (voice pipeline)
-  installTwilioMediaWs({ app, logger });
-
   const port = env.PORT || 10000;
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     logger.info("Service started", { port, provider_mode: env.PROVIDER_MODE });
   });
+
+  // IMPORTANT: installTwilioMediaWs requires the *HTTP server* (server.on('upgrade', ...)).
+  installTwilioMediaWs(server);
 }
 
 start().catch((e) => {
