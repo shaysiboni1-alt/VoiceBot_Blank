@@ -151,4 +151,5 @@ router.get("/recording/:sid.mp3", async (req, res) => {
   }
 });
 
-module.exports = router;
+// Export named router to match the pattern used by other route modules.
+module.exports = { recordingsRouter: router };
