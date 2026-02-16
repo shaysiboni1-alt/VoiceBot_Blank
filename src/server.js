@@ -19,7 +19,10 @@ const { ensureCallerMemorySchema } = require("./memory/callerMemory");
 
 // Lead/Recording support (does not affect audio pipeline)
 const { setRecordingForCall } = require("./utils/recordingRegistry");
-const { proxyRecordingMp3 } = require("./utils/twilioRecordings");
+
+// NOTE: We keep a stable public recording URL under /recording/:sid.mp3,
+// but the actual serving (cache + Range support) is implemented in
+// src/routes/recordings.js under /recordings.
 
 const app = express();
 
@@ -43,16 +46,12 @@ app.use(twilioStatusRouter);
 // Public proxy endpoints (existing)
 app.use(recordingsRouter);
 
-// Canonical recording proxy endpoint (alias): /recording/:sid.mp3
-app.get("/recording/:sid.mp3", async (req, res) => {
+// Canonical public recording URL (alias): /recording/:sid.mp3
+// Implementation detail: redirect to /recordings which supports caching + Range.
+app.get("/recording/:sid.mp3", (req, res) => {
   const sid = String(req.params.sid || "").trim();
   if (!sid) return res.status(400).send("missing_sid");
-  try {
-    await proxyRecordingMp3(sid, res, logger);
-  } catch (e) {
-    logger.warn("recording proxy failed", { err: String(e) });
-    if (!res.headersSent) res.status(500).send("proxy_error");
-  }
+  res.redirect(302, `/recordings/${encodeURIComponent(sid)}.mp3`);
 });
 
 // Twilio async recording callback
