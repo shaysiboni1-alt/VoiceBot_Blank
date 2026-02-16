@@ -18,13 +18,16 @@ const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
 const { ensureCallerMemorySchema } = require("./memory/callerMemory");
 
 // Lead/Recording support (does not affect audio pipeline)
-const { setRecordingForCall } = require("./utils/recordingRegistry");
+const recordingRegistry = require("./utils/recordingRegistry");
+const { setRecordingForCall } = recordingRegistry;
+const { startDownloadBestEffort } = require("./utils/recordingCache");
 
 // NOTE: We keep a stable public recording URL under /recording/:sid.mp3,
 // but the actual serving (cache + Range support) is implemented in
 // src/routes/recordings.js under /recordings.
 
 const app = express();
+app.set("recordingRegistry", recordingRegistry);
 
 // JSON payloads (webhooks/admin)
 app.use(express.json({ limit: "1mb" }));
@@ -58,6 +61,9 @@ app.post("/twilio-recording-callback", (req, res) => {
         recordingSid: recordingSid || null,
         recordingUrl: recordingUrl || null
       });
+      if (recordingSid && recordingUrl) {
+        startDownloadBestEffort({ recordingSid, recordingUrl, logger });
+      }
     }
 
     // Respond quickly (Twilio expects fast ACK)
