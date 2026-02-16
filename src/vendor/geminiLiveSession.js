@@ -9,8 +9,8 @@ const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
 const { updateCallerDisplayName } = require("../memory/callerMemory");
-const { startCallRecording, publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
-const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
+const { publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
+const { waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -281,6 +281,29 @@ class GeminiLiveSession {
 
     // Canonical: after CLOSING is fully spoken, we initiate hangup from our side.
     this._hangupScheduled = false;
+
+    // Intent tracking (best match across the call)
+    this._bestIntent = null;
+  }
+
+  _isBetterIntent(candidate, current) {
+    if (!candidate) return false;
+    if (!current) return true;
+
+    const cScore = Number(candidate.score ?? 0) || 0;
+    const bScore = Number(current.score ?? 0) || 0;
+    if (cScore !== bScore) return cScore > bScore;
+
+    const cPr = Number(candidate.priority ?? 0) || 0;
+    const bPr = Number(current.priority ?? 0) || 0;
+    if (cPr !== bPr) return cPr > bPr;
+
+    const cId = safeStr(candidate.intent_id);
+    const bId = safeStr(current.intent_id);
+    if (!cId) return false;
+    if (!bId) return true;
+    // deterministic tie-breaker: lexicographic ascending
+    return cId.localeCompare(bId) < 0;
   }
 
   start() {
@@ -292,16 +315,8 @@ class GeminiLiveSession {
     this.ws.on("open", async () => {
       logger.info("Gemini Live WS connected", this.meta);
 
-      // Recording: start best-effort (must NOT affect voice)
-      try {
-        const r = await startCallRecording(this._call.callSid, logger);
-        if (r?.ok && r.recordingSid) {
-          this._call.recording_sid = String(r.recordingSid);
-          setRecordingForCall(this._call.callSid, { recordingSid: this._call.recording_sid });
-        }
-      } catch (e) {
-        logger.warn("startCallRecording failed", { err: String(e) });
-      }
+      // Recording is started ONCE at Twilio media WS 'start' event (twilioMediaWs.js).
+      // Do NOT start recording here to avoid duplicates/races.
 
       const systemText = buildSystemInstructionFromSSOT(this.ssot);
 
@@ -522,10 +537,18 @@ class GeminiLiveSession {
     }
 
     if (who === "user") {
-      const intent = detectIntent({
-        text: nlp.normalized || nlp.raw,
-        intents: this.ssot?.intents || []
-      });
+      const intent = detectIntent(
+        nlp.normalized || nlp.raw,
+        this.ssot?.intents || []
+      );
+
+      // Track best intent across the call (ignore fallback 'other')
+      const intentId = safeStr(intent?.intent_id);
+      if (intentId && intentId !== "other") {
+        if (this._isBetterIntent(intent, this._bestIntent)) {
+          this._bestIntent = intent;
+        }
+      }
 
       logger.info("INTENT_DETECTED", {
         ...this.meta,
@@ -634,7 +657,13 @@ class GeminiLiveSession {
         ended_at: this._call.ended_at,
         duration_ms: durationMs,
         caller_withheld: this._call.caller_withheld,
-        finalize_reason: reason || ""
+        finalize_reason: reason || "",
+
+        // Best intent detected during the call (deterministic, SSOT-driven)
+        intent_id: safeStr(this._bestIntent?.intent_id) || null,
+        intent_type: safeStr(this._bestIntent?.intent_type) || null,
+        intent_score: Number(this._bestIntent?.score ?? 0) || 0,
+        intent_priority: Number(this._bestIntent?.priority ?? 0) || 0,
       };
 
       // optional passive context (non-breaking)
