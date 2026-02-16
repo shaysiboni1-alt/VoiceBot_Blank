@@ -2,7 +2,7 @@
 
 const express = require("express");
 const fs = require("fs");
-const axios = require("axios");
+const { Readable } = require("stream");
 const { logger } = require("../utils/logger");
 const {
   ensureDirSync,
@@ -83,14 +83,26 @@ router.get("/recording/:sid.mp3", async (req, res) => {
   const tmpPath = localPath ? `${localPath}.tmp-${Date.now()}` : null;
 
   try {
-    const resp = await axios.get(recordingUrl, {
-      auth,
-      responseType: "stream",
-      timeout: Number(process.env.RECORDING_PROXY_TIMEOUT_MS || 20000),
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      validateStatus: (s) => s >= 200 && s < 300,
-    });
+    // Use native fetch (Node 18+) to avoid extra deps like axios.
+    const timeoutMs = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || 20000);
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+
+    const basic = Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64");
+    const resp = await fetch(recordingUrl, {
+      method: "GET",
+      headers: { Authorization: `Basic ${basic}` },
+      signal: ac.signal,
+    }).finally(() => clearTimeout(t));
+
+    if (!resp.ok) {
+      // Twilio often returns 404 briefly right after call end.
+      throw new Error(`Upstream responded ${resp.status}`);
+    }
+    if (!resp.body) throw new Error("Upstream response has no body");
+
+    // Convert WHATWG ReadableStream -> Node Readable
+    const stream = Readable.fromWeb(resp.body);
 
     res.status(200);
     res.setHeader("Content-Type", "audio/mpeg");
@@ -101,7 +113,7 @@ router.get("/recording/:sid.mp3", async (req, res) => {
     if (tmpPath) {
       try {
         out = fs.createWriteStream(tmpPath);
-        resp.data.pipe(out);
+        stream.pipe(out);
         out.on("finish", () => {
           try {
             fs.renameSync(tmpPath, localPath);
@@ -120,13 +132,13 @@ router.get("/recording/:sid.mp3", async (req, res) => {
       }
     }
 
-    resp.data.on("error", (e) => {
+    stream.on("error", (e) => {
       logger.warn("Recording proxy stream error", { recordingSid: sid, error: String(e?.message || e) });
       try { res.end(); } catch (_) {}
     });
 
     // respond to client
-    resp.data.pipe(res);
+    stream.pipe(res);
 
     // also kick a proper cache download in parallel to ensure completion (deduped)
     downloadToFile({ recordingSid: sid, recordingUrl, logger }).catch(() => {});
