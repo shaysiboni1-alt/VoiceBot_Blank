@@ -43,17 +43,9 @@ app.use(healthRouter);
 app.use(adminReloadRouter);
 app.use(twilioStatusRouter);
 
-// Public proxy endpoints (existing)
-app.use(recordingsRouter);
-
-// Canonical public recording URL (alias): /recording/:sid.mp3
-// Implementation detail: redirect to /recordings which supports caching + Range.
-app.get("/recording/:sid.mp3", (req, res) => {
-  const sid = String(req.params.sid || "").trim();
-  if (!sid) return res.status(400).send("missing_sid");
-  res.redirect(302, `/recordings/${encodeURIComponent(sid)}.mp3`);
-});
-
+// Public recording proxy (Twilio Recording SID -> streamed MP3)
+app.use("/recordings", recordingsRouter);
+app.use("/recording", recordingsRouter);
 // Twilio async recording callback
 app.post("/twilio-recording-callback", (req, res) => {
   try {
