@@ -3,26 +3,35 @@
 /*
   Finalize Pipeline (GilSport‑style) for VoiceBot_Blank
 
-  This module runs after each call to build and dispatch webhook payloads. It:
-    - Resolves recording metadata via senders.resolveRecording() and downloads
-      the MP3 from Twilio using downloadRecording() when possible, to provide
-      a stable /recordings URL.
-    - Builds a transcript of the conversation and parses it through the
-      post‑call lead parser (Gemini) to extract intent, full_name, phone,
-      subject, notes, brand, model and a parsing summary.
-    - Applies deterministic fallbacks when the LLM fails: uses the passive
-      context and conversation heuristics to fill missing name/phone/subject,
-      and uses intentRouter.detectIntent if no intent was returned.
-    - Decides whether the call is FINAL or ABANDONED based on the presence
-      of a name (>=2 chars, Hebrew/Latin only), a subject and a callback number.
-    - Builds a payload containing the call metadata, call_status (completed/
-      abandoned), event (FINAL/ABANDONED), parsedLeadCollection (with
-      isFullLead flag), recording information and the full conversation log.
-    - Sends CALL_LOG, FINAL or ABANDONED webhooks using the senders object.
-    - Updates the caller memory table with the last name/subject/notes so that
-      returning callers are greeted by name.
+  This module is responsible for constructing and dispatching webhook
+  payloads after a call has ended.  It performs the following steps:
+    1. Resolve the call recording (best‑effort) via senders.resolveRecording()
+       to include recording metadata and a public URL.
+    2. Build a consolidated transcript of the conversation and parse it
+       through the post‑call lead parser (Gemini) to extract intent,
+       name, callback number, subject and other fields.  Known values
+       from the passive context (full_name and callback_number) are used
+       to bias extraction and fill missing fields.
+    3. Normalize and sanitize the parsed lead, and apply deterministic
+       fallbacks for missing name (via conversation heuristics) and phone
+       number (caller ID when not withheld).
+    4. Decide the call status and event:
+         - FINAL when name (>=2 letters), subject and phone are present
+         - ABANDONED otherwise
+       The call_status field is set to 'completed' for FINAL and
+       'abandoned' for ABANDONED.
+    5. Construct the webhook payload including call metadata, call_status,
+       event, parsedLeadCollection (with isFullLead flag), recording info
+       and conversationLog.  The STATUS field mirrors call_status for
+       backward compatibility.
+    6. Send the CALL_LOG webhook if enabled; then send either FINAL or
+       ABANDONED webhook depending on the event.
+    7. Update the caller profile in the database with the captured name
+       and last subject/notes (best‑effort) to enable returning caller
+       greetings on subsequent calls.
 
-  The function never throws outward; errors are logged and processing continues.
+  This pipeline never throws outward; all errors are logged and
+  processing continues best‑effort.
 */
 
 const { parseLeadPostcall } = require("./postcallLeadParser");
@@ -112,7 +121,7 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
       candidate = derived ? safeStr(derived) : null;
     }
     // Accept the candidate only if it contains Hebrew/Latin letters (and spaces).
-    if (candidate && /^[\p{Hebrew}\p{Latin}\s]{2,40}$/u.test(candidate)) {
+    if (candidate && /^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,40}$/u.test(candidate)) {
       out.full_name = candidate;
     }
   }
@@ -154,7 +163,9 @@ function deriveSubjectFromConversationLog(conversationLog) {
 /**
  * Determine the event (FINAL or ABANDONED) and decision reason based on
  * required fields.  A final lead requires a name of at least two
- * characters (Hebrew/Latin letters), a subject and a phone number.
+ * characters, a subject and a phone number.  An abandoned lead has a
+ * phone number and subject but is missing a valid name.  Anything else
+ * defaults to ABANDONED (missing subject or phone).
  */
 function decideEvent(lead) {
   const nameVal = safeStr(lead?.full_name);
@@ -164,7 +175,7 @@ function decideEvent(lead) {
   const hasName =
     nameVal &&
     nameVal.length >= 2 &&
-    /^[\p{Hebrew}\p{Latin}\s]+$/u.test(nameVal);
+    /^[\p{Script=Hebrew}\p{Script=Latin}\s]+$/u.test(nameVal);
   const hasPhone = !!phoneVal;
   const hasSubject = !!subjVal;
   if (hasName && hasPhone && hasSubject) {
@@ -182,7 +193,6 @@ function decideEvent(lead) {
   return { event: "ABANDONED", decision_reason: "partial" };
 }
 
-// Main function: finalizePipeline
 async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   const log = logger || console;
   try {
@@ -210,18 +220,18 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
       : Array.isArray(snapshot?.call?.conversationLog)
         ? snapshot.call.conversationLog
         : [];
-    // Resolve recording (best effort)
+    // Resolve recording (best‑effort)
     let recording = {
       recording_provider: null,
       recording_sid: null,
       recording_url_public: null,
     };
-    if (env.MB_ENABLE_RECORDING && typeof senders?.resolveRecording === "function") {
-      try {
+    try {
+      if (env.MB_ENABLE_RECORDING && typeof senders?.resolveRecording === "function") {
         recording = await senders.resolveRecording();
-      } catch (e) {
-        log.warn?.("Resolve recording failed", e?.message || e);
       }
+    } catch (e) {
+      log.warn?.("Resolve recording failed", e?.message || e);
     }
     // Download recording from Twilio API and save locally
     if (recording?.recording_sid) {
@@ -251,14 +261,14 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         log.warn?.("Postcall lead parsing failed", e?.message || e);
       }
     }
-    // Normalize and fill missing fields
+    // Normalize and apply fallbacks
     const parsedLead = normalizeLead(parsed || {}, call, knownFullName, knownPhone, conversationLog, ssot);
-    // Derive subject if missing
+    // If subject is missing, derive one from conversation log
     if (!parsedLead.subject) {
       const derived = deriveSubjectFromConversationLog(conversationLog);
       if (derived) parsedLead.subject = derived;
     }
-    // Decide on event and call status
+    // Determine event and call status
     const { event, decision_reason } = decideEvent(parsedLead);
     const call_status = event === "FINAL" ? "completed" : "abandoned";
     // Build payload
@@ -284,7 +294,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         isFullLead: event === "FINAL",
       },
     };
-    // Dispatch CALL_LOG webhook at end
+    // CALL_LOG webhook
     try {
       if (isTrue(env.CALL_LOG_AT_END)) {
         if (env.CALL_LOG_WEBHOOK_URL && typeof senders?.sendCallLog === "function") {
@@ -294,7 +304,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     } catch (e) {
       log.warn?.("CALL_LOG webhook failed", e?.message || e);
     }
-    // Dispatch FINAL or ABANDONED webhook
+    // FINAL or ABANDONED webhook
     try {
       if (event === "FINAL") {
         if (env.FINAL_WEBHOOK_URL && typeof senders?.sendFinal === "function") {
@@ -308,12 +318,9 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     } catch (e) {
       log.warn?.("Lead webhook failed", e?.message || e);
     }
-    // Update caller memory (best effort)
+    // Update caller profile (best‑effort)
     try {
-      const displayName =
-        safeStr(parsedLead.full_name) ||
-        deriveDisplayNameFromConversationLog(conversationLog) ||
-        null;
+      const displayName = safeStr(parsedLead.full_name) || deriveDisplayNameFromConversationLog(conversationLog) || null;
       await upsertCallerProfile({
         caller: call?.caller,
         full_name: displayName,
