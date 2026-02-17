@@ -1,155 +1,91 @@
+// src/routes/recordings.js
 "use strict";
 
 const express = require("express");
-const fs = require("fs");
-const { Readable } = require("stream");
+const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
-const {
-  ensureDirSync,
-  getLocalPath,
-  existsSync,
-  getTwilioAuth,
-  downloadToFile,
-} = require("../utils/recordingCache");
 
-const router = express.Router();
+const recordingsRouter = express.Router();
 
-// Serve cached mp3 from disk (supports Range), else stream from Twilio and tee to disk.
-function serveFileWithRange(req, res, filePath) {
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-
-  if (!range) {
-    res.setHeader("Content-Length", fileSize);
-    fs.createReadStream(filePath).pipe(res);
-    return;
+/**
+ * Public proxy for Twilio recording media.
+ * Why: Twilio Recording media URLs require basic auth (AccountSid/AuthToken).
+ * This endpoint fetches the mp3 from Twilio with auth, and streams it publicly.
+ *
+ * URL: GET /recordings/:recordingSid.mp3
+ *
+ * NOTE (robustness): some clients (and older webhook payloads) mistakenly call
+ *   /recording/<RecordingSid>.mp3
+ *   /recordings/<RecordingSid>.mp3.mp3
+ * We normalize the recording SID defensively.
+ */
+recordingsRouter.get("/recordings/:recordingSid.mp3", async (req, res) => {
+  let recordingSid = String(req.params.recordingSid || "").trim();
+  // tolerate accidental suffixes
+  if (recordingSid.toLowerCase().endsWith(".mp3")) {
+    recordingSid = recordingSid.slice(0, -4);
   }
+  if (!recordingSid) return res.status(400).send("missing recordingSid");
 
-  // Range: bytes=start-end
-  const m = String(range).match(/bytes=(\d*)-(\d*)/);
-  const start = m && m[1] ? parseInt(m[1], 10) : 0;
-  const end = m && m[2] ? parseInt(m[2], 10) : fileSize - 1;
+  const accountSid = env.TWILIO_ACCOUNT_SID;
+  const authToken = env.TWILIO_AUTH_TOKEN;
 
-  if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= fileSize) {
-    res.status(416);
-    res.setHeader("Content-Range", `bytes */${fileSize}`);
-    res.end();
-    return;
+  if (!accountSid || !authToken) {
+    return res.status(500).send("missing TWILIO creds");
   }
-
-  res.status(206);
-  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-  res.setHeader("Content-Length", end - start + 1);
-
-  fs.createReadStream(filePath, { start, end }).pipe(res);
-}
-
-router.get("/recording/:sid.mp3", async (req, res) => {
-  const sid = String(req.params.sid || "").trim();
-  if (!sid) return res.status(400).send("Missing recording sid");
-
-  ensureDirSync();
-  const localPath = getLocalPath(sid);
-
-  // 1) fast path: cached file exists
-  if (localPath && existsSync(localPath)) {
-    logger.info("Recording served from cache", { recordingSid: sid });
-    return serveFileWithRange(req, res, localPath);
-  }
-
-  // 2) we need recording URL from registry
-  const registry = req.app.get("recordingRegistry");
-  const info = registry?.getRecordingInfo ? registry.getRecordingInfo(sid) : null;
-  const recordingUrl = info?.recordingUrl;
-
-  if (!recordingUrl) {
-    // It might not have reached callback yet.
-    logger.warn("Recording URL not found in registry", { recordingSid: sid });
-    return res.status(404).send("Recording not ready yet");
-  }
-
-  // 3) try stream from Twilio and tee into local cache
-  const auth = getTwilioAuth();
-  if (!auth) {
-    logger.error("Twilio auth missing; cannot proxy recording", { recordingSid: sid });
-    return res.status(500).send("Server missing Twilio auth");
-  }
-
-  const tmpPath = localPath ? `${localPath}.tmp-${Date.now()}` : null;
 
   try {
-    // Use native fetch (Node 18+) to avoid extra deps like axios.
-    const timeoutMs = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || 20000);
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), timeoutMs);
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+      accountSid
+    )}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
 
-    const basic = Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64");
-    const resp = await fetch(recordingUrl, {
+    const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+
+    const r = await fetch(url, {
       method: "GET",
-      headers: { Authorization: `Basic ${basic}` },
-      signal: ac.signal,
-    }).finally(() => clearTimeout(t));
-
-    if (!resp.ok) {
-      // Twilio often returns 404 briefly right after call end.
-      throw new Error(`Upstream responded ${resp.status}`);
-    }
-    if (!resp.body) throw new Error("Upstream response has no body");
-
-    // Convert WHATWG ReadableStream -> Node Readable
-    const stream = Readable.fromWeb(resp.body);
-
-    res.status(200);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-
-    // tee to disk (best effort) while streaming to client
-    let out = null;
-    if (tmpPath) {
-      try {
-        out = fs.createWriteStream(tmpPath);
-        stream.pipe(out);
-        out.on("finish", () => {
-          try {
-            fs.renameSync(tmpPath, localPath);
-            logger.info("Recording cached via proxy tee", { recordingSid: sid, path: localPath });
-          } catch (e) {
-            try { fs.unlinkSync(tmpPath); } catch (_) {}
-            logger.warn("Failed to finalize cached recording", { recordingSid: sid, error: String(e?.message || e) });
-          }
-        });
-        out.on("error", (e) => {
-          try { fs.unlinkSync(tmpPath); } catch (_) {}
-          logger.warn("Recording cache tee write error", { recordingSid: sid, error: String(e?.message || e) });
-        });
-      } catch (e) {
-        logger.warn("Recording cache tee init failed", { recordingSid: sid, error: String(e?.message || e) });
+      headers: {
+        authorization: `Basic ${basic}`,
+        "user-agent": "voicebot-blank/recording-proxy"
       }
-    }
-
-    stream.on("error", (e) => {
-      logger.warn("Recording proxy stream error", { recordingSid: sid, error: String(e?.message || e) });
-      try { res.end(); } catch (_) {}
     });
 
-    // respond to client
-    stream.pipe(res);
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      logger.warn("Recording proxy fetch failed", {
+        status: r.status,
+        recordingSid,
+        body: body?.slice(0, 240)
+      });
+      return res.status(502).send("twilio fetch failed");
+    }
 
-    // also kick a proper cache download in parallel to ensure completion (deduped)
-    downloadToFile({ recordingSid: sid, recordingUrl, logger }).catch(() => {});
+    res.status(200);
+    res.setHeader("content-type", "audio/mpeg");
+    res.setHeader("cache-control", "public, max-age=31536000, immutable");
+
+    // Stream through
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.send(buf);
   } catch (err) {
-    const msg = String(err?.message || err);
-    logger.warn("Recording proxy failed", { recordingSid: sid, error: msg });
-
-    // Common: Twilio returns 404 for a short window after call ends.
-    return res.status(404).send("Recording not ready yet");
+    logger.error("Recording proxy error", { recordingSid, error: err?.message || String(err) });
+    res.status(500).send("proxy error");
   }
 });
 
-// Export named router to match the pattern used by other route modules.
-module.exports = { recordingsRouter: router };
+// Compatibility aliases:
+// 1) /recording/<RecordingSid>
+// 2) /recording/<RecordingSid>.mp3
+// (Older payloads and some users paste links in this form)
+function redirectToCanonicalRecording(req, res) {
+  let recordingSid = String(req.params.recordingSid || "").trim();
+  if (recordingSid.toLowerCase().endsWith(".mp3")) {
+    recordingSid = recordingSid.slice(0, -4);
+  }
+  if (!recordingSid) return res.status(400).send("missing recordingSid");
+  return res.redirect(302, `/recordings/${encodeURIComponent(recordingSid)}.mp3`);
+}
+
+recordingsRouter.get("/recording/:recordingSid", redirectToCanonicalRecording);
+recordingsRouter.get("/recording/:recordingSid.mp3", redirectToCanonicalRecording);
+
+module.exports = { recordingsRouter };

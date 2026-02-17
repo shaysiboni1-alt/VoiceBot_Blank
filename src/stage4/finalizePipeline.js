@@ -204,10 +204,6 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
       snapshot?.call?.duration_sec ??
       secondsFromMs(snapshot?.call?.duration_ms ?? snapshot?.duration_ms),
     finalize_reason: snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
-    intent_id: snapshot?.call?.intent_id || snapshot?.intent_id || null,
-    intent_type: snapshot?.call?.intent_type || snapshot?.intent_type || null,
-    intent_score: snapshot?.call?.intent_score ?? snapshot?.intent_score ?? null,
-    intent_priority: snapshot?.call?.intent_priority ?? snapshot?.intent_priority ?? null,
     passive_context: snapshot?.call?.passive_context || null,
   };
 
@@ -254,15 +250,6 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
   const parsedLead = normalizeParsedLead(parsedRaw || {}, call);
 
-  // Attach intent to lead payload as well (requested). Backward-compatible.
-  if (call?.intent_id) {
-    parsedLead.intent_id = safeStr(call.intent_id);
-    parsedLead.intent_type = safeStr(call.intent_type);
-  } else {
-    parsedLead.intent_id = null;
-    parsedLead.intent_type = null;
-  }
-
   // Deterministic enrichment: make subject include key details actually said (without guessing).
   parsedLead.subject = enhanceSubjectDeterministic({
     subject: parsedLead.subject,
@@ -274,10 +261,8 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     call,
     parsedLead,
     conversationLog,
-    intent_id: safeStr(call?.intent_id),
     recording_provider: safeStr(recording?.recording_provider),
     recording_sid: safeStr(recording?.recording_sid),
-    recording_url: safeStr(recording?.recording_url),
     recording_url_public: safeStr(recording?.recording_url_public),
   };
 
