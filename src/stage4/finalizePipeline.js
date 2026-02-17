@@ -1,4 +1,3 @@
-// src/stage4/finalizePipeline.js
 "use strict";
 
 /*
@@ -12,8 +11,8 @@
   - Attach recording_url_public/recording_sid/recording_provider when available (best-effort)
 
   Decision rule (locked):
-  - FINAL: full_name + subject + callback_to_number
-  - ABANDONED: callback_to_number only
+  - FINAL: name (>=2 chars) + subject + callback_to_number
+  - ABANDONED: callback_to_number only or missing name/subject
 */
 
 const { parseLeadPostcall } = require("./postcallLeadParser");
@@ -53,13 +52,13 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
   const rows = Array.isArray(conversationLog) ? conversationLog : [];
 
   for (const r of rows) {
-    if (String(r?.role || '').toLowerCase() !== 'user') continue;
-    let t = String(r?.text || '').trim();
+    if (String(r?.role || "").toLowerCase() !== "user") continue;
+    let t = String(r?.text || "").trim();
     if (!t) continue;
 
     // Strip common punctuation
-    t = t.replace(/[\u200e\u200f\u202a-\u202e]/g, '').trim();
-    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '').trim();
+    t = t.replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
+    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, "").trim();
     if (!t) continue;
 
     // Reject obvious non-names
@@ -73,7 +72,7 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
     if (t.length < 2) continue;
     if (!/\p{L}/u.test(t)) continue;
 
-    return words.join(' ');
+    return words.join(" ");
   }
 
   return null;
@@ -81,10 +80,13 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
 
 function normalizeParsedLead(parsed, call) {
   const lead = {
+    intent: safeStr(parsed?.intent),
     full_name: safeStr(parsed?.full_name),
-    subject: safeStr(parsed?.subject),
     callback_to_number: safeStr(parsed?.callback_to_number),
+    subject: safeStr(parsed?.subject),
     notes: safeStr(parsed?.notes),
+    brand: safeStr(parsed?.brand),
+    model: safeStr(parsed?.model),
   };
 
   // GilSport parity: if caller ID exists and is not withheld, allow it to be the callback number.
@@ -98,12 +100,22 @@ function normalizeParsedLead(parsed, call) {
 }
 
 function decideEvent(lead) {
-  const hasPhone = !!safeStr(lead?.callback_to_number);
-  const hasName = !!safeStr(lead?.full_name);
-  const hasSubject = !!safeStr(lead?.subject);
+  const phoneVal = safeStr(lead?.callback_to_number);
+  const nameVal = safeStr(lead?.full_name);
+  const subjectVal = safeStr(lead?.subject);
+  const hasPhone = !!phoneVal;
+  const hasName = !!(nameVal && nameVal.length >= 2);
+  const hasSubject = !!subjectVal;
 
-  if (hasPhone && hasName && hasSubject) return { event: "FINAL", decision_reason: "ok" };
-  if (hasPhone) return { event: "ABANDONED", decision_reason: "phone_only" };
+  // FINAL when we have at least a 2-letter name, subject, and callback number
+  if (hasPhone && hasName && hasSubject) {
+    return { event: "FINAL", decision_reason: "ok" };
+  }
+  // ABANDONED when phone exists but missing name or subject
+  if (hasPhone) {
+    return { event: "ABANDONED", decision_reason: "phone_only" };
+  }
+  // ABANDONED due to no phone
   return { event: "ABANDONED", decision_reason: "missing_phone" };
 }
 
@@ -133,12 +145,12 @@ function enhanceSubjectDeterministic({ subject, conversationLog }) {
   };
 
   // Years like 2024
-  const years = uniq((t.match(/\b(19|20)\d{2}\b/g) || []));
+  const years = uniq(t.match(/\b(19|20)\d{2}\b/g) || []);
 
   // Period fragments / ranges (keep as-is; do NOT guess)
   const periodFragments = uniq((t.match(/\b\d{1,2}\s*-\s*\d{1,2}\b/g) || []).map((s) => s.replace(/\s+/g, "")));
   const weirdFragments = uniq((t.match(/\b\d{2}\s*-\s*\d\b/g) || []).map((s) => s.replace(/\s+/g, "")));
-  const singleDigits = uniq((t.match(/\b\d\b/g) || []));
+  const singleDigits = uniq(t.match(/\b\d\b/g) || []);
 
   const parts = [];
 
@@ -239,6 +251,8 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         ssot,
         known: {
           caller_id_e164: safeStr(call?.caller) || null,
+          full_name: null,
+          callback_to_number: null,
         },
         env,
         logger: log,
@@ -289,7 +303,9 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   };
 
   const derivedDisplayName =
-    finalPayload?.parsedLead?.full_name || deriveDisplayNameFromConversationLog(conversationLog) || null;
+    finalPayload?.parsedLead?.full_name ||
+    deriveDisplayNameFromConversationLog(conversationLog) ||
+    null;
 
   if (event === "FINAL") {
     if (env.FINAL_WEBHOOK_URL && typeof senders?.sendFinal === "function") {
