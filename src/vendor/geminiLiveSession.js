@@ -9,7 +9,7 @@ const { normalizeUtterance } = require("../logic/hebrewNlp");
 const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
 const { updateCallerDisplayName } = require("../memory/callerMemory");
-const { publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
+const { publicRecordingUrl, twilioApiRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
 const { waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
@@ -692,7 +692,12 @@ class GeminiLiveSession {
           sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
           resolveRecording: async () => {
             if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) {
-              return { recording_provider: null, recording_sid: null, recording_url_public: null };
+              return {
+                recording_provider: null,
+                recording_sid: null,
+                recording_url: null,
+                recording_url_public: null,
+              };
             }
 
             // Wait a bit for Twilio callback to arrive (best-effort)
@@ -700,6 +705,7 @@ class GeminiLiveSession {
             const rec = getRecordingForCall(this._call.callSid);
             const sid = safeStr(rec?.recordingSid || this._call.recording_sid) || null;
             const url = sid ? publicRecordingUrl(sid) : null;
+            const urlTwilio = sid ? twilioApiRecordingUrl(sid) : null;
 
             // cache for later (best-effort)
             if (sid) this._call.recording_sid = sid;
@@ -707,6 +713,7 @@ class GeminiLiveSession {
             return {
               recording_provider: sid ? "twilio" : null,
               recording_sid: sid,
+              recording_url: urlTwilio,
               recording_url_public: url,
             };
           },

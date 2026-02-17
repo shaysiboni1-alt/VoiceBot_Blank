@@ -277,6 +277,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     intent_id: safeStr(call?.intent_id),
     recording_provider: safeStr(recording?.recording_provider),
     recording_sid: safeStr(recording?.recording_sid),
+    recording_url: safeStr(recording?.recording_url),
     recording_url_public: safeStr(recording?.recording_url_public),
   };
 

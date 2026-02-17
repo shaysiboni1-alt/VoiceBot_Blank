@@ -76,6 +76,12 @@ function publicRecordingUrl(recordingSid) {
   return `${base.replace(/\/$/, "")}/recording/${recordingSid}.mp3`;
 }
 
+// 1:1 like GilSport: expose the Twilio API Recording resource URL (requires Twilio auth to fetch)
+function twilioApiRecordingUrl(recordingSid) {
+  if (!recordingSid) return null;
+  return `${twilioBase()}/Recordings/${encodeURIComponent(recordingSid)}`;
+}
+
 async function hangupCall(callSid, logger) {
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
   try {
@@ -173,6 +179,7 @@ async function proxyRecordingMp3(recordingSid, res, logger) {
 module.exports = {
   startCallRecording,
   publicRecordingUrl,
+  twilioApiRecordingUrl,
   hangupCall,
   proxyRecordingMp3,
 };
