@@ -44,14 +44,14 @@ function extractNameHe(text) {
   if (m && m[1]) {
     const candidate = m[1].trim();
     // The candidate should consist solely of Hebrew/Latin letters and spaces.
-    if (/^[\p{Hebrew}\p{Latin}\s]{2,40}$/u.test(candidate)) {
+    if (/^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,40}$/u.test(candidate)) {
       return candidate;
     }
   }
   // Fallback: Only treat the entire utterance as a name if it is short, contains no digits
   // and consists solely of Hebrew or Latin letters (and spaces). This prevents capturing
   // product names or random words containing other scripts or punctuation.
-  if (t.length <= 25 && /^[\p{Hebrew}\p{Latin}\s]{2,25}$/u.test(t)) {
+  if (t.length <= 25 && /^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,25}$/u.test(t)) {
     // Normalize spaces and strip common hesitation filler.
     const clean = t.replace(/^אה+[, ]*/g, "").trim().replace(/\s+/g, " ");
     return clean;
