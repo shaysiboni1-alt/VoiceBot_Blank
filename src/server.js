@@ -90,52 +90,144 @@ function sendMp3File(req, res, filePath) {
   return stream.pipe(res);
 }
 
-async function proxyTwilioMp3(req, res, recordingSid) {
-  // Cache-first proxy for Twilio recording MP3.
-  // Key issue observed: Twilio may accept the request but keep the body pending while MP3 is still processing.
-  // If we wait, Render/Twilio callbacks will hit 502 after ~1,000s. So we MUST fail fast.
-
-  const auth = getTwilioBasicAuthHeader();
-  if (!auth) {
-    res.status(500).json({ error: "missing_twilio_credentials" });
+async function proxyTwilioMp3(recordingSid, req, res) {
+  // Public proxy: return Twilio recording MP3 without exposing credentials.
+  // Behavior:
+  // - If cached -> serve from disk with Range support (fast).
+  // - Else -> stream from Twilio to client (Range passthrough), optionally tee to cache for future requests.
+  if (!recordingSid || typeof recordingSid !== "string") {
+    res.status(400).send("Bad request");
     return;
   }
 
-  const cachedPath = recordingPath(recordingSid, "mp3");
-
-  // Serve from cache immediately (supports Range via sendMp3File).
-  if (hasCached(recordingSid)) {
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    return sendMp3File(req, res, cachedPath);
-  }
-
-  // Fast readiness check (GilSport-style): only attempt MP3 fetch when Recording status=completed.
-  const st = await getRecordingStatus(recordingSid, { timeoutMs: 6000 });
-  if (!st.ok || String(st.status).toLowerCase() !== "completed") {
-    res.setHeader("Retry-After", "5");
-    return res.status(404).json({ error: "recording_not_ready" });
-  }
-
-  const totalTimeoutMs = (() => {
-    const v = Number(process.env.RECORDING_TOTAL_TIMEOUT_MS || process.env.RECORDING_PROXY_TIMEOUT_MS || 15000);
-    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 15000;
-  })();
+  // 1) If we have cache + file exists, serve immediately
+  const cacheEnabled = String(process.env.RECORDING_CACHE_ENABLED || "true").toLowerCase() !== "false";
+  const cachePath = getRecordingCachePath(recordingSid);
 
   try {
-    await downloadToFile(recordingSid, cachedPath, { totalTimeoutMs });
-    if (!hasCached(recordingSid)) {
-      res.setHeader("Retry-After", "5");
-      return res.status(404).json({ error: "recording_not_available" });
+    if (cacheEnabled && fs.existsSync(cachePath)) {
+      await sendMp3File(req, res, cachePath);
+      return;
     }
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    return sendMp3File(req, res, cachedPath);
   } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
+    // Cache failures must never block serving; fall through to live proxy.
+    logger.warn("Recording cache read failed; falling back to live proxy", { recordingSid, err: String(e && e.message ? e.message : e) });
+  }
+
+  // 2) Live proxy from Twilio (supports Range)
+  const range = req.headers.range;
+  const controller = new AbortController();
+
+  const totalTimeoutMs = Number(process.env.RECORDING_PROXY_TOTAL_TIMEOUT_MS || 120000); // 2 min default
+  const timeout = setTimeout(() => controller.abort(new Error("recording_proxy_timeout")), Math.max(5000, totalTimeoutMs));
+
+  let tmpPath = null;
+  let fileStream = null;
+  let tee = null;
+
+  // If client disconnects, abort upstream immediately
+  const onClose = () => {
+    try { controller.abort(new Error("client_disconnected")); } catch (_) {}
+  };
+  res.on("close", onClose);
+
+  try {
+    const auth = getTwilioBasicAuthHeader();
+    const mp3Url = getTwilioRecordingMp3Url(recordingSid);
+
+    const headers = { Authorization: auth };
+    if (range) headers.Range = range;
+
+    const twilioRes = await fetch(mp3Url, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+      redirect: "follow",
+    });
+
+    // Propagate status (200/206/404 etc.)
+    res.status(twilioRes.status);
+
+    // Copy relevant headers
+    const passHeaders = [
+      "content-type",
+      "content-length",
+      "accept-ranges",
+      "content-range",
+      "etag",
+      "last-modified",
+    ];
+    for (const h of passHeaders) {
+      const v = twilioRes.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+
+    // Always mark as inline audio
+    res.setHeader("Content-Disposition", `inline; filename="${recordingSid}.mp3"`);
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+    if (!twilioRes.body) {
+      res.end();
+      return;
+    }
+
+    // Convert to Node stream
+    const nodeStream = Readable.fromWeb(twilioRes.body);
+
+    // Tee to cache only for full-file responses (no Range, 200 OK)
+    const canCache = cacheEnabled && !range && twilioRes.status === 200;
+    if (canCache) {
+      try {
+        ensureRecordingCacheDir();
+        tmpPath = cachePath + ".tmp";
+        fileStream = fs.createWriteStream(tmpPath);
+        tee = new PassThrough();
+
+        // nodeStream -> tee -> (res + file)
+        tee.pipe(res);
+        tee.pipe(fileStream);
+
+        await Promise.all([
+          pipeline(nodeStream, tee),
+          new Promise((resolve, reject) => {
+            fileStream.on("finish", resolve);
+            fileStream.on("error", reject);
+            tee.on("error", reject);
+          }),
+        ]);
+
+        // Atomically move into place
+        try {
+          fs.renameSync(tmpPath, cachePath);
+        } catch (e) {
+          // If rename fails, just remove tmp
+          try { if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+        }
+        return;
+      } catch (e) {
+        logger.warn("Recording cache tee failed; streaming without cache", { recordingSid, err: String(e && e.message ? e.message : e) });
+        // fallthrough to plain streaming below
+        try { if (fileStream) fileStream.destroy(); } catch (_) {}
+        try { if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+      }
+    }
+
+    // Plain streaming (Range or no cache)
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    const msg = String(err && err.message ? err.message : err);
     logger.warn("Recording proxy failed", { recordingSid, err: msg });
-    res.setHeader("Retry-After", "5");
-    return res.status(404).json({ error: "recording_not_available" });
+    if (!res.headersSent) {
+      res.status(502).send("Recording proxy failed");
+    } else {
+      try { res.end(); } catch (_) {}
+    }
+  } finally {
+    clearTimeout(timeout);
+    res.off("close", onClose);
+    try { if (fileStream) fileStream.destroy(); } catch (_) {}
+    try { if (tee) tee.destroy(); } catch (_) {}
+    try { if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
   }
 }
 
