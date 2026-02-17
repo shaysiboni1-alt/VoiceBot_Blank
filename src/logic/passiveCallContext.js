@@ -78,7 +78,7 @@ function createPassiveCallContext({ callSid, streamSid, caller, called, source, 
     returning_last_subject: caller_profile?.last_subject || "",
     returning_last_ended_at: caller_profile?.last_ended_at || null,
 
-    // Lead fields
+    // Lead fields (captured during conversation)
     name: "",
     callback_number: callerInfo.withheld ? "" : callerInfo.value,
     has_request: false,
@@ -109,20 +109,24 @@ function appendUtterance(ctx, u) {
   const effective = String(normalized || text).trim();
   if (!effective) return;
 
-  // 1) Name capture (first time only)
-  if (!ctx.name) {
-    const n = extractNameHe(effective);
-    if (n) ctx.name = n;
-    return;
+  // Always attempt to extract a name from the user's utterance.
+  // If the caller corrects or provides a new name later in the call, update it.
+  const n = extractNameHe(effective);
+  if (n) {
+    ctx.name = n.trim();
   }
 
-  // 2) After we have a name: mark request present if user said something meaningful
-  if (effective.length >= 6) ctx.has_request = true;
+  // Mark that the caller has made a request once they say more than a few characters.
+  if (effective.length >= 6) {
+    ctx.has_request = true;
+  }
 
-  // 3) Callback number if withheld and not captured yet
-  if (ctx.caller_withheld && !ctx.callback_number) {
-    const p = extractPhone(effective);
-    if (p) ctx.callback_number = p;
+  // Always attempt to extract a phone number from user utterances.
+  // This allows callers to override or correct their callback number during the call,
+  // even if the original caller ID was not withheld.
+  const p = extractPhone(effective);
+  if (p) {
+    ctx.callback_number = p;
   }
 }
 
