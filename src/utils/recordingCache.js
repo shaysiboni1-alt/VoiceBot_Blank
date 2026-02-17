@@ -6,124 +6,158 @@ const { Readable } = require("stream");
 
 // Best-effort local cache for Twilio recordings (mp3).
 // Goals:
-// - Never block call flow.
-// - Serve /recording/:sid.mp3 quickly from disk when possible.
-// - If not cached yet, stream from Twilio and tee to disk.
-// - Handle concurrent downloads safely (single in-flight per RecordingSid).
-//
-// NOTE: Uses native fetch (Node 18+) to avoid extra deps like axios.
+// - Never block call flow; cache is optional.
+// - Stream from Twilio -> disk with hard timeouts (connect + total).
+// - Serve cached files quickly via server route.
 
-const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/tmp/recordings";
-const DEFAULT_TIMEOUT_MS = Number(process.env.RECORDING_DOWNLOAD_TIMEOUT_MS || 20000);
+const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 20000;
 
-const inflight = new Map(); // recordingSid -> Promise
-
-function ensureDirSync() {
-  try {
-    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-  } catch (_) {}
+function hasTwilioCreds() {
+  return Boolean(
+    process.env.TWILIO_ACCOUNT_SID &&
+      String(process.env.TWILIO_ACCOUNT_SID).trim() &&
+      process.env.TWILIO_AUTH_TOKEN &&
+      String(process.env.TWILIO_AUTH_TOKEN).trim()
+  );
 }
 
-function getLocalPath(recordingSid) {
-  const sid = String(recordingSid || "").trim();
-  return sid ? path.join(RECORDINGS_DIR, `${sid}.mp3`) : null;
+function getCacheDir() {
+  return process.env.RECORDING_CACHE_DIR || path.join(process.cwd(), "data", "recordings");
 }
 
-function existsSync(p) {
+function ensureCacheDir() {
+  const dir = getCacheDir();
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function recordingPath(recordingSid, ext = "mp3") {
+  const dir = ensureCacheDir();
+  return path.join(dir, `${recordingSid}.${ext}`);
+}
+
+function hasCached(recordingSid) {
   try {
-    return p && fs.existsSync(p) && fs.statSync(p).isFile();
-  } catch (_) {
+    const p = recordingPath(recordingSid);
+    return fs.existsSync(p) && fs.statSync(p).size > 0;
+  } catch {
     return false;
   }
 }
 
-function getTwilioAuth() {
+function twilioAuthHeader() {
   const sid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
-  const token =
-    String(process.env.TWILIO_AUTH_TOKEN || "").trim() ||
-    String(process.env.TWILIO_ACCOUNT_TOKEN || "").trim(); // backward compat if user set it
-  return sid && token ? { username: sid, password: token } : null;
+  const token = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
+  const b64 = Buffer.from(`${sid}:${token}`, "utf8").toString("base64");
+  return `Basic ${b64}`;
 }
 
-async function downloadToFile({ recordingSid, recordingUrl, logger, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const sid = String(recordingSid || "").trim();
-  const url = String(recordingUrl || "").trim();
-  if (!sid || !url) throw new Error("downloadToFile missing sid/url");
-
-  ensureDirSync();
-  const finalPath = getLocalPath(sid);
-  if (!finalPath) throw new Error("downloadToFile no finalPath");
-
-  if (existsSync(finalPath)) return { path: finalPath, cached: true };
-
-  // dedupe concurrent downloads
-  if (inflight.has(sid)) return inflight.get(sid);
-
-  const p = (async () => {
-    const auth = getTwilioAuth();
-    if (!auth) throw new Error("Twilio auth missing (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)");
-
-    const tmpPath = `${finalPath}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    try {
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), timeoutMs);
-
-      const basic = Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64");
-      const resp = await fetch(url, {
-        method: "GET",
-        headers: { Authorization: `Basic ${basic}` },
-        signal: ac.signal,
-      }).finally(() => clearTimeout(t));
-
-      if (!resp.ok) throw new Error(`Upstream responded ${resp.status}`);
-      if (!resp.body) throw new Error("Upstream response has no body");
-
-      const stream = Readable.fromWeb(resp.body);
-
-      await new Promise((resolve, reject) => {
-        const out = fs.createWriteStream(tmpPath);
-        stream.on("error", reject);
-        out.on("error", reject);
-        out.on("finish", resolve);
-        stream.pipe(out);
-      });
-
-      // atomic-ish rename
-      fs.renameSync(tmpPath, finalPath);
-
-      logger?.info?.("Recording cached to disk", { recordingSid: sid, path: finalPath });
-      return { path: finalPath, cached: true };
-    } catch (err) {
-      try {
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-      } catch (_) {}
-
-      logger?.warn?.("Recording cache download failed", {
-        recordingSid: sid,
-        error: String(err?.message || err),
-      });
-      throw err;
-    } finally {
-      inflight.delete(sid);
+async function fetchWithRedirect(url, opts) {
+  // Follow up to 3 redirects manually (Twilio may redirect media to CDN).
+  let current = url;
+  for (let i = 0; i < 4; i++) {
+    const r = await fetch(current, { ...opts, redirect: "manual" });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get("location");
+      if (!loc) return r;
+      current = new URL(loc, current).toString();
+      continue;
     }
-  })();
-
-  inflight.set(sid, p);
-  return p;
+    return r;
+  }
+  return fetch(url, opts);
 }
 
-function startDownloadBestEffort({ recordingSid, recordingUrl, logger } = {}) {
-  // fire and forget
-  downloadToFile({ recordingSid, recordingUrl, logger }).catch(() => {});
+async function getRecordingStatus(recordingSid, { timeoutMs } = {}) {
+  if (!hasTwilioCreds()) return { ok: false, status: "no_creds" };
+  const sid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    sid
+  )}/Recordings/${encodeURIComponent(recordingSid)}.json`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    Math.max(1000, Number(timeoutMs || process.env.RECORDING_STATUS_TIMEOUT_MS || DEFAULT_CONNECT_TIMEOUT_MS))
+  );
+
+  try {
+    const r = await fetchWithRedirect(url, {
+      method: "GET",
+      headers: { Authorization: twilioAuthHeader(), Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!r.ok) return { ok: false, status: `http_${r.status}` };
+    const data = await r.json().catch(() => null);
+    const status = data && typeof data.status === "string" ? data.status : "unknown";
+    return { ok: true, status, data };
+  } catch (e) {
+    return { ok: false, status: e && e.name === "AbortError" ? "timeout" : "error", err: String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function downloadToFile(recordingSid, filePath, opts = {}) {
+  if (!hasTwilioCreds()) throw new Error("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN");
+
+  const sid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const mp3Url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    sid
+  )}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
+
+  const totalTimeoutMs = Number(
+    opts.totalTimeoutMs || process.env.RECORDING_TOTAL_TIMEOUT_MS || DEFAULT_TOTAL_TIMEOUT_MS
+  );
+
+  const controller = new AbortController();
+  const hardTimer = setTimeout(() => controller.abort(), Math.max(1000, totalTimeoutMs));
+
+  let r;
+  try {
+    // IMPORTANT: keep hardTimer active until the stream finishes.
+    r = await fetchWithRedirect(mp3Url, {
+      method: "GET",
+      headers: { Authorization: twilioAuthHeader(), Accept: "audio/mpeg" },
+      signal: controller.signal,
+    });
+
+    if (!r.ok) {
+      throw new Error(`Twilio fetch failed: ${r.status} ${r.statusText}`);
+    }
+
+    const ws = fs.createWriteStream(filePath);
+
+    await new Promise((resolve, reject) => {
+      const onErr = (err) => reject(err);
+      ws.on("error", onErr);
+
+      if (!r.body) return reject(new Error("Twilio response has no body"));
+
+      let rs;
+      try {
+        rs = Readable.fromWeb(r.body);
+      } catch {
+        rs = r.body;
+      }
+      rs.on("error", onErr);
+
+      rs.pipe(ws);
+      ws.on("finish", resolve);
+    });
+
+    return { ok: true, mp3Url, filePath };
+  } finally {
+    clearTimeout(hardTimer);
+  }
 }
 
 module.exports = {
-  RECORDINGS_DIR,
-  ensureDirSync,
-  getLocalPath,
-  existsSync,
-  getTwilioAuth,
+  hasTwilioCreds,
+  getCacheDir,
+  recordingPath,
+  hasCached,
+  getRecordingStatus,
   downloadToFile,
-  startDownloadBestEffort,
 };
