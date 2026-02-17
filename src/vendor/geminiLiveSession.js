@@ -42,6 +42,12 @@ function safeStr(x) {
   return String(x).trim();
 }
 
+function clampNum(n, min, max, fallback) {
+  const v = Number(n);
+  if (Number.isNaN(v)) return fallback;
+  return Math.max(min, Math.min(max, v));
+}
+
 function isClosingUtterance(text) {
   const t = safeStr(text);
   if (!t) return false;
@@ -59,9 +65,21 @@ function isClosingUtterance(text) {
 function applyTemplate(tpl, vars) {
   const s = safeStr(tpl);
   if (!s) return "";
-  return s.replace(/\{([A-Z0-9_]+)\}/g, (_, key) => {
-    const v = vars?.[key];
-    return v === undefined || v === null ? "" : String(v);
+
+  // Support lowercase placeholders too: {display_name} / {CALLER_NAME} / etc.
+  return s.replace(/\{([A-Za-z0-9_]+)\}/g, (_, keyRaw) => {
+    const key = String(keyRaw || "");
+    if (!key) return "";
+    const direct = vars?.[key];
+    if (direct !== undefined && direct !== null) return String(direct);
+
+    const upper = vars?.[key.toUpperCase()];
+    if (upper !== undefined && upper !== null) return String(upper);
+
+    const lower = vars?.[key.toLowerCase()];
+    if (lower !== undefined && lower !== null) return String(lower);
+
+    return "";
   });
 }
 
@@ -94,7 +112,7 @@ function buildIntentsContext(intents) {
   return lines.join("\n").trim();
 }
 
-function buildSystemInstructionFromSSOT(ssot) {
+function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
   const settings = ssot?.settings || {};
   const prompts = ssot?.prompts || {};
   const intents = ssot?.intents || [];
@@ -109,9 +127,36 @@ function buildSystemInstructionFromSSOT(ssot) {
       "- You are NOT a generic model and must NEVER describe yourself as an AI/LLM/model.",
       "- You are the business phone assistant defined by SETTINGS and PROMPTS.",
       "- Speak naturally and briefly.",
-      "- Prefer Hebrew by default unless the caller requests otherwise."
+      "- Prefer Hebrew by default unless the caller requests otherwise.",
+      "",
+      "STRICT OUTPUT POLICY (CRITICAL):",
+      "- NEVER output analysis, explanations, markdown, or meta-commentary.",
+      "- DO NOT 'think out loud'.",
+      "- When you speak, speak only the final user-facing sentence(s).",
+      "- If you are asked to say a specific sentence verbatim, say it immediately and exactly, with no additions."
     ].join("\n")
   );
+
+  // Caller memory policy: if we already have a caller name, do not re-ask it.
+  const callerName = safeStr(runtimeMeta?.caller_name) || safeStr(runtimeMeta?.display_name) || "";
+  if (callerName) {
+    sections.push(
+      [
+        "CALLER MEMORY POLICY:",
+        `- Known caller name: "${callerName}"`,
+        "- Treat it as correct unless the caller explicitly corrects it.",
+        "- Do NOT ask the caller for their name again."
+      ].join("\n")
+    );
+  } else {
+    sections.push(
+      [
+        "CALLER MEMORY POLICY:",
+        "- If you do NOT know the caller name, you may ask for it once, politely.",
+        "- If the caller says their name, accept it and do not ask again."
+      ].join("\n")
+    );
+  }
 
   const master = safeStr(prompts.MASTER_PROMPT);
   const guardrails = safeStr(prompts.GUARDRAILS_PROMPT);
@@ -173,6 +218,8 @@ function getOpeningScriptFromSSOT(ssot, vars) {
     BUSINESS_NAME: safeStr(settings.BUSINESS_NAME),
     BOT_NAME: safeStr(settings.BOT_NAME),
     CALLER_NAME: safeStr(vars?.CALLER_NAME),
+    DISPLAY_NAME: safeStr(vars?.CALLER_NAME), // alias
+    display_name: safeStr(vars?.CALLER_NAME), // alias (lowercase)
     MAIN_PHONE: safeStr(settings.MAIN_PHONE),
     BUSINESS_EMAIL: safeStr(settings.BUSINESS_EMAIL),
     BUSINESS_ADDRESS: safeStr(settings.BUSINESS_ADDRESS),
@@ -205,14 +252,6 @@ function normalizeCallerId(caller) {
 function isTruthyEnv(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes" || s === "y";
-}
-
-async function safeJson(resp) {
-  try {
-    return await resp.json();
-  } catch {
-    return null;
-  }
 }
 
 // -----------------------------------------------------------------------------
@@ -279,6 +318,21 @@ class GeminiLiveSession {
       finalized: false
     };
 
+    // Optional passive context aggregator (best-effort)
+    this._passiveCtx = null;
+    try {
+      if (passiveCallContext?.createPassiveCallContext) {
+        this._passiveCtx = passiveCallContext.createPassiveCallContext({
+          callSid: this._call.callSid,
+          streamSid: this._call.streamSid,
+          caller: this._call.caller_raw,
+          called: this._call.called,
+          source: this._call.source,
+          caller_profile: this.meta?.caller_profile || null
+        });
+      }
+    } catch { /* ignore */ }
+
     // Canonical: after CLOSING is fully spoken, we initiate hangup from our side.
     this._hangupScheduled = false;
   }
@@ -298,12 +352,22 @@ class GeminiLiveSession {
         if (r?.ok && r.recordingSid) {
           this._call.recording_sid = String(r.recordingSid);
           setRecordingForCall(this._call.callSid, { recordingSid: this._call.recording_sid });
+          logger.info("Recording started + stored in registry", { callSid: this._call.callSid, recordingSid: this._call.recording_sid });
         }
       } catch (e) {
         logger.warn("startCallRecording failed", { err: String(e) });
       }
 
-      const systemText = buildSystemInstructionFromSSOT(this.ssot);
+      const callerProfile = this.meta?.caller_profile || null;
+      const callerName = safeStr(callerProfile?.display_name) || "";
+      const systemText = buildSystemInstructionFromSSOT(this.ssot, {
+        caller_name: callerName,
+        display_name: callerName
+      });
+
+      // VAD tuning (keep ENV names locked; clamp to safe ranges)
+      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 120, 50, 600, 120);
+      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 450, 200, 1500, 450);
 
       const setup = {
         setup: {
@@ -312,6 +376,8 @@ class GeminiLiveSession {
 
           generationConfig: {
             responseModalities: ["AUDIO"],
+            // keep concise and fast
+            temperature: 0.2,
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
@@ -323,8 +389,8 @@ class GeminiLiveSession {
 
           realtimeInputConfig: {
             automaticActivityDetection: {
-              prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS ?? 200),
-              silenceDurationMs: Number(env.MB_VAD_SILENCE_MS ?? 900)
+              prefixPaddingMs: vadPrefix,
+              silenceDurationMs: vadSilence
             }
           },
 
@@ -348,10 +414,12 @@ class GeminiLiveSession {
         return;
       }
 
-      if (msg?.setupComplete && !this._greetingSent) {
+      // Send proactive opening exactly once, as early as possible.
+      // We send it on setupComplete if present; otherwise we will send it once we see any serverContent.
+      if ((msg?.setupComplete || msg?.serverContent) && !this._greetingSent) {
         this._greetingSent = true;
         this._sendProactiveOpening();
-        return;
+        // do not return; we still want to process audio in same frame if exists
       }
 
       // AUDIO from Gemini -> Twilio
@@ -377,7 +445,7 @@ class GeminiLiveSession {
         logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
       }
 
-      // Optional text parts
+      // Optional text parts (debug only; should be empty with strict policy, but we keep it)
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -432,7 +500,7 @@ class GeminiLiveSession {
     this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
 
     if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
-    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
+    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 350);
   }
 
   _flushTranscript(who) {
@@ -453,6 +521,18 @@ class GeminiLiveSession {
     try {
       const role = who === "user" ? "user" : "assistant";
       this._call.conversationLog.push({ role, text: nlp.raw, ts: nowIso() });
+    } catch { /* ignore */ }
+
+    // Passive context aggregation (best-effort)
+    try {
+      if (this._passiveCtx && passiveCallContext?.appendUtterance) {
+        passiveCallContext.appendUtterance(this._passiveCtx, {
+          role: who === "user" ? "user" : "assistant",
+          text: nlp.raw,
+          normalized: nlp.normalized,
+          lang: nlp.lang
+        });
+      }
     } catch { /* ignore */ }
 
     logger.info(`UTTERANCE ${who}`, {
@@ -480,18 +560,22 @@ class GeminiLiveSession {
 
           const found = extractCallerName({ userText: nlp.raw, lastBotUtterance: lastBot });
           if (found && found.name) {
+            // Minimal normalization (super conservative)
+            let normalizedName = String(found.name).trim();
+            if (normalizedName === "שאי") normalizedName = "שי"; // fix known STT confusion
+
             const existing = safeStr(this.meta?.caller_profile?.display_name) || "";
-            if (!existing || existing !== found.name) {
+            if (!existing || existing !== normalizedName) {
               // Best-effort DB write, must never block call flow.
-              updateCallerDisplayName(callerId, found.name).catch(() => {});
+              updateCallerDisplayName(callerId, normalizedName).catch(() => {});
               // Update in-memory immediately for same-call usage.
               if (!this.meta.caller_profile) this.meta.caller_profile = {};
-              this.meta.caller_profile.display_name = found.name;
+              this.meta.caller_profile.display_name = normalizedName;
 
               logger.info("CALLER_NAME_CAPTURED", {
                 ...this.meta,
                 caller: callerId,
-                name: found.name,
+                name: normalizedName,
                 confidence_reason: found.reason,
                 source_utterance: nlp.raw
               });
@@ -500,7 +584,6 @@ class GeminiLiveSession {
         }
       } catch { /* swallow */ }
     }
-
 
     // Canonical: after the closing is spoken, initiate a proactive hangup.
     // We only do this once per call. Delay is ENV-controlled to avoid cutting the audio.
@@ -551,7 +634,9 @@ class GeminiLiveSession {
     const greeting = computeGreetingHebrew(tz);
 
     const callerProfile = this.meta?.caller_profile || null;
-    const callerName = safeStr(callerProfile?.display_name) || "";
+    let callerName = safeStr(callerProfile?.display_name) || "";
+    if (callerName === "שאי") callerName = "שי";
+
     // total_calls is the number of *previously completed* calls we have stored.
     // We want the 2nd call (total_calls >= 1) to already be treated as "returning".
     const totalCalls = Number(callerProfile?.total_calls ?? 0);
@@ -560,20 +645,22 @@ class GeminiLiveSession {
     let opening = getOpeningScriptFromSSOT(this.ssot, {
       GREETING: greeting,
       CALLER_NAME: callerName,
+      DISPLAY_NAME: callerName,
+      display_name: callerName,
       returning_caller: isReturning,
       RETURNING_CALLER: isReturning
     });
 
-    // If CALLER_NAME is empty, SSOT templates that include it can produce awkward punctuation/spaces.
-    // Keep this cleanup extremely conservative to avoid changing authored scripts.
+    // Conservative cleanup (do not rewrite authored scripts)
     opening = String(opening)
       .replace(/\s{2,}/g, " ")
       .replace(/\s+,/g, ",")
       .replace(/,\s+,/g, ",")
       .trim();
 
+    // Critical: keep kickoff ultra-short to avoid the model "thinking out loud".
     const userKickoff =
-      `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n` +
+      `אמרי עכשיו בדיוק את המשפט הבא בלבד, מילה במילה, בלי שום תוספת, ואז עצרי להקשבה:\n` +
       opening;
 
     const msg = {
@@ -638,7 +725,12 @@ class GeminiLiveSession {
       };
 
       // optional passive context (non-breaking)
-      if (passiveCallContext?.buildPassiveContext) {
+      if (this._passiveCtx && passiveCallContext?.finalizeCtx) {
+        try {
+          callMeta.passive_context = passiveCallContext.finalizeCtx(this._passiveCtx);
+        } catch { /* ignore */ }
+      } else if (passiveCallContext?.buildPassiveContext) {
+        // fallback to legacy build
         try {
           callMeta.passive_context = passiveCallContext.buildPassiveContext({
             meta: this.meta,
