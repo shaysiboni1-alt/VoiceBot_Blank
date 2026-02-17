@@ -35,24 +35,20 @@ function normalizeCallerId(caller) {
 }
 
 // Extract a name from Hebrew pattern or fallback to any short non-digit phrase.
+// Only accept names consisting of Hebrew/Latin letters and spaces.
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
-  // Try to extract the name following common Hebrew introduction phrases.
-  // Only accept the captured name if it contains Hebrew or Latin letters and spaces.
+  // Try pattern-based extraction
   const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
   if (m && m[1]) {
     const candidate = m[1].trim();
-    // The candidate should consist solely of Hebrew/Latin letters and spaces.
     if (/^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,40}$/u.test(candidate)) {
       return candidate;
     }
   }
-  // Fallback: Only treat the entire utterance as a name if it is short, contains no digits
-  // and consists solely of Hebrew or Latin letters (and spaces). This prevents capturing
-  // product names or random words containing other scripts or punctuation.
+  // Fallback: short utterance of letters/spaces
   if (t.length <= 25 && /^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,25}$/u.test(t)) {
-    // Normalize spaces and strip common hesitation filler.
     const clean = t.replace(/^אה+[, ]*/g, "").trim().replace(/\s+/g, " ");
     return clean;
   }
