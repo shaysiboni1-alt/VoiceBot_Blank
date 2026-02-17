@@ -2,6 +2,8 @@
 "use strict";
 
 const { Readable } = require("node:stream");
+const fs = require("fs");
+const path = require("path");
 
 function isTrue(v) {
   return String(v || "").toLowerCase() === "true";
@@ -39,7 +41,6 @@ async function startCallRecording(callSid, logger) {
     const body = new URLSearchParams({
       RecordingStatusCallback: `${base}/twilio-recording-callback`,
       RecordingStatusCallbackMethod: "POST",
-      // keep as-is; callback can still arrive multiple times; registry stores latest
       RecordingStatusCallbackEvent: "completed",
       RecordingChannels: "dual",
     });
@@ -170,9 +171,63 @@ async function proxyRecordingMp3(recordingSid, res, logger) {
   }
 }
 
+/**
+ * Download the MP3 recording from Twilio and save it locally.
+ * Returns an object with the file path and a public URL (under /recordings) on success,
+ * otherwise null.
+ *
+ * This function is designed to be used in finalizePipeline to ensure the recording
+ * is available even when the proxy route fails.  It uses the same Twilio credentials
+ * as the proxy.
+ */
+async function downloadRecording(recordingSid, logger) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !authToken || !recordingSid) {
+    return null;
+  }
+  try {
+    // Download recording from Twilio
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${encodeURIComponent(
+      recordingSid
+    )}.mp3`;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { authorization: twilioAuthHeader() },
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      logger?.warn?.("Twilio download recording failed", {
+        status: resp.status,
+        body: txt?.slice?.(0, 300),
+      });
+      return null;
+    }
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    // Determine where to store the file: either from LOCAL_RECORDINGS_DIR or default 'recordings'
+    const recordingsDir =
+      process.env.LOCAL_RECORDINGS_DIR ||
+      path.join(__dirname, "..", "..", "recordings");
+    fs.mkdirSync(recordingsDir, { recursive: true });
+    const filePath = path.join(recordingsDir, `${recordingSid}.mp3`);
+    fs.writeFileSync(filePath, buffer);
+    // Build a public URL pointing to the recordings folder
+    const base = process.env.PUBLIC_BASE_URL || "";
+    const publicUrl = `${base.replace(/\/$/, "")}/recordings/${recordingSid}.mp3`;
+    return { filePath, publicUrl };
+  } catch (e) {
+    logger?.warn?.("Twilio download recording exception", {
+      err: String(e),
+      recordingSid,
+    });
+    return null;
+  }
+}
+
 module.exports = {
   startCallRecording,
   publicRecordingUrl,
   hangupCall,
   proxyRecordingMp3,
+  downloadRecording,
 };
