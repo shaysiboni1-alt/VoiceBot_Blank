@@ -21,7 +21,7 @@ const { ensureCallerMemorySchema } = require("./memory/callerMemory");
 // Lead/Recording support (does not affect audio pipeline)
 const recordingRegistry = require("./utils/recordingRegistry");
 const recordingCache = require("./utils/recordingCache");
-const { ensureCacheDir, getCachedRecordingPath, fileExists, downloadToFile } = recordingCache;
+const { ensureCacheDir, getCachedRecordingPath, fileExists } = recordingCache;
 const { setRecordingForCall } = recordingRegistry;
 
 /**
@@ -54,11 +54,9 @@ function twilioRecordingMp3Url(recordingSid) {
 }
 
 async function proxyTwilioMp3(req, res, recordingSid) {
-  // Cache-first proxy for Twilio recording MP3.
-  // Goals:
-  // - Fast response for repeated requests (serve from disk).
-  // - Hard timeout so we never hang Render/Twilio callbacks.
-  // - No third-party modules; keep baseline stable.
+  // Cache + stream (tee) proxy for Twilio recording MP3.
+  // This avoids waiting for a full download before responding, which can
+  // stall for minutes when Twilio generates MP3 on-demand.
 
   const auth = getTwilioBasicAuthHeader();
   if (!auth) {
@@ -66,36 +64,131 @@ async function proxyTwilioMp3(req, res, recordingSid) {
     return;
   }
 
+  const fs = require("fs");
+  const path = require("path");
+  const { PassThrough } = require("stream");
+
+  ensureCacheDir();
+  const cachedPath = getCachedRecordingPath(recordingSid);
+  const tmpPath = `${cachedPath}.part`;
+
+  // Fast path: cached file exists (support Range for Chrome/players)
   try {
-    ensureCacheDir();
-    const cachedPath = getCachedRecordingPath(recordingSid);
+    if (await fileExists(cachedPath)) {
+      const stat = fs.statSync(cachedPath);
+      const range = req.headers.range;
 
-    const timeoutMs = (() => {
-      const v = Number(process.env.RECORDING_PROXY_TIMEOUT_MS || process.env.RECORDING_DOWNLOAD_TIMEOUT_MS || 20000);
-      return Number.isFinite(v) && v > 0 ? Math.floor(v) : 20000;
-    })();
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
 
-    if (!(await fileExists(cachedPath))) {
-      const url = twilioRecordingMp3Url(recordingSid);
-      await downloadToFile(url, recordingSid, { timeoutMs });
+      if (range) {
+        const m = /^bytes=(\d+)-(\d+)?$/.exec(String(range));
+        if (m) {
+          const start = Number(m[1]);
+          const end = m[2] ? Number(m[2]) : stat.size - 1;
+          const safeStart = Number.isFinite(start) ? Math.max(0, start) : 0;
+          const safeEnd = Number.isFinite(end) ? Math.min(stat.size - 1, end) : stat.size - 1;
+          res.status(206);
+          res.setHeader("Accept-Ranges", "bytes");
+          res.setHeader("Content-Range", `bytes ${safeStart}-${safeEnd}/${stat.size}`);
+          res.setHeader("Content-Length", safeEnd - safeStart + 1);
+          return fs.createReadStream(cachedPath, { start: safeStart, end: safeEnd }).pipe(res);
+        }
+      }
+
+      res.status(200);
+      res.setHeader("Content-Length", stat.size);
+      return fs.createReadStream(cachedPath).pipe(res);
     }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-
-    const fs = require("fs");
-    const stream = fs.createReadStream(cachedPath);
-    stream.on("error", (err) => {
-      logger.warn("Recording stream error", { recordingSid, err: String(err && err.message ? err.message : err) });
-      if (!res.headersSent) res.status(500).end("recording_stream_error");
-      else res.end();
-    });
-    stream.pipe(res);
   } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
-    logger.warn("Recording proxy failed", { recordingSid, err: msg });
-    res.status(502).end("recording_unavailable");
+    logger.warn("Cached recording read failed", { recordingSid, err: String(e && e.message ? e.message : e) });
   }
+
+  const url = twilioRecordingMp3Url(recordingSid);
+
+  // Timeouts
+  const connectTimeoutMs = (() => {
+    const v = Number(process.env.RECORDING_PROXY_CONNECT_TIMEOUT_MS || 15000);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 15000;
+  })();
+  const overallTimeoutMs = (() => {
+    const v = Number(process.env.RECORDING_PROXY_OVERALL_TIMEOUT_MS || 120000);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 120000;
+  })();
+
+  const ac = new AbortController();
+  const tConnect = setTimeout(() => ac.abort(new Error("recording_connect_timeout")), connectTimeoutMs);
+
+  let upstream;
+  try {
+    upstream = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: auth,
+        Accept: "audio/mpeg, audio/*;q=0.9, */*;q=0.8",
+      },
+      signal: ac.signal,
+    });
+  } catch (e) {
+    clearTimeout(tConnect);
+    logger.warn("Recording fetch failed", { recordingSid, err: String(e && e.message ? e.message : e) });
+    res.status(504).end("recording_fetch_timeout");
+    return;
+  }
+  clearTimeout(tConnect);
+
+  if (!upstream || !upstream.ok || !upstream.body) {
+    let body = "";
+    try { body = upstream ? await upstream.text() : ""; } catch (_) {}
+    logger.warn("Recording fetch non-200", { recordingSid, status: upstream ? upstream.status : "no_response", body_sample: body.slice(0, 200) });
+    if (upstream && (upstream.status === 404 || upstream.status === 410)) {
+      res.status(404).end("recording_not_ready");
+    } else {
+      res.status(502).end("recording_unavailable");
+    }
+    return;
+  }
+
+  // Start sending immediately.
+  res.status(200);
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+  const pass = new PassThrough();
+  const fileStream = fs.createWriteStream(tmpPath);
+
+  const tOverall = setTimeout(() => {
+    try { ac.abort(new Error("recording_overall_timeout")); } catch (_) {}
+    try { pass.destroy(new Error("recording_overall_timeout")); } catch (_) {}
+  }, overallTimeoutMs);
+
+  const finalize = (err) => {
+    clearTimeout(tOverall);
+    try { fileStream.end(); } catch (_) {}
+    if (!err) {
+      try {
+        fs.mkdirSync(path.dirname(cachedPath), { recursive: true });
+        fs.renameSync(tmpPath, cachedPath);
+      } catch (_) {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+      }
+    } else {
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+  };
+
+  const nodeStream = Readable.fromWeb(upstream.body);
+  nodeStream.on("error", (e) => {
+    logger.warn("Recording upstream stream error", { recordingSid, err: String(e && e.message ? e.message : e) });
+    try { pass.destroy(e); } catch (_) {}
+    finalize(e);
+  });
+  fileStream.on("finish", () => finalize(null));
+  fileStream.on("error", (e) => finalize(e));
+
+  nodeStream.pipe(pass);
+  pass.pipe(res);
+  pass.pipe(fileStream);
 }
 
 const app = express();
