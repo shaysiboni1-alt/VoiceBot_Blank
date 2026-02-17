@@ -1,14 +1,15 @@
-// src/utils/twilioRecordings.js
 "use strict";
 
 const { Readable } = require("node:stream");
 const fs = require("fs");
 const path = require("path");
 
+// Check boolean-like env
 function isTrue(v) {
   return String(v || "").toLowerCase() === "true";
 }
 
+// Build Authorization header for Twilio
 function twilioAuthHeader() {
   const sid = process.env.TWILIO_ACCOUNT_SID || "";
   const token = process.env.TWILIO_AUTH_TOKEN || "";
@@ -16,14 +17,18 @@ function twilioAuthHeader() {
   return `Basic ${basic}`;
 }
 
+// Build base URL for Twilio API
 function twilioBase() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   return `https://api.twilio.com/2010-04-01/Accounts/${sid}`;
 }
 
+// Start a recording for a call
 async function startCallRecording(callSid, logger) {
   const enabled = isTrue(process.env.MB_ENABLE_RECORDING);
-  if (!enabled) return { ok: false, recordingSid: null, reason: "recording_disabled" };
+  if (!enabled) {
+    return { ok: false, recordingSid: null, reason: "recording_disabled" };
+  }
 
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
     logger?.warn?.("TWILIO creds missing; cannot start recording");
@@ -71,12 +76,14 @@ async function startCallRecording(callSid, logger) {
   }
 }
 
+// Build public proxy URL for a recording (fallback)
 function publicRecordingUrl(recordingSid) {
   const base = process.env.PUBLIC_BASE_URL || "";
   if (!base || !recordingSid) return null;
   return `${base.replace(/\/$/, "")}/recording/${recordingSid}.mp3`;
 }
 
+// Hang up a Twilio call
 async function hangupCall(callSid, logger) {
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
   try {
@@ -102,17 +109,10 @@ async function hangupCall(callSid, logger) {
   }
 }
 
-/**
- * Streaming proxy for Twilio recording MP3 with hard timeout.
- * This prevents Render edge 502/504 due to long hangs.
- *
- * Optional ENV:
- *   RECORDING_PROXY_TIMEOUT_MS (default 20000)
- */
+// Streaming proxy for Twilio recording MP3 with timeout
 async function proxyRecordingMp3(recordingSid, res, logger) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
-
   if (!accountSid || !authToken) {
     res.statusCode = 503;
     res.end("twilio_not_configured");
@@ -162,7 +162,6 @@ async function proxyRecordingMp3(recordingSid, res, logger) {
       res.end("recording_fetch_timeout");
       return;
     }
-
     logger?.warn?.("recording proxy exception", { err: String(e), recordingSid });
     res.statusCode = 500;
     res.end("proxy_error");
@@ -173,21 +172,13 @@ async function proxyRecordingMp3(recordingSid, res, logger) {
 
 /**
  * Download the MP3 recording from Twilio and save it locally.
- * Returns an object with the file path and a public URL (under /recordings) on success,
- * otherwise null.
- *
- * This function is designed to be used in finalizePipeline to ensure the recording
- * is available even when the proxy route fails.  It uses the same Twilio credentials
- * as the proxy.
+ * Returns { filePath, publicUrl } on success, or null on failure.
  */
 async function downloadRecording(recordingSid, logger) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
-  if (!accountSid || !authToken || !recordingSid) {
-    return null;
-  }
+  if (!accountSid || !authToken || !recordingSid) return null;
   try {
-    // Download recording from Twilio
     const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${encodeURIComponent(
       recordingSid
     )}.mp3`;
@@ -204,14 +195,12 @@ async function downloadRecording(recordingSid, logger) {
       return null;
     }
     const buffer = Buffer.from(await resp.arrayBuffer());
-    // Determine where to store the file: either from LOCAL_RECORDINGS_DIR or default 'recordings'
     const recordingsDir =
       process.env.LOCAL_RECORDINGS_DIR ||
       path.join(__dirname, "..", "..", "recordings");
     fs.mkdirSync(recordingsDir, { recursive: true });
     const filePath = path.join(recordingsDir, `${recordingSid}.mp3`);
     fs.writeFileSync(filePath, buffer);
-    // Build a public URL pointing to the recordings folder
     const base = process.env.PUBLIC_BASE_URL || "";
     const publicUrl = `${base.replace(/\/$/, "")}/recordings/${recordingSid}.mp3`;
     return { filePath, publicUrl };
