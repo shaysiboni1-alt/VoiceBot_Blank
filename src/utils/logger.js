@@ -5,60 +5,86 @@ function nowIso() {
 }
 
 function isPlainObject(v) {
-  return !!v && typeof v === "object" && !Array.isArray(v) && !(v instanceof Error);
+  return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function serializeError(err) {
-  if (!err) return null;
-  return {
-    message: err.message || String(err),
-    name: err.name || "Error",
-    code: err.code,
-    stack: err.stack,
-  };
+function safeJson(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return { value: String(value) };
+  }
+}
+
+function isTruthyEnv(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y";
+}
+
+function shouldSuppressReasoningText(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+
+  if (/^\*\*/.test(t)) return true;
+
+  if (
+    /\b(Addressing the Request|Refining the Approach|Initiating Callback Request|Concluding the Details|Uttering the Specific Phrase)\b/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /\bI(?:'| a)m now\b/i.test(t) ||
+    /\bMy next step will be\b/i.test(t) ||
+    /\bI've determined\b/i.test(t)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function normalizeArgs(msg, meta) {
+  let outMsg = msg;
+  let outMeta = meta;
+
   if (isPlainObject(msg) && typeof msg.msg === "string") {
-    return {
-      msg: msg.msg,
-      meta: isPlainObject(msg.meta) ? msg.meta : undefined,
-    };
+    outMsg = msg.msg;
+    outMeta = isPlainObject(msg.meta)
+      ? { ...(isPlainObject(meta) ? meta : {}), ...msg.meta }
+      : meta;
+  } else if (isPlainObject(msg) && meta === undefined) {
+    outMsg = msg.message || msg.event || "object";
+    outMeta = msg;
   }
 
-  if (msg instanceof Error) {
-    return {
-      msg: msg.message || "Error",
-      meta: { error: serializeError(msg), ...(isPlainObject(meta) ? meta : {}) },
-    };
-  }
+  if (outMsg === undefined || outMsg === null) outMsg = "";
+  if (typeof outMsg !== "string") outMsg = String(outMsg);
 
-  if (isPlainObject(msg)) {
-    return {
-      msg: msg.event || msg.label || msg.message || "object_log",
-      meta: msg,
-    };
-  }
+  if (!isPlainObject(outMeta)) outMeta = undefined;
 
-  return {
-    msg: String(msg ?? ""),
-    meta: isPlainObject(meta)
-      ? meta
-      : meta instanceof Error
-        ? { error: serializeError(meta) }
-        : undefined,
-  };
+  return { msg: outMsg, meta: outMeta };
 }
 
 function emit(level, msg, meta) {
   const normalized = normalizeArgs(msg, meta);
+  const debugEnabled = isTruthyEnv(process.env.MB_DEBUG);
+
+  if (!debugEnabled && normalized.msg === "Gemini text") {
+    const t = normalized.meta?.t;
+    if (shouldSuppressReasoningText(t)) return;
+  }
+
   const line = {
     time: nowIso(),
     level,
     msg: normalized.msg,
   };
+
   if (normalized.meta && Object.keys(normalized.meta).length) {
-    line.meta = normalized.meta;
+    line.meta = safeJson(normalized.meta);
   }
 
   const s = JSON.stringify(line);
@@ -77,4 +103,8 @@ function getLogger() {
   return logger;
 }
 
-module.exports = { logger, getLogger };
+module.exports = {
+  logger,
+  getLogger,
+  shouldSuppressReasoningText,
+};
