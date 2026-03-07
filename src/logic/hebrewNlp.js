@@ -35,28 +35,6 @@ const HE_DIGIT_WORDS = new Map([
   ["תשע", "9"],
 ]);
 
-const HEBREW_JOIN_MAP = new Map([
-  ["של ום", "שלום"],
-  ["רו צה", "רוצה"],
-  ["ב בק שה", "בבקשה"],
-  ["ל ד בר", "לדבר"],
-  ["תח זור", "תחזור"],
-  ["אל יי", "אליי"],
-  ["ב נו גע", "בנוגע"],
-  ["ל דו חות", "לדוחות"],
-  ["דו חות", "דוחות"],
-  ["דו ח", 'דו"ח'],
-  ["ר ווח", "רווח"],
-  ["ה פסד", "הפסד"],
-  ["ו הפסד", "והפסד"],
-  ["ל ש נת", "לשנת "],
-  ["ש נת", "שנת "],
-  ["לאיזו שנה", "לאיזו שנה"],
-  ["לאיזושנה", "לאיזו שנה"],
-]);
-
-const FILLER_WORDS_RE = /^(אה+|אמ+|המ+|כאילו|טוב|כן כן|רגע רגע)$/u;
-
 function safeStr(x) {
   if (x === undefined || x === null) return "";
   return String(x);
@@ -83,7 +61,7 @@ function basicNormalize(s) {
   out = out.replace(/\u200f|\u200e|\ufeff/g, "");
   out = stripDiacriticsHebrew(out);
   out = normalizePunctuation(out);
-  out = out.replace(/[ \t]+([,.!?;:])/g, "$1");
+  out = out.replace(/\s+([,.!?;:])/g, "$1");
   out = collapseWhitespace(out);
   return out;
 }
@@ -134,14 +112,11 @@ function detectLanguageDetailed(s) {
     };
   }
 
-  const confidence = top[1] / total;
-  const mixed = second[1] > 0 && second[1] / total >= 0.2;
-
   return {
     lang: top[0],
-    confidence,
+    confidence: top[1] / total,
     script_counts: counts,
-    mixed,
+    mixed: second[1] > 0 && second[1] / total >= 0.2,
   };
 }
 
@@ -149,37 +124,83 @@ function detectLanguageRough(s) {
   return detectLanguageDetailed(s).lang;
 }
 
-function collapseSpelledYear(text) {
-  return String(text || "")
-    .replace(/ל\s*ש\s*נת\s*(\d{4})/g, "לשנת $1")
-    .replace(/ש\s*נת\s*(\d{4})/g, "שנת $1");
+function applyPhraseMap(text, replacements) {
+  let s = text;
+  for (const [from, to] of replacements) {
+    const pattern = from
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\s+/g, "\\s+");
+    s = s.replace(new RegExp(pattern, "giu"), to);
+  }
+  return s;
 }
 
-function joinSplitHebrewLetters(text) {
+const PHRASE_FIXES = [
+  ["של ום", "שלום"],
+  ["א פשר", "אפשר"],
+  ["ב בקשה", "בבקשה"],
+  ["שה יא", "שהיא"],
+  ["ש נייה", "שנייה"],
+  ["שא לות", "שאלות"],
+  ["ב בת", "בבת"],
+  ["שוא לת", "שואלת"],
+  ["ד ו חות", "דוחות"],
+  ["דו חות", "דוחות"],
+  ["ל דו חות", "לדוחות"],
+  ["ד ו ח", 'דו"ח'],
+  ["דו ח", 'דו"ח'],
+  ["ר ווח", "רווח"],
+  ["הפ סד", "הפסד"],
+  ["ה פסד", "הפסד"],
+  ["ו הפ סד", "והפסד"],
+  ["ו הפסד", "והפסד"],
+  ["ע בור", "עבור"],
+  ["תש לח", "תשלח"],
+  ["ל ש נת", "לשנת "],
+  ["ש נת", "שנת "],
+  ["לאיזושנה", "לאיזו שנה"],
+  ["לאיזו שנה", "לאיזו שנה"],
+];
+
+function joinSplitDigits(text) {
+  let s = safeStr(text);
+
+  s = s.replace(/(?<!\d)(\d)\s+(\d)\s+(\d)\s+(\d)(?!\d)/g, "$1$2$3$4");
+  s = s.replace(/(?<!\d)(\d)\s+(\d)\s+(\d)(?!\d)/g, "$1$2$3");
+  s = s.replace(/(?<!\d)(\d)\s+(\d)(?!\d)/g, "$1$2");
+
+  return s;
+}
+
+function joinCommonHebrewFragments(text) {
   let s = safeStr(text);
   if (!s || !HEBREW_CHAR_RE.test(s)) return s;
 
-  for (const [from, to] of HEBREW_JOIN_MAP.entries()) {
-    const escaped = from
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-      .replace(/\s+/g, "\\s+");
-    s = s.replace(new RegExp(escaped, "gu"), to);
-  }
+  s = applyPhraseMap(s, PHRASE_FIXES);
 
-  s = s.replace(/\b([\u0590-\u05FF])\s+([\u0590-\u05FF])\b/gu, "$1$2");
+  // specific short-word joins
+  s = s.replace(/\bש\s+נייה\b/gu, "שנייה");
+  s = s.replace(/\bא\s+פשר\b/gu, "אפשר");
+  s = s.replace(/\bב\s+בקשה\b/gu, "בבקשה");
+  s = s.replace(/\bש\s+נת\s*(\d{4})\b/gu, "שנת $1");
+  s = s.replace(/\bל\s+שנת\s*(\d{4})\b/gu, "לשנת $1");
+  s = s.replace(/\bד\s+וחות\b/gu, "דוחות");
+  s = s.replace(/\bר\s+ווח\b/gu, "רווח");
+  s = s.replace(/\bהפ\s+סד\b/gu, "הפסד");
+  s = s.replace(/\bע\s+בור\b/gu, "עבור");
+  s = s.replace(/\bשה\s+יא\b/gu, "שהיא");
+  s = s.replace(/\bשוא\s+לת\b/gu, "שואלת");
+  s = s.replace(/\bשא\s+לות\b/gu, "שאלות");
+  s = s.replace(/\bב\s+בת\b/gu, "בבת");
+  s = s.replace(/\bתש\s+לח\b/gu, "תשלח");
 
-  s = s.replace(
-    /\b([\u0590-\u05FF]{1,2})\s+([\u0590-\u05FF]{1,4})\b/gu,
-    (m, a, b) => {
-      const joined = `${a}${b}`;
-      if (joined.length < 3) return m;
-      if ([a, b].some((p) => FILLER_WORDS_RE.test(p))) return m;
-      return joined;
-    }
-  );
+  // handle repeated spaced letter sequences conservatively
+  s = s.replace(/\b([א-ת])\s+([א-ת]{2,})\b/gu, "$1$2");
+  s = s.replace(/\b([א-ת]{2,})\s+([א-ת])\b/gu, "$1$2");
 
-  s = s.replace(/([\u0590-\u05FF])\s+(\d)/gu, "$1 $2");
-  s = collapseSpelledYear(s);
+  s = joinSplitDigits(s);
+  s = s.replace(/\b(?:לשנת)\s*(\d{4})\b/gu, "לשנת $1");
+  s = s.replace(/\b(?:שנת)\s*(\d{4})\b/gu, "שנת $1");
   s = s.replace(/\s{2,}/g, " ").trim();
 
   return s;
@@ -190,6 +211,7 @@ function normalizeHebrewBusinessTerms(text) {
   s = s.replace(/רווח\s+ו\s*הפסד/gu, "רווח והפסד");
   s = s.replace(/דו"?חות?/gu, "דוחות");
   s = s.replace(/לשנת(\d{4})/gu, "לשנת $1");
+  s = s.replace(/שנת(\d{4})/gu, "שנת $1");
   return s;
 }
 
@@ -214,7 +236,7 @@ function normalizeUtterance(text) {
   const raw = safeStr(text);
 
   let normalized = basicNormalize(raw);
-  normalized = joinSplitHebrewLetters(normalized);
+  normalized = joinCommonHebrewFragments(normalized);
   normalized = normalizeHebrewBusinessTerms(normalized);
   normalized = collapseWhitespace(normalized);
 
@@ -278,7 +300,7 @@ module.exports = {
   isAffirmativeHebrew,
   isClosingPhrase,
   basicNormalize,
-  joinSplitHebrewLetters,
+  joinCommonHebrewFragments,
   normalizeHebrewBusinessTerms,
   hebrewDigitWordsToDigits,
 };
