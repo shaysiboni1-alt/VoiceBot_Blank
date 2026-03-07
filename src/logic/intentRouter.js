@@ -9,95 +9,71 @@ const {
   splitTriggersCell
 } = require("../utils/textNlp");
 
-/**
- * Expected SSOT intents schema (current sheet):
- * [
- *   {
- *     intent_id: "reports_request",
- *     intent_type: "documents",
- *     priority: 90,
- *     triggers_he: "דוחות|דוח|מסמכים|...",
- *     triggers_en: "reports|report|documents|...",
- *     triggers_ru: "...",
- *   }
- * ]
- *
- * Returns:
- * { intent_id, intent_type, score, priority, matched_triggers }
- */
-function detectIntent(utteranceText, intents, opts = {}) {
-  const textRaw = utteranceText || "";
-  const rows = Array.isArray(intents) ? intents : [];
-
-  // If no intents configured, return fallback
-  if (!rows.length) {
+function normalizeArgs(arg1, arg2, arg3) {
+  if (arg1 && typeof arg1 === "object" && !Array.isArray(arg1) && Object.prototype.hasOwnProperty.call(arg1, "text")) {
     return {
-      intent_id: "other",
-      intent_type: "other",
-      score: 0,
-      priority: 0,
-      matched_triggers: []
+      textRaw: String(arg1.text || ""),
+      rows: Array.isArray(arg1.intents) ? arg1.intents : [],
+      opts: arg1.opts || arg3 || {},
     };
   }
+  return {
+    textRaw: String(arg1 || ""),
+    rows: Array.isArray(arg2) ? arg2 : [],
+    opts: arg3 || {},
+  };
+}
+
+function emptyIntent() {
+  return {
+    intent_id: "other",
+    intent_type: "other",
+    score: 0,
+    priority: 0,
+    matched_triggers: []
+  };
+}
+
+function detectIntent(arg1, arg2, arg3) {
+  const { textRaw, rows, opts } = normalizeArgs(arg1, arg2, arg3);
+  if (!rows.length) return emptyIntent();
 
   const lang = opts.forceLang || detectLang(textRaw);
-
-  const norm =
-    lang === "he" ? normalizeHebrew(textRaw) : normalizeLatin(textRaw);
-
+  const norm = lang === "he" ? normalizeHebrew(textRaw) : normalizeLatin(textRaw);
   const tokenSetHe = lang === "he" ? buildHebrewTokenSet(norm) : null;
+  const normTokens = new Set(norm.split(" ").filter(Boolean));
 
-  // Scoring:
-  // - phrase/includes match gets higher weight
-  // - token match gets medium weight
-  // - ties broken by priority desc, then intent_id
   let best = null;
-
   for (const it of rows) {
     const intentId = String(it?.intent_id || "").trim();
-    const intentType = String(it?.intent_type || "").trim();
+    const intentType = String(it?.intent_type || "").trim() || "other";
     const priority = Number(it?.priority ?? 0) || 0;
-
     if (!intentId) continue;
 
-    const triggersCell =
-      lang === "he"
-        ? it?.triggers_he
-        : lang === "ru"
-          ? it?.triggers_ru
-          : it?.triggers_en;
-
+    const triggersCell = lang === "he" ? it?.triggers_he : (lang === "ru" ? it?.triggers_ru : it?.triggers_en);
     const triggers = splitTriggersCell(triggersCell);
     if (!triggers.length) continue;
 
     let score = 0;
     const matched = [];
-
     for (const tr0 of triggers) {
       const tr = lang === "he" ? normalizeHebrew(tr0) : normalizeLatin(tr0);
       if (!tr) continue;
-
-      // Phrase match (substring) — works well for multi-word triggers
       if (tr.length >= 2 && norm.includes(tr)) {
-        score += tr.length >= 6 ? 6 : 4; // longer phrase => stronger
+        score += tr.length >= 6 ? 6 : 4;
         matched.push(tr0);
         continue;
       }
-
-      // Keyword-style match
       if (lang === "he") {
-        // Use tokenSetHe (includes conservative stemming)
-        // If trigger is a single token, check membership
         if (!tr.includes(" ") && tokenSetHe && tokenSetHe.has(tr)) {
           score += 3;
           matched.push(tr0);
           continue;
         }
       } else {
-        // Latin/cyrillic token match (split)
         const tokens = tr.split(" ").filter(Boolean);
         for (const tk of tokens) {
-          if (tk.length >= 2 && norm.split(" ").includes(tk)) {
+          if (tk.length >= 2 && normTokens.has(tk)) {
             score += 2;
             matched.push(tr0);
             break;
@@ -107,46 +83,23 @@ function detectIntent(utteranceText, intents, opts = {}) {
     }
 
     if (score <= 0) continue;
-
     const candidate = {
       intent_id: intentId,
-      intent_type: intentType || "other",
+      intent_type: intentType,
       score,
       priority,
       matched_triggers: Array.from(new Set(matched)).slice(0, 8)
     };
 
-    if (!best) {
-      best = candidate;
-      continue;
-    }
-
-    // Compare
-    if (candidate.score > best.score) best = candidate;
-    else if (candidate.score === best.score) {
-      if (candidate.priority > best.priority) best = candidate;
-      else if (candidate.priority === best.priority) {
-        if (candidate.intent_id.localeCompare(best.intent_id) < 0) best = candidate;
-      }
-    }
+    if (!best) best = candidate;
+    else if (candidate.score > best.score) best = candidate;
+    else if (candidate.score === best.score && candidate.priority > best.priority) best = candidate;
+    else if (candidate.score === best.score && candidate.priority === best.priority && candidate.intent_id.localeCompare(best.intent_id) < 0) best = candidate;
   }
 
-  if (!best) {
-    return {
-      intent_id: "other",
-      intent_type: "other",
-      score: 0,
-      priority: 0,
-      matched_triggers: []
-    };
-  }
-
-  // Optional debug hook
-  if (opts.logDebug) {
-    logger.info("INTENT_DEBUG", { lang, norm, best });
-  }
-
-  return best;
+  const out = best || emptyIntent();
+  if (opts.logDebug) logger.info("INTENT_DEBUG", { lang, norm, best: out });
+  return out;
 }
 
 module.exports = { detectIntent };
