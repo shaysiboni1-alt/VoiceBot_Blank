@@ -105,7 +105,7 @@ function buildIntentsContext(intents) {
     const pb = Number(b?.priority ?? 0);
     if (pb !== pa) return pb - pa;
     return String(a?.intent_id ?? "").localeCompare(
-      String(b?.intent_id ?? "")
+      String(a?.intent_id ?? "")
     );
   });
 
@@ -162,6 +162,21 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
       "- Do NOT switch language because of accent, pronunciation, or a foreign-sounding name.",
       "- Switch language only if the caller explicitly asks to switch, or clearly speaks in a supported language for multiple turns.",
       "- If in doubt, remain in Hebrew.",
+    ].join("\n")
+  );
+
+  sections.push(
+    [
+      "DIALOG POLICY (HARD RULE):",
+      "- Ask only ONE question at a time.",
+      "- Never bundle multiple data-collection questions into one turn.",
+      "- Prefer short, focused follow-up questions.",
+      "- If the caller sounds impatient or says you ask too much, apologize briefly and continue with one short question only.",
+      "- In accounting/report requests, collect details in this order:",
+      "  1) what document/report is needed",
+      "  2) which year/period",
+      "  3) for whom / which file",
+      "  4) callback number confirmation",
     ].join("\n")
   );
 
