@@ -1,44 +1,109 @@
 "use strict";
 
+const {
+  basicNormalize,
+  isAffirmativeHebrew,
+  isClosingPhrase,
+} = require("./hebrewNlp");
+
 function nowIso() {
   return new Date().toISOString();
 }
 
 function normalizeCallerId(caller) {
-  const s = (caller || "").trim();
+  const s = String(caller || "").trim();
   const low = s.toLowerCase();
+
   if (!s) return { value: "", withheld: true };
-  if (["anonymous", "restricted", "unavailable", "unknown", "private", "withheld"].includes(low)) {
+
+  if (
+    ["anonymous", "restricted", "unavailable", "unknown", "private", "withheld"].includes(
+      low
+    )
+  ) {
     return { value: s, withheld: true };
   }
+
   const digits = s.replace(/\D/g, "");
   return { value: s, withheld: digits.length < 5 };
 }
 
-function extractNameHe(text) {
-  const t = (text || "").trim();
-  if (!t) return "";
-  const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני(?: זה)?|מדבר(?:ת)?)\s+([^\n,.!?]{2,40})/u);
-  if (m && m[1]) {
-    const candidate = m[1].trim().replace(/\s+/g, " ");
-    if (/^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,40}$/u.test(candidate)) return candidate;
+const NAME_STOP_WORDS = new Set([
+  "צריך",
+  "רוצה",
+  "בקשה",
+  "בעיה",
+  "דוח",
+  "דוחות",
+  "חשבונית",
+  "חשבוניות",
+  "מרגריטה",
+  "לחזור",
+  "אליי",
+  "אלי",
+  "בנוגע",
+  "רווח",
+  "הפסד",
+  "לשנת",
+  "עבורי",
+  "ממנה",
+  "שיחזרו",
+]);
+
+function looksLikeHumanName(text) {
+  const t = basicNormalize(text).replace(/[,.!?]/g, "").trim();
+  if (!t) return false;
+  if (/\d/.test(t)) return false;
+
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length < 1 || words.length > 2) return false;
+
+  if (!/^[\p{Script=Hebrew}\p{Script=Latin}\s'"-]{2,40}$/u.test(t)) {
+    return false;
   }
+
+  const lowered = words.map((w) => w.toLowerCase());
+  if (lowered.some((w) => NAME_STOP_WORDS.has(w))) return false;
+
+  return true;
+}
+
+function extractNameHe(text) {
+  const t = basicNormalize(text);
+  if (!t) return "";
+
+  const pattern = t.match(
+    /(?:קוראים לי|השם שלי(?: הוא| זה)?|שמי|אני)\s+([^\n,.!?]{1,40})/u
+  );
+  if (pattern && pattern[1]) {
+    const candidate = pattern[1].trim().replace(/\s+/g, " ");
+    if (looksLikeHumanName(candidate)) return candidate;
+  }
+
   return "";
 }
 
 function extractPhone(text) {
-  const digits = (text || "").replace(/\D/g, "");
+  const digits = String(text || "").replace(/\D/g, "");
   if (!digits) return "";
-  if (digits.length >= 9 && digits.length <= 13) {
-    if (digits.startsWith("972") && digits.length === 12) return "+" + digits;
-    if (digits.startsWith("0") && digits.length === 10) return "+972" + digits.slice(1);
-    return digits;
-  }
+
+  if (digits.startsWith("972") && digits.length === 12) return `+${digits}`;
+  if (digits.startsWith("0") && digits.length === 10) return `+972${digits.slice(1)}`;
+  if (digits.length >= 9 && digits.length <= 13) return digits;
+
   return "";
 }
 
-function createPassiveCallContext({ callSid, streamSid, caller, called, source, caller_profile }) {
+function createPassiveCallContext({
+  callSid,
+  streamSid,
+  caller,
+  called,
+  source,
+  caller_profile,
+}) {
   const callerInfo = normalizeCallerId(caller);
+
   return {
     callSid: callSid || "",
     streamSid: streamSid || "",
@@ -53,11 +118,11 @@ function createPassiveCallContext({ callSid, streamSid, caller, called, source, 
     returning_last_subject: caller_profile?.last_subject || "",
     returning_last_ended_at: caller_profile?.last_ended_at || null,
     language_locked: "he",
-    language_observed: [],
-    closing_detected: false,
-    affirmed_callback_number: false,
+    language_observed: "he",
     name: "",
     callback_number: callerInfo.withheld ? "" : callerInfo.value,
+    affirmed_callback_number: false,
+    closing_detected: false,
     has_request: false,
     transcript: [],
   };
@@ -65,24 +130,33 @@ function createPassiveCallContext({ callSid, streamSid, caller, called, source, 
 
 function appendUtterance(ctx, u) {
   if (!ctx) return;
+
   const role = u?.role || "";
   const text = String(u?.text || "");
-  const normalized = u?.normalized;
-  const lang = u?.lang;
-  ctx.transcript.push({ role, text, normalized, lang, ts: nowIso() });
-  if (lang) ctx.language_observed.push(lang);
-  if (u?.language_locked) ctx.language_locked = u.language_locked;
-  if (u?.is_closing) ctx.closing_detected = true;
-  if (u?.affirmed_callback_number) ctx.affirmed_callback_number = true;
+  const normalized = String(u?.normalized || text || "");
+  const lang = u?.lang || "unknown";
+
+  ctx.transcript.push({
+    role,
+    text,
+    normalized,
+    lang,
+    ts: nowIso(),
+  });
 
   if (role !== "user") return;
-  const effective = String(normalized || text).trim();
-  if (!effective) return;
-  const n = extractNameHe(effective);
-  if (n) ctx.name = n.trim();
-  if (effective.length >= 6) ctx.has_request = true;
-  const p = extractPhone(effective);
-  if (p) ctx.callback_number = p;
+
+  if (lang && lang !== "unknown") ctx.language_observed = lang;
+
+  const extractedName = extractNameHe(normalized);
+  if (extractedName) ctx.name = extractedName;
+
+  const phone = extractPhone(normalized);
+  if (phone) ctx.callback_number = phone;
+
+  if (isAffirmativeHebrew(normalized)) ctx.affirmed_callback_number = true;
+  if (isClosingPhrase(normalized)) ctx.closing_detected = true;
+  if (normalized.length >= 6) ctx.has_request = true;
 }
 
 function finalizeCtx(ctx) {
@@ -101,11 +175,16 @@ function buildPassiveContext({ meta, ssot }) {
     source: callMeta.source,
     caller_profile: callMeta.caller_profile || null,
   });
-  if (callMeta.startTs) ctx.started_at = new Date(callMeta.startTs).toISOString();
+
+  if (callMeta.startTs) {
+    ctx.started_at = new Date(callMeta.startTs).toISOString();
+  }
+
   if (ssot && typeof ssot.getSetting === "function") {
     ctx.time_zone = ssot.getSetting("TIME_ZONE") || null;
     ctx.supported_languages = ssot.getSetting("SUPPORTED_LANGUAGES") || null;
   }
+
   return ctx;
 }
 
