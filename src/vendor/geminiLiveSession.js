@@ -3,191 +3,225 @@
 const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
-const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
+const {
+  ulaw8kB64ToPcm16kB64,
+  pcm24kB64ToUlaw8kB64,
+} = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
-const { normalizeUtterance } = require("../logic/hebrewNlp");
+const {
+  normalizeUtterance,
+  detectExplicitLanguageSwitch,
+} = require("../logic/hebrewNlp");
 const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
 const { updateCallerDisplayName } = require("../memory/callerMemory");
-const { startCallRecording, publicRecordingUrl, hangupCall } = require("../utils/twilioRecordings");
-const { setRecordingForCall, waitForRecording, getRecordingForCall } = require("../utils/recordingRegistry");
+const {
+  startCallRecording,
+  publicRecordingUrl,
+  hangupCall,
+} = require("../utils/twilioRecordings");
+const {
+  setRecordingForCall,
+  waitForRecording,
+  getRecordingForCall,
+} = require("../utils/recordingRegistry");
+const { getCachedOpening } = require("../logic/openingBuilder");
 
 let passiveCallContext = null;
 try {
   passiveCallContext = require("../logic/passiveCallContext");
-} catch {}
+} catch {
+  passiveCallContext = null;
+}
 
 function normalizeModelName(m) {
   if (!m) return "";
-  if (m.startsWith("models/")) return m;
-  return `models/${m}`;
+  return m.startsWith("models/") ? m : `models/${m}`;
 }
+
 function liveWsUrl() {
   const key = env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
-  return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(key)}`;
+  return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+    key
+  )}`;
 }
+
 function safeStr(x) {
   if (x === undefined || x === null) return "";
   return String(x).trim();
 }
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function clampNum(n, min, max, fallback) {
   const v = Number(n);
   if (Number.isNaN(v)) return fallback;
   return Math.max(min, Math.min(max, v));
 }
-function nowIso() {
-  return new Date().toISOString();
-}
+
 function normalizeCallerId(caller) {
   const s = (caller || "").trim();
   const low = s.toLowerCase();
+
   if (!s) return { value: "", withheld: true };
-  if (["anonymous", "restricted", "unavailable", "unknown"].includes(low)) return { value: s, withheld: true };
+
+  if (["anonymous", "restricted", "unavailable", "unknown"].includes(low)) {
+    return { value: s, withheld: true };
+  }
+
   const digits = s.replace(/\D/g, "");
   return { value: s, withheld: digits.length < 5 };
 }
+
 function isTruthyEnv(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes" || s === "y";
 }
+
 function isClosingUtterance(text) {
-  const t = safeStr(text).toLowerCase();
+  const t = safeStr(text);
   if (!t) return false;
-  return /(תודה\s*ו?להתראות|להתראות|ביי|נתראה|thank(s)?\b.*(bye|goodbye)|\bbye\b|\bgoodbye\b|до свидания|спасибо)/i.test(t);
+
+  if (/(תודה\s*ו?להתראות|להתראות|ביי|נתראה)/.test(t)) return true;
+  if (/(спасибо.*до свидания|до свидания|пока)/i.test(t)) return true;
+  if (/(thank(s)?\b.*(bye|goodbye)|\bbye\b|\bgoodbye\b)/i.test(t)) return true;
+
+  return false;
 }
-function applyTemplate(tpl, vars) {
-  const s = safeStr(tpl);
-  if (!s) return "";
-  return s.replace(/\{([A-Za-z0-9_]+)\}/g, (_, keyRaw) => {
-    const key = String(keyRaw || "");
-    const direct = vars?.[key];
-    if (direct !== undefined && direct !== null) return String(direct);
-    const upper = vars?.[key.toUpperCase()];
-    if (upper !== undefined && upper !== null) return String(upper);
-    const lower = vars?.[key.toLowerCase()];
-    if (lower !== undefined && lower !== null) return String(lower);
-    return "";
-  });
-}
+
 function buildSettingsContext(settings) {
-  return Object.keys(settings || {}).sort().map((k) => `${k}: ${safeStr(settings[k])}`).join("\n").trim();
+  const keys = Object.keys(settings || {}).sort();
+  return keys.map((k) => `${k}: ${safeStr(settings[k])}`).join("\n").trim();
 }
+
 function buildIntentsContext(intents) {
   const rows = Array.isArray(intents) ? intents.slice() : [];
-  rows.sort((a, b) => (Number(b?.priority ?? 0) - Number(a?.priority ?? 0)) || String(a?.intent_id ?? "").localeCompare(String(b?.intent_id ?? "")));
-  return rows.map((it) => `- ${safeStr(it.intent_id)} | type=${safeStr(it.intent_type)} | priority=${Number(it.priority ?? 0) || 0} | triggers_he=${safeStr(it.triggers_he)} | triggers_en=${safeStr(it.triggers_en)} | triggers_ru=${safeStr(it.triggers_ru)}`).join("\n").trim();
+
+  rows.sort((a, b) => {
+    const pa = Number(a?.priority ?? 0);
+    const pb = Number(b?.priority ?? 0);
+    if (pb !== pa) return pb - pa;
+    return String(a?.intent_id ?? "").localeCompare(
+      String(b?.intent_id ?? "")
+    );
+  });
+
+  return rows
+    .map(
+      (it) =>
+        `- ${safeStr(it.intent_id)} | type=${safeStr(
+          it.intent_type
+        )} | priority=${Number(it.priority ?? 0) || 0} | triggers_he=${safeStr(
+          it.triggers_he
+        )} | triggers_en=${safeStr(it.triggers_en)} | triggers_ru=${safeStr(
+          it.triggers_ru
+        )}`
+    )
+    .join("\n")
+    .trim();
 }
+
 function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
   const settings = ssot?.settings || {};
   const prompts = ssot?.prompts || {};
   const intents = ssot?.intents || [];
-  const defaultLang = safeStr(env.MB_DEFAULT_LANGUAGE || settings.DEFAULT_LANGUAGE) || "he";
+
+  const defaultLang =
+    safeStr(runtimeMeta?.language_locked) ||
+    safeStr(settings.DEFAULT_LANGUAGE) ||
+    "he";
+  const callerName =
+    safeStr(runtimeMeta?.caller_name) ||
+    safeStr(runtimeMeta?.display_name) ||
+    "";
+
   const sections = [];
-  sections.push([
-    "IDENTITY (NON-NEGOTIABLE):",
-    "- You are NOT a generic model and must NEVER describe yourself as an AI/LLM/model.",
-    "- You are the business phone assistant defined by SETTINGS and PROMPTS.",
-    "- Speak naturally, briefly, and service-first.",
-    "- Keep answers short and usable on a live phone call.",
-    "",
-    "STRICT OUTPUT POLICY (CRITICAL):",
-    "- NEVER output analysis, explanations, markdown, or meta-commentary.",
-    "- DO NOT think out loud.",
-    "- Speak only the final caller-facing sentence(s).",
-    "- If told to say a specific sentence verbatim, say only that sentence and then stop.",
-  ].join("\n"));
 
-  const callerName = safeStr(runtimeMeta?.caller_name) || safeStr(runtimeMeta?.display_name) || "";
+  sections.push(
+    [
+      "IDENTITY (NON-NEGOTIABLE):",
+      "- You are the business phone assistant defined by SETTINGS and PROMPTS.",
+      "- Never identify as an AI, model, assistant model, or LLM.",
+      "- Speak briefly, naturally, and only as a customer-facing phone representative.",
+      "",
+      "STRICT OUTPUT POLICY:",
+      "- NEVER output analysis, internal planning, reasoning, markdown, or notes.",
+      "- NEVER describe what you are about to do.",
+      "- Output only the exact user-facing sentence(s) to be spoken.",
+    ].join("\n")
+  );
+
+  sections.push(
+    [
+      "LANGUAGE POLICY (HARD RULE):",
+      `- locked_language=${defaultLang}`,
+      "- Start and stay in Hebrew by default.",
+      "- Do NOT switch language because of accent, pronunciation, or a foreign-sounding name.",
+      "- Switch language only if the caller explicitly asks to switch, or clearly speaks in a supported language for multiple turns.",
+      "- If in doubt, remain in Hebrew.",
+    ].join("\n")
+  );
+
   if (callerName) {
-    sections.push([
-      "CALLER MEMORY POLICY:",
-      `- Known caller name: \"${callerName}\"`,
-      "- Treat it as correct unless the caller explicitly corrects it.",
-      "- Do NOT ask for the caller name again.",
-    ].join("\n"));
+    sections.push(
+      [
+        "CALLER MEMORY POLICY:",
+        `- Known caller name: "${callerName}"`,
+        "- Treat it as correct unless the caller explicitly corrects it.",
+        "- Do not ask for the caller name again if it is already known.",
+      ].join("\n")
+    );
   }
 
-  for (const key of ["MASTER_PROMPT", "GUARDRAILS_PROMPT", "KB_PROMPT", "LEAD_CAPTURE_PROMPT", "INTENT_ROUTER_PROMPT"]) {
-    if (safeStr(prompts[key])) sections.push(`${key}:\n${safeStr(prompts[key])}`);
+  if (prompts.MASTER_PROMPT) {
+    sections.push(`MASTER_PROMPT:\n${safeStr(prompts.MASTER_PROMPT)}`);
   }
+  if (prompts.GUARDRAILS_PROMPT) {
+    sections.push(`GUARDRAILS_PROMPT:\n${safeStr(prompts.GUARDRAILS_PROMPT)}`);
+  }
+  if (prompts.KB_PROMPT) {
+    sections.push(`KB_PROMPT:\n${safeStr(prompts.KB_PROMPT)}`);
+  }
+  if (prompts.LEAD_CAPTURE_PROMPT) {
+    sections.push(
+      `LEAD_CAPTURE_PROMPT:\n${safeStr(prompts.LEAD_CAPTURE_PROMPT)}`
+    );
+  }
+  if (prompts.INTENT_ROUTER_PROMPT) {
+    sections.push(
+      `INTENT_ROUTER_PROMPT:\n${safeStr(prompts.INTENT_ROUTER_PROMPT)}`
+    );
+  }
+
   const settingsContext = buildSettingsContext(settings);
-  if (settingsContext) sections.push(`SETTINGS_CONTEXT (SOURCE OF TRUTH):\n${settingsContext}`);
-  const intentsContext = buildIntentsContext(intents);
-  if (intentsContext) sections.push(`INTENTS_TABLE:\n${intentsContext}`);
+  if (settingsContext) {
+    sections.push(`SETTINGS_CONTEXT:\n${settingsContext}`);
+  }
 
-  sections.push([
-    "LANGUAGE POLICY (HARD RULES):",
-    `- default_language=${defaultLang}`,
-    `- Start in ${defaultLang === "he" ? "Hebrew" : defaultLang} and stay there by default.`,
-    "- NEVER switch language because of accent, pronunciation, caller name, or guesswork.",
-    "- Switch language ONLY if the caller explicitly asks to switch, or if the caller clearly speaks another supported language for at least two consecutive utterances.",
-    "- If unsure, continue in Hebrew.",
-    "- Keep the opening in Hebrew unless there is an explicit language switch request.",
-  ].join("\n"));
+  const intentsContext = buildIntentsContext(intents);
+  if (intentsContext) {
+    sections.push(`INTENTS_TABLE:\n${intentsContext}`);
+  }
 
   return sections.filter(Boolean).join("\n\n---\n\n").trim();
 }
-function computeGreetingHebrew(timeZone) {
-  const tz = timeZone || "Asia/Jerusalem";
-  const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date()));
-  if (Number.isNaN(hour)) return "שלום";
-  if (hour >= 5 && hour < 11) return "בוקר טוב";
-  if (hour >= 11 && hour < 17) return "צהריים טובים";
-  if (hour >= 17 && hour < 22) return "ערב טוב";
-  return "לילה טוב";
-}
-function getOpeningScriptFromSSOT(ssot, vars) {
-  const settings = ssot?.settings || {};
-  const isReturning = Boolean(vars?.RETURNING_CALLER) || Boolean(vars?.returning_caller);
-  const tpl = (isReturning && safeStr(settings.OPENING_SCRIPT_RETURNING)) ? safeStr(settings.OPENING_SCRIPT_RETURNING) : (safeStr(settings.OPENING_SCRIPT) || "שלום! איך אפשר לעזור?");
-  const merged = {
-    BUSINESS_NAME: safeStr(settings.BUSINESS_NAME),
-    BOT_NAME: safeStr(settings.BOT_NAME),
-    CALLER_NAME: safeStr(vars?.CALLER_NAME),
-    DISPLAY_NAME: safeStr(vars?.CALLER_NAME),
-    display_name: safeStr(vars?.CALLER_NAME),
-    MAIN_PHONE: safeStr(settings.MAIN_PHONE),
-    BUSINESS_EMAIL: safeStr(settings.BUSINESS_EMAIL),
-    BUSINESS_ADDRESS: safeStr(settings.BUSINESS_ADDRESS),
-    WORKING_HOURS: safeStr(settings.WORKING_HOURS),
-    BUSINESS_WEBSITE_URL: safeStr(settings.BUSINESS_WEBSITE_URL),
-    VOICE_NAME: safeStr(settings.VOICE_NAME),
-    GREETING: safeStr(vars?.GREETING),
-    ...vars,
-  };
-  return applyTemplate(tpl, merged).trim() || "שלום! איך אפשר לעזור?";
-}
+
 async function deliverWebhook(url, payload, label) {
   if (!url) return;
+
   try {
-    const resp = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     logger.info("Webhook delivered", { label, status: resp.status });
   } catch (e) {
     logger.warn("Webhook delivery failed", { label, error: String(e) });
   }
-}
-function looksLikeNumericContinuation(prev, next) {
-  const a = safeStr(prev);
-  const b = safeStr(next);
-  if (!a || !b) return false;
-  const aDigits = a.replace(/\D/g, "");
-  const bDigits = b.replace(/\D/g, "");
-  if (aDigits && bDigits) return true;
-  if (/^(ו?שנת|שנה|year|год)/i.test(b)) return true;
-  if (/^\d{1,2}$/.test(b)) return true;
-  return false;
-}
-function concatChunks(prev, next) {
-  const a = safeStr(prev);
-  const b = safeStr(next);
-  if (!a) return b;
-  if (!b) return a;
-  if (b.startsWith(a)) return b;
-  if (a.endsWith(b)) return a;
-  if (looksLikeNumericContinuation(a, b)) return `${a}${b}`.replace(/\s+/g, " ").trim();
-  if (/^[,.;:!?]/.test(b)) return `${a}${b}`;
-  return `${a} ${b}`.replace(/\s+/g, " ").trim();
 }
 
 class GeminiLiveSession {
@@ -197,15 +231,30 @@ class GeminiLiveSession {
     this.onTranscript = onTranscript;
     this.meta = meta || {};
     this.ssot = ssot || {};
+
     this.ws = null;
     this.ready = false;
     this.closed = false;
     this._greetingSent = false;
-    this._tr = {
-      user: { bufferText: "", lastChunk: "", timer: null, lastChunkTs: 0 },
-      bot: { bufferText: "", lastChunk: "", timer: null, lastChunkTs: 0 },
+    this._hangupScheduled = false;
+
+    this._langState = {
+      lockedLanguage: safeStr(env.MB_DEFAULT_LANGUAGE) || "he",
+      candidateLanguage: null,
+      candidateHits: 0,
+      minConsecutive: Math.max(
+        2,
+        Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 2)
+      ),
     };
+
+    this._trBuf = {
+      user: { text: "", timer: null, lastChunk: "", lastTs: 0 },
+      bot: { text: "", timer: null, lastChunk: "", lastTs: 0 },
+    };
+
     const callerInfo = normalizeCallerId(this.meta?.caller || "");
+
     this._call = {
       callSid: safeStr(this.meta?.callSid),
       streamSid: safeStr(this.meta?.streamSid),
@@ -219,6 +268,7 @@ class GeminiLiveSession {
       recording_sid: "",
       finalized: false,
     };
+
     this._passiveCtx = null;
     try {
       if (passiveCallContext?.createPassiveCallContext) {
@@ -232,46 +282,63 @@ class GeminiLiveSession {
         });
       }
     } catch {}
-    this._hangupScheduled = false;
-    this._language = {
-      default: safeStr(env.MB_DEFAULT_LANGUAGE || this.ssot?.settings?.DEFAULT_LANGUAGE) || "he",
-      locked: safeStr(env.MB_DEFAULT_LANGUAGE || this.ssot?.settings?.DEFAULT_LANGUAGE) || "he",
-      candidate: null,
-      candidateHits: 0,
-      explicitSwitchRequested: false,
-    };
   }
 
   start() {
     if (this.ws) return;
+
     this.ws = new WebSocket(liveWsUrl());
 
     this.ws.on("open", async () => {
       logger.info("Gemini Live WS connected", this.meta);
+
       try {
         const r = await startCallRecording(this._call.callSid, logger);
         if (r?.ok && r.recordingSid) {
           this._call.recording_sid = String(r.recordingSid);
-          setRecordingForCall(this._call.callSid, { recordingSid: this._call.recording_sid });
-          logger.info("Recording started + stored in registry", { callSid: this._call.callSid, recordingSid: this._call.recording_sid });
+          setRecordingForCall(this._call.callSid, {
+            recordingSid: this._call.recording_sid,
+          });
+          logger.info("Recording started + stored in registry", {
+            callSid: this._call.callSid,
+            recordingSid: this._call.recording_sid,
+          });
         }
       } catch (e) {
         logger.warn("startCallRecording failed", { err: String(e) });
       }
 
-      const callerName = safeStr(this.meta?.caller_profile?.display_name);
-      const systemText = buildSystemInstructionFromSSOT(this.ssot, { caller_name: callerName, display_name: callerName });
-      const vadPrefix = env.MB_LOW_LATENCY_MODE ? clampNum(env.MB_VAD_PREFIX_MS ?? 40, 20, 200, 40) : clampNum(env.MB_VAD_PREFIX_MS ?? 120, 40, 600, 120);
-      const vadSilence = env.MB_LOW_LATENCY_MODE ? clampNum(env.MB_VAD_SILENCE_MS ?? 120, 80, 400, 120) : clampNum(env.MB_VAD_SILENCE_MS ?? 450, 150, 1500, 450);
+      const callerProfile = this.meta?.caller_profile || null;
+      const callerName = safeStr(callerProfile?.display_name) || "";
+
+      const systemText = buildSystemInstructionFromSSOT(this.ssot, {
+        caller_name: callerName,
+        display_name: callerName,
+        language_locked: this._langState.lockedLanguage,
+      });
+
+      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 40, 20, 600, 40);
+      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 120, 80, 1500, 120);
 
       const setup = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
-          systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
+          systemInstruction: systemText
+            ? { parts: [{ text: systemText }] }
+            : undefined,
           generationConfig: {
             responseModalities: ["AUDIO"],
             temperature: 0.15,
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME) || "Kore" } } },
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName:
+                    env.VOICE_NAME_OVERRIDE ||
+                    safeStr(this.ssot?.settings?.VOICE_NAME) ||
+                    "Kore",
+                },
+              },
+            },
           },
           realtimeInputConfig: {
             automaticActivityDetection: {
@@ -279,7 +346,9 @@ class GeminiLiveSession {
               silenceDurationMs: vadSilence,
             },
           },
-          ...(env.MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {}),
+          ...(env.MB_LOG_TRANSCRIPTS
+            ? { inputAudioTranscription: {}, outputAudioTranscription: {} }
+            : {}),
         },
       };
 
@@ -287,35 +356,60 @@ class GeminiLiveSession {
         this.ws.send(JSON.stringify(setup));
         this.ready = true;
       } catch (e) {
-        logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
+        logger.error("Failed to send Gemini setup", {
+          ...this.meta,
+          error: e.message,
+        });
       }
     });
 
     this.ws.on("message", (data) => {
       let msg;
-      try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+      try {
+        msg = JSON.parse(data.toString("utf8"));
+      } catch {
+        return;
+      }
+
       if ((msg?.setupComplete || msg?.serverContent) && !this._greetingSent) {
         this._greetingSent = true;
         this._sendProactiveOpening();
       }
 
       try {
-        const parts = msg?.serverContent?.modelTurn?.parts || msg?.serverContent?.turn?.parts || msg?.serverContent?.parts || [];
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.serverContent?.turn?.parts ||
+          msg?.serverContent?.parts ||
+          [];
+
         for (const p of parts) {
           const inline = p?.inlineData;
-          if (inline?.data && String(inline?.mimeType || "").startsWith("audio/pcm")) {
+          if (
+            inline?.data &&
+            String(inline?.mimeType || "").startsWith("audio/pcm")
+          ) {
             const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
-            if (ulawB64 && this.onGeminiAudioUlaw8kBase64) this.onGeminiAudioUlaw8kBase64(ulawB64);
+            if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
+              this.onGeminiAudioUlaw8kBase64(ulawB64);
+            }
           }
-          if (p?.text && this.onGeminiText) this.onGeminiText(String(p.text));
+
+          if (p?.text && this.onGeminiText) {
+            this.onGeminiText(String(p.text));
+          }
         }
       } catch (e) {
-        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
+        logger.debug("Gemini message parse error", {
+          ...this.meta,
+          error: e.message,
+        });
       }
 
       try {
         const inTr = msg?.serverContent?.inputTranscription?.text;
         if (inTr) this._onTranscriptChunk("user", String(inTr));
+
         const outTr = msg?.serverContent?.outputTranscription?.text;
         if (outTr) this._onTranscriptChunk("bot", String(outTr));
       } catch {}
@@ -325,190 +419,337 @@ class GeminiLiveSession {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
       this.closed = true;
       this.ready = false;
+
       this._flushTranscript("user");
       this._flushTranscript("bot");
+
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
+
       await this._finalizeOnce("gemini_ws_close");
     });
 
     this.ws.on("error", (err) => {
-      logger.error("Gemini Live WS error", { ...this.meta, error: err.message });
+      logger.error("Gemini Live WS error", {
+        ...this.meta,
+        error: err.message,
+      });
     });
   }
 
-  _nextFlushMs(who, chunk) {
-    const base = who === "user" ? env.MB_USER_UTTERANCE_FLUSH_MS : env.MB_BOT_UTTERANCE_FLUSH_MS;
-    const t = safeStr(chunk);
-    if (looksLikeNumericContinuation(this._tr[who].bufferText, t)) {
-      return Math.max(base, Number(env.MB_NUMERIC_CONTINUATION_GRACE_MS || 900));
-    }
-    if (t.length <= Math.max(1, Number(env.MB_MIN_STABLE_UTTERANCE_CHARS || 4) - 1)) return Math.max(base, 900);
-    return base;
+  _scheduleFlush(who) {
+    const holder = this._trBuf[who];
+    if (holder.timer) clearTimeout(holder.timer);
+
+    const delay = who === "user" ? 550 : 750;
+    holder.timer = setTimeout(() => this._flushTranscript(who), delay);
   }
 
   _onTranscriptChunk(who, chunk) {
     if (!env.MB_LOG_TRANSCRIPTS) return;
-    const c = safeStr(chunk);
+
+    const c = String(chunk || "");
     if (!c) return;
-    if (c === this._tr[who].lastChunk) return;
-    this._tr[who].lastChunk = c;
-    this._tr[who].lastChunkTs = Date.now();
-    this._tr[who].bufferText = concatChunks(this._tr[who].bufferText, c).slice(-1200);
-    if (this._tr[who].timer) clearTimeout(this._tr[who].timer);
-    this._tr[who].timer = setTimeout(() => this._flushTranscript(who), this._nextFlushMs(who, c));
+
+    const holder = this._trBuf[who];
+    if (holder.lastChunk === c) return;
+
+    holder.lastChunk = c;
+    holder.lastTs = Date.now();
+
+    if (!holder.text) {
+      holder.text = c;
+    } else if (holder.text.endsWith(c)) {
+      // no-op
+    } else if (c.startsWith(holder.text)) {
+      holder.text = c;
+    } else {
+      holder.text = `${holder.text} ${c}`.replace(/\s{2,}/g, " ");
+    }
+
+    this._scheduleFlush(who);
   }
 
-  _resolveLanguagePolicy(nlp) {
-    let observed = nlp.lang;
-    if (!observed || observed === "unknown" || nlp.lang_confidence < 0.75 || nlp.language_analysis?.mixed) observed = this._language.locked;
-    const explicit = nlp.explicit_language_switch;
-    if (explicit) {
-      this._language.locked = explicit;
-      this._language.candidate = null;
-      this._language.candidateHits = 0;
-      this._language.explicitSwitchRequested = true;
-      observed = explicit;
-    } else if (env.MB_LANGUAGE_LOCK_ENABLED) {
-      if (observed && observed !== this._language.locked) {
-        if (observed === this._language.candidate) this._language.candidateHits += 1;
-        else {
-          this._language.candidate = observed;
-          this._language.candidateHits = 1;
-        }
-        if (this._language.candidateHits >= Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 2)) {
-          this._language.locked = observed;
-          this._language.candidate = null;
-          this._language.candidateHits = 0;
-        }
+  _applyLanguageDecision(nlp) {
+    const explicitSwitch = detectExplicitLanguageSwitch(
+      nlp.raw || nlp.normalized || ""
+    );
+
+    if (explicitSwitch) {
+      this._langState.lockedLanguage = explicitSwitch;
+      this._langState.candidateLanguage = null;
+      this._langState.candidateHits = 0;
+    } else if (
+      nlp.lang &&
+      nlp.lang !== "unknown" &&
+      nlp.lang !== this._langState.lockedLanguage
+    ) {
+      if (nlp.lang === this._langState.candidateLanguage) {
+        this._langState.candidateHits += 1;
       } else {
-        this._language.candidate = null;
-        this._language.candidateHits = 0;
+        this._langState.candidateLanguage = nlp.lang;
+        this._langState.candidateHits = 1;
       }
-    } else if (observed && observed !== "unknown") {
-      this._language.locked = observed;
+
+      if (
+        this._langState.candidateHits >= this._langState.minConsecutive
+      ) {
+        this._langState.lockedLanguage = this._langState.candidateLanguage;
+        this._langState.candidateLanguage = null;
+        this._langState.candidateHits = 0;
+      }
+    } else {
+      this._langState.candidateLanguage = null;
+      this._langState.candidateHits = 0;
     }
-    return this._language.locked;
+
+    logger.info("LANGUAGE_DECISION", {
+      ...this.meta,
+      observed_lang: nlp.lang,
+      observed_confidence: nlp.lang_confidence,
+      explicit_switch: explicitSwitch,
+      locked_language: this._langState.lockedLanguage,
+      candidate_language: this._langState.candidateLanguage,
+      candidate_hits: this._langState.candidateHits,
+    });
   }
 
   _flushTranscript(who) {
     if (!env.MB_LOG_TRANSCRIPTS) return;
-    if (this._tr[who].timer) {
-      clearTimeout(this._tr[who].timer);
-      this._tr[who].timer = null;
+
+    const holder = this._trBuf[who];
+    if (holder.timer) {
+      clearTimeout(holder.timer);
+      holder.timer = null;
     }
-    const text = safeStr(this._tr[who].bufferText);
-    this._tr[who].bufferText = "";
+
+    const text = String(holder.text || "").trim();
+    holder.text = "";
     if (!text) return;
 
     const nlp = normalizeUtterance(text);
-    const lockedLanguage = who === "user" ? this._resolveLanguagePolicy(nlp) : this._language.locked;
+    const role = who === "user" ? "user" : "assistant";
 
-    try {
-      const role = who === "user" ? "user" : "assistant";
-      this._call.conversationLog.push({ role, text: nlp.raw, ts: nowIso(), lang: lockedLanguage });
-    } catch {}
+    this._call.conversationLog.push({
+      role,
+      text: nlp.normalized || nlp.raw,
+      ts: nowIso(),
+    });
 
     try {
       if (this._passiveCtx && passiveCallContext?.appendUtterance) {
         passiveCallContext.appendUtterance(this._passiveCtx, {
-          role: who === "user" ? "user" : "assistant",
+          role,
           text: nlp.raw,
           normalized: nlp.normalized,
           lang: nlp.lang,
-          language_locked: lockedLanguage,
-          is_closing: nlp.is_closing,
-          affirmed_callback_number: nlp.is_affirmation,
         });
       }
     } catch {}
 
-    logger.info(`UTTERANCE ${who}`, { ...this.meta, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang, language_locked: lockedLanguage, lang_confidence: nlp.lang_confidence });
-    if (who === "user" && env.MB_LOG_LANGUAGE_DECISIONS) {
-      logger.info("LANGUAGE_DECISION", { ...this.meta, observed_lang: nlp.lang, observed_confidence: nlp.lang_confidence, explicit_switch: nlp.explicit_language_switch, locked_language: lockedLanguage, candidate_language: this._language.candidate, candidate_hits: this._language.candidateHits });
+    if (who === "user") {
+      this._applyLanguageDecision(nlp);
     }
+
+    logger.info(`UTTERANCE ${who}`, {
+      ...this.meta,
+      text: nlp.raw,
+      normalized: nlp.normalized,
+      lang: nlp.lang,
+      language_locked: this._langState.lockedLanguage,
+      lang_confidence: nlp.lang_confidence,
+    });
 
     if (who === "user") {
       try {
-        const callerId = safeStr(this.meta?.caller);
+        const callerId = safeStr(this.meta?.caller) || "";
         if (callerId) {
           let lastBot = "";
-          const logArr = Array.isArray(this._call?.conversationLog) ? this._call.conversationLog : [];
-          for (let i = logArr.length - 2; i >= 0; i--) {
+          const logArr = Array.isArray(this._call?.conversationLog)
+            ? this._call.conversationLog
+            : [];
+
+          for (let i = logArr.length - 2; i >= 0; i -= 1) {
             const it = logArr[i];
-            if (it && it.role === "assistant" && it.text) { lastBot = String(it.text); break; }
+            if (it?.role === "assistant" && it.text) {
+              lastBot = String(it.text);
+              break;
+            }
           }
-          const found = extractCallerName({ userText: nlp.raw, lastBotUtterance: lastBot });
+
+          const found = extractCallerName({
+            userText: nlp.normalized || nlp.raw,
+            lastBotUtterance: lastBot,
+          });
+
           if (found?.name) {
             let normalizedName = String(found.name).trim();
             if (normalizedName === "שאי") normalizedName = "שי";
-            const existing = safeStr(this.meta?.caller_profile?.display_name);
+
+            const existing =
+              safeStr(this.meta?.caller_profile?.display_name) || "";
+
             if (!existing || existing !== normalizedName) {
               updateCallerDisplayName(callerId, normalizedName).catch(() => {});
               if (!this.meta.caller_profile) this.meta.caller_profile = {};
               this.meta.caller_profile.display_name = normalizedName;
-              logger.info("CALLER_NAME_CAPTURED", { ...this.meta, caller: callerId, name: normalizedName, confidence_reason: found.reason, source_utterance: nlp.raw });
+
+              logger.info("CALLER_NAME_CAPTURED", {
+                ...this.meta,
+                caller: callerId,
+                name: normalizedName,
+                confidence_reason: found.reason,
+                source_utterance: nlp.raw,
+              });
             }
           }
         }
       } catch {}
+
+      const intent = detectIntent({
+        text: nlp.normalized || nlp.raw,
+        intents: this.ssot?.intents || [],
+      });
+
+      logger.info("INTENT_DETECTED", {
+        ...this.meta,
+        text: nlp.raw,
+        normalized: nlp.normalized,
+        lang: nlp.lang,
+        language_locked: this._langState.lockedLanguage,
+        intent,
+      });
     }
 
-    if (who === "bot" && env.FORCE_HANGUP_AFTER_CLOSE && !this._hangupScheduled && (nlp.is_closing || isClosingUtterance(nlp.raw))) {
-      const callSid = safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
+    if (
+      who === "bot" &&
+      env.FORCE_HANGUP_AFTER_CLOSE &&
+      !this._hangupScheduled &&
+      isClosingUtterance(nlp.raw)
+    ) {
+      const callSid =
+        safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
+
       if (callSid) {
         this._hangupScheduled = true;
-        const graceMs = Math.max(3000, Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 15000));
-        setTimeout(() => { hangupCall(callSid, logger).catch(() => {}); }, graceMs);
-        logger.info("Proactive hangup scheduled", { ...this.meta, callSid, delay_ms: graceMs });
+        const graceMs = Math.max(
+          15000,
+          Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 15000)
+        );
+
+        setTimeout(() => {
+          hangupCall(callSid, logger).catch(() => {});
+        }, graceMs);
+
+        logger.info("Proactive hangup scheduled", {
+          ...this.meta,
+          callSid,
+          delay_ms: graceMs,
+        });
       }
     }
 
-    if (who === "user") {
-      const intent = detectIntent({ text: nlp.normalized || nlp.raw, intents: this.ssot?.intents || [], opts: { forceLang: lockedLanguage } });
-      logger.info("INTENT_DETECTED", { ...this.meta, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang, language_locked: lockedLanguage, intent });
+    if (this.onTranscript) {
+      this.onTranscript({
+        who,
+        text: nlp.raw,
+        normalized: nlp.normalized,
+        lang: nlp.lang,
+      });
     }
-
-    if (this.onTranscript) this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang, language_locked: lockedLanguage });
   }
 
   _sendProactiveOpening() {
     if (!this.ws || this.closed || !this.ready) return;
-    const greeting = computeGreetingHebrew(env.TIME_ZONE || "Asia/Jerusalem");
-    let callerName = safeStr(this.meta?.caller_profile?.display_name);
+
+    const callerProfile = this.meta?.caller_profile || null;
+    let callerName = safeStr(callerProfile?.display_name) || "";
     if (callerName === "שאי") callerName = "שי";
-    const totalCalls = Number(this.meta?.caller_profile?.total_calls ?? 0);
+
+    const totalCalls = Number(callerProfile?.total_calls ?? 0);
     const isReturning = totalCalls > 0;
-    let opening = getOpeningScriptFromSSOT(this.ssot, { GREETING: greeting, CALLER_NAME: callerName, DISPLAY_NAME: callerName, display_name: callerName, returning_caller: isReturning, RETURNING_CALLER: isReturning });
-    opening = String(opening).replace(/\s{2,}/g, " ").replace(/\s+,/g, ",").replace(/,\s+,/g, ",").trim();
-    const userKickoff = `אמרי עכשיו בדיוק את המשפט הבא בלבד, בעברית, מילה במילה, בלי שום תוספת, ואז עצרי להקשבה:\n${opening}`;
+
+    const openingPack = getCachedOpening({
+      ssot: this.ssot,
+      callerName,
+      isReturning,
+      timeZone: env.TIME_ZONE || "Asia/Jerusalem",
+      ttlMs: Number(env.MB_OPENING_CACHE_TTL_MS || 300000),
+    });
+
+    const opening = openingPack.opening;
+
+    const userKickoff = [
+      "אמרי עכשיו בדיוק את המשפט הבא בלבד, מילה במילה, בלי שום תוספת, בלי הקדמה ובלי מחשבות בקול.",
+      "אחרי המשפט עצרי והמתיני ללקוח.",
+      opening,
+    ].join("\n");
+
+    const msg = {
+      clientContent: {
+        turns: [{ role: "user", parts: [{ text: userKickoff }] }],
+        turnComplete: true,
+      },
+    };
+
     try {
-      this.ws.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: userKickoff }] }], turnComplete: true } }));
-      logger.info("Proactive opening sent", { ...this.meta, greeting, opening_len: opening.length, language_locked: this._language.locked });
+      this.ws.send(JSON.stringify(msg));
+      logger.info("Proactive opening sent", {
+        ...this.meta,
+        greeting: openingPack.greeting,
+        opening_len: opening.length,
+        language_locked: this._langState.lockedLanguage,
+        opening_cache_hit: openingPack.cache_hit,
+      });
     } catch (e) {
-      logger.debug("Failed sending proactive opening", { ...this.meta, error: e.message });
+      logger.debug("Failed sending proactive opening", {
+        ...this.meta,
+        error: e.message,
+      });
     }
   }
 
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
+
+    const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
+    const msg = {
+      realtimeInput: {
+        mediaChunks: [
+          {
+            mimeType: "audio/pcm;rate=16000",
+            data: pcm16kB64,
+          },
+        ],
+      },
+    };
+
     try {
-      this.ws.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: ulaw8kB64ToPcm16kB64(ulaw8kB64) }] } }));
+      this.ws.send(JSON.stringify(msg));
     } catch (e) {
-      logger.debug("Failed sending audio to Gemini", { ...this.meta, error: e.message });
+      logger.debug("Failed sending audio to Gemini", {
+        ...this.meta,
+        error: e.message,
+      });
     }
   }
 
   endInput() {
     if (!this.ws || this.closed) return;
-    try { this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } })); } catch {}
+
+    try {
+      this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    } catch {}
   }
 
   async _finalizeOnce(reason) {
     if (this._call.finalized) return;
     this._call.finalized = true;
+
     try {
       this._call.ended_at = nowIso();
-      const durationMs = Date.now() - new Date(this._call.started_at).getTime();
+      const durationMs =
+        Date.now() - new Date(this._call.started_at).getTime();
+
       const callMeta = {
         callSid: this._call.callSid,
         streamSid: this._call.streamSid,
@@ -520,31 +761,59 @@ class GeminiLiveSession {
         duration_ms: durationMs,
         caller_withheld: this._call.caller_withheld,
         finalize_reason: reason || "",
-        language_locked: this._language.locked,
+        language_locked: this._langState.lockedLanguage,
       };
+
       if (this._passiveCtx && passiveCallContext?.finalizeCtx) {
-        try { callMeta.passive_context = passiveCallContext.finalizeCtx(this._passiveCtx); } catch {}
-      } else if (passiveCallContext?.buildPassiveContext) {
-        try { callMeta.passive_context = passiveCallContext.buildPassiveContext({ meta: this.meta, ssot: this.ssot }); } catch {}
+        try {
+          callMeta.passive_context = passiveCallContext.finalizeCtx(
+            this._passiveCtx
+          );
+        } catch {}
       }
+
+      const snapshot = {
+        call: callMeta,
+        conversationLog: this._call.conversationLog || [],
+      };
+
       await finalizePipeline({
-        snapshot: { call: callMeta, conversationLog: this._call.conversationLog || [] },
+        snapshot,
         ssot: this.ssot,
         env,
         logger,
         senders: {
-          sendCallLog: (payload) => deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
-          sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
-          sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
+          sendCallLog: (payload) =>
+            deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
+          sendFinal: (payload) =>
+            deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
+          sendAbandoned: (payload) =>
+            deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
           resolveRecording: async () => {
-            if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) return { recording_provider: null, recording_sid: null, recording_url_public: null };
+            if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) {
+              return {
+                recording_provider: null,
+                recording_sid: null,
+                recording_url_public: null,
+              };
+            }
+
             await waitForRecording(this._call.callSid, 12000);
+
             const rec = getRecordingForCall(this._call.callSid);
-            const sid = safeStr(rec?.recordingSid || this._call.recording_sid) || null;
+            const sid =
+              safeStr(rec?.recordingSid || this._call.recording_sid) || null;
+            const url = sid ? publicRecordingUrl(sid) : null;
+
             if (sid) this._call.recording_sid = sid;
-            return { recording_provider: sid ? "twilio" : null, recording_sid: sid, recording_url_public: sid ? publicRecordingUrl(sid) : null };
+
+            return {
+              recording_provider: sid ? "twilio" : null,
+              recording_sid: sid,
+              recording_url_public: url,
+            };
           },
-        }
+        },
       });
     } catch (e) {
       logger.warn("Finalize failed", { error: String(e) });
@@ -554,7 +823,10 @@ class GeminiLiveSession {
   stop() {
     this._finalizeOnce("stop_called").catch(() => {});
     if (!this.ws) return;
-    try { this.ws.close(); } catch {}
+
+    try {
+      this.ws.close();
+    } catch {}
   }
 }
 
