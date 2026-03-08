@@ -1,7 +1,7 @@
 "use strict";
 
 const CACHE = new Map();
-const DEFAULT_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_TTL_MS = 10 * 60 * 1000;
 
 function safeStr(x) {
   if (x === undefined || x === null) return "";
@@ -101,6 +101,22 @@ function getOpeningScriptFromSSOT(ssot, vars) {
   return filled || "שלום! איך נוכל לעזור?";
 }
 
+function warmOpeningCache({
+  ssot,
+  callerName,
+  isReturning,
+  timeZone,
+  ttlMs = DEFAULT_TTL_MS,
+}) {
+  return getCachedOpening({
+    ssot,
+    callerName,
+    isReturning,
+    timeZone,
+    ttlMs,
+  });
+}
+
 function getCachedOpening({
   ssot,
   callerName,
@@ -150,4 +166,5 @@ module.exports = {
   computeGreetingHebrew,
   getOpeningScriptFromSSOT,
   getCachedOpening,
+  warmOpeningCache,
 };
