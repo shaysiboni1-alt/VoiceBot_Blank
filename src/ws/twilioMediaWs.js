@@ -8,8 +8,8 @@ const { GeminiLiveSession } = require("../vendor/geminiLiveSession");
 const { startCallRecording } = require("../utils/twilioRecordings");
 const { setRecordingForCall } = require("../utils/recordingRegistry");
 const { getSSOT } = require("../ssot/ssotClient");
-
 const { getCallerProfile } = require("../memory/callerMemory");
+const { warmOpeningCache } = require("../logic/openingBuilder");
 
 function installTwilioMediaWs(server) {
   const wss = new WebSocket.Server({ noServer: true });
@@ -26,7 +26,6 @@ function installTwilioMediaWs(server) {
     let callSid = null;
     let customParameters = {};
     let gemini = null;
-
     let stopped = false;
 
     function sendToTwilioMedia(ulaw8kB64) {
@@ -41,7 +40,6 @@ function installTwilioMediaWs(server) {
       } catch {}
     }
 
-    // NOTE: must be async because we may await caller-memory lookups (Postgres).
     twilioWs.on("message", async (data) => {
       let msg;
       try {
@@ -58,8 +56,6 @@ function installTwilioMediaWs(server) {
         customParameters = msg?.start?.customParameters || {};
         logger.info("Twilio stream start", { streamSid, callSid, customParameters });
 
-        // Start Twilio call recording early so a RecordingSid exists by the time we finalize.
-        // Canonical spec: if Twilio returns a sid, store it immediately in Registry by CallSid.
         if (env.MB_ENABLE_RECORDING && callSid) {
           startCallRecording(callSid, logger)
             .then((r) => {
@@ -78,12 +74,14 @@ function installTwilioMediaWs(server) {
               }
             })
             .catch((e) => {
-              logger.warn("Failed to start call recording", { callSid, err: e?.message || String(e) });
+              logger.warn("Failed to start call recording", {
+                callSid,
+                err: e?.message || String(e),
+              });
             });
         }
 
-        const ssot = getSSOT(); // already loaded; if empty do not break voice
-
+        const ssot = getSSOT();
         const meta = {
           streamSid,
           callSid,
@@ -92,13 +90,22 @@ function installTwilioMediaWs(server) {
           source: customParameters?.source,
         };
 
-        // Best-effort caller recognition. No impact on lead parsing.
         try {
           const prof = await getCallerProfile(meta.caller);
           if (prof) meta.caller_profile = prof;
-        } catch (e) {
-          // swallow
-        }
+        } catch {}
+
+        try {
+          const callerName = String(meta?.caller_profile?.display_name || "").trim();
+          const totalCalls = Number(meta?.caller_profile?.total_calls ?? 0);
+          warmOpeningCache({
+            ssot,
+            callerName,
+            isReturning: totalCalls > 0,
+            timeZone: env.TIME_ZONE || "Asia/Jerusalem",
+            ttlMs: Number(process.env.MB_OPENING_CACHE_TTL_MS || 600000),
+          });
+        } catch {}
 
         gemini = new GeminiLiveSession({
           meta,
@@ -131,7 +138,11 @@ function installTwilioMediaWs(server) {
       }
 
       if (ev === "connected") {
-        logger.info("Twilio WS event", { event: "connected", streamSid: null, callSid: null });
+        logger.info("Twilio WS event", {
+          event: "connected",
+          streamSid: null,
+          callSid: null,
+        });
       }
     });
 
