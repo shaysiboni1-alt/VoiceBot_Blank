@@ -2,8 +2,6 @@
 
 const HEBREW_DIACRITICS_RE = /[\u0591-\u05C7]/g;
 const HEBREW_CHAR_RE = /[\u0590-\u05FF]/;
-const LATIN_CHAR_RE = /[A-Za-z]/;
-const CYRILLIC_CHAR_RE = /[\u0400-\u04FF]/;
 
 const PUNCT_NORMALIZE_MAP = new Map([
   ["׳", "'"],
@@ -158,8 +156,16 @@ const PHRASE_FIXES = [
   ["תש לח", "תשלח"],
   ["ל ש נת", "לשנת "],
   ["ש נת", "שנת "],
+  ["ל שנ ת", "לשנת "],
+  ["שנשנת", "לשנת"],
   ["לאיזושנה", "לאיזו שנה"],
-  ["לאיזו שנה", "לאיזו שנה"],
+  ["ש תח ז ור", "שתחזור"],
+  ["ש תח זור", "שתחזור"],
+  ["תח זור", "תחזור"],
+  ["ל ק בל", "לקבל"],
+  ["ו הפ ס ד", "והפסד"],
+  ["ש יא", "שהיא"],
+  ["א פשר", "אפשר"],
 ];
 
 function joinSplitDigits(text) {
@@ -178,12 +184,12 @@ function joinCommonHebrewFragments(text) {
 
   s = applyPhraseMap(s, PHRASE_FIXES);
 
-  // specific short-word joins
   s = s.replace(/\bש\s+נייה\b/gu, "שנייה");
   s = s.replace(/\bא\s+פשר\b/gu, "אפשר");
   s = s.replace(/\bב\s+בקשה\b/gu, "בבקשה");
   s = s.replace(/\bש\s+נת\s*(\d{4})\b/gu, "שנת $1");
   s = s.replace(/\bל\s+שנת\s*(\d{4})\b/gu, "לשנת $1");
+  s = s.replace(/\bל\s+שנ\s+ת\s*(\d{4})\b/gu, "לשנת $1");
   s = s.replace(/\bד\s+וחות\b/gu, "דוחות");
   s = s.replace(/\bר\s+ווח\b/gu, "רווח");
   s = s.replace(/\bהפ\s+סד\b/gu, "הפסד");
@@ -193,14 +199,22 @@ function joinCommonHebrewFragments(text) {
   s = s.replace(/\bשא\s+לות\b/gu, "שאלות");
   s = s.replace(/\bב\s+בת\b/gu, "בבת");
   s = s.replace(/\bתש\s+לח\b/gu, "תשלח");
+  s = s.replace(/\bתח\s+זור\b/gu, "תחזור");
+  s = s.replace(/\bל\s+קבל\b/gu, "לקבל");
+  s = s.replace(/\bו\s+הפסד\b/gu, "והפסד");
 
-  // handle repeated spaced letter sequences conservatively
   s = s.replace(/\b([א-ת])\s+([א-ת]{2,})\b/gu, "$1$2");
   s = s.replace(/\b([א-ת]{2,})\s+([א-ת])\b/gu, "$1$2");
 
   s = joinSplitDigits(s);
-  s = s.replace(/\b(?:לשנת)\s*(\d{4})\b/gu, "לשנת $1");
-  s = s.replace(/\b(?:שנת)\s*(\d{4})\b/gu, "שנת $1");
+
+  s = s.replace(/\b20\s+25\b/gu, "2025");
+  s = s.replace(/\b20\s+24\b/gu, "2024");
+  s = s.replace(/\b20\s+23\b/gu, "2023");
+  s = s.replace(/\b20\s+22\b/gu, "2022");
+
+  s = s.replace(/\bלשנת\s*(\d{4})\b/gu, "לשנת $1");
+  s = s.replace(/\bשנת\s*(\d{4})\b/gu, "שנת $1");
   s = s.replace(/\s{2,}/g, " ").trim();
 
   return s;
@@ -210,6 +224,7 @@ function normalizeHebrewBusinessTerms(text) {
   let s = safeStr(text);
   s = s.replace(/רווח\s+ו\s*הפסד/gu, "רווח והפסד");
   s = s.replace(/דו"?חות?/gu, "דוחות");
+  s = s.replace(/דו"?ח/gu, 'דו"ח');
   s = s.replace(/לשנת(\d{4})/gu, "לשנת $1");
   s = s.replace(/שנת(\d{4})/gu, "שנת $1");
   return s;
@@ -282,9 +297,53 @@ function detectExplicitLanguageSwitch(text) {
 
 function isAffirmativeHebrew(text) {
   const t = basicNormalize(text);
-  return /^(כן|בטח|ברור|בוודאי|ודאי|סבבה|אוקיי|אוקי|נכון)([.!?, ]|$)/u.test(
+  return /^(כן|כן כן|בטח|ברור|בוודאי|ודאי|סבבה|אוקיי|אוקי|נכון|יאללה כן)([.!?, ]|$)/u.test(
     t
   );
+}
+
+function isNegativeHebrew(text) {
+  const t = basicNormalize(text);
+  return /^(לא|ממש לא|לא צריך|אין צורך|לא לא)([.!?, ]|$)/u.test(t);
+}
+
+function isShortAffirmationAny(text) {
+  const t = basicNormalize(text).toLowerCase();
+  if (!t) return false;
+
+  if (isAffirmativeHebrew(t)) return true;
+
+  return /^(yes|yep|yeah|ok|okay|bien|si|sí|geen|gen|lo|oui)([.!?, ]|$)/i.test(
+    t
+  );
+}
+
+function isShortNegationAny(text) {
+  const t = basicNormalize(text).toLowerCase();
+  if (!t) return false;
+
+  if (isNegativeHebrew(t)) return true;
+
+  return /^(no|nope|lo|geen|gen|nah|non)([.!?, ]|$)/i.test(t);
+}
+
+function isShortSpeechToken(text) {
+  const t = basicNormalize(text);
+  if (!t) return false;
+  const words = t.split(/\s+/).filter(Boolean);
+  return words.length <= 3 && t.length <= 18;
+}
+
+function isLikelyNoiseLanguageFlip(text) {
+  const t = basicNormalize(text);
+  if (!t) return false;
+
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 2) return false;
+
+  if (HEBREW_CHAR_RE.test(t)) return false;
+
+  return /^[A-Za-z.,!?'" -]{1,20}$/.test(t);
 }
 
 function isClosingPhrase(text) {
@@ -298,6 +357,11 @@ module.exports = {
   detectLanguageDetailed,
   detectExplicitLanguageSwitch,
   isAffirmativeHebrew,
+  isNegativeHebrew,
+  isShortAffirmationAny,
+  isShortNegationAny,
+  isShortSpeechToken,
+  isLikelyNoiseLanguageFlip,
   isClosingPhrase,
   basicNormalize,
   joinCommonHebrewFragments,
