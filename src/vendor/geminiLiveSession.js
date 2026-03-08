@@ -11,6 +11,10 @@ const { detectIntent } = require("../logic/intentRouter");
 const {
   normalizeUtterance,
   detectExplicitLanguageSwitch,
+  isShortAffirmationAny,
+  isShortNegationAny,
+  isShortSpeechToken,
+  isLikelyNoiseLanguageFlip,
 } = require("../logic/hebrewNlp");
 const { extractCallerName } = require("../logic/nameExtractor");
 const { finalizePipeline } = require("../stage4/finalizePipeline");
@@ -25,7 +29,7 @@ const {
   waitForRecording,
   getRecordingForCall,
 } = require("../utils/recordingRegistry");
-const { getCachedOpening } = require("../logic/openingBuilder");
+const { getCachedOpening, warmOpeningCache } = require("../logic/openingBuilder");
 
 let passiveCallContext = null;
 try {
@@ -105,7 +109,7 @@ function buildIntentsContext(intents) {
     const pb = Number(b?.priority ?? 0);
     if (pb !== pa) return pb - pa;
     return String(a?.intent_id ?? "").localeCompare(
-      String(a?.intent_id ?? "")
+      String(b?.intent_id ?? "")
     );
   });
 
@@ -159,8 +163,8 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
       "LANGUAGE POLICY (HARD RULE):",
       `- locked_language=${defaultLang}`,
       "- Start and stay in Hebrew by default.",
-      "- Do NOT switch language because of accent, pronunciation, or a foreign-sounding name.",
-      "- Switch language only if the caller explicitly asks to switch, or clearly speaks in a supported language for multiple turns.",
+      "- Do NOT switch language because of accent, pronunciation, short foreign words, transliteration, or background TV/radio.",
+      "- Switch language only if the caller explicitly asks to switch, or clearly speaks in a supported language for multiple full turns.",
       "- If in doubt, remain in Hebrew.",
     ].join("\n")
   );
@@ -177,6 +181,7 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
       "  2) which year/period",
       "  3) for whom / which file",
       "  4) callback number confirmation",
+      "- For yes/no questions, keep the next response short and move on immediately.",
     ].join("\n")
   );
 
@@ -258,9 +263,15 @@ class GeminiLiveSession {
       candidateLanguage: null,
       candidateHits: 0,
       minConsecutive: Math.max(
-        2,
-        Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 2)
+        3,
+        Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 3)
       ),
+    };
+
+    this._dialogState = {
+      lastBotQuestionType: null,
+      awaitingBinaryConfirmation: false,
+      lastBotTurnAt: 0,
     };
 
     this._trBuf = {
@@ -299,9 +310,28 @@ class GeminiLiveSession {
     } catch {}
   }
 
+  _primeOpeningCache() {
+    const callerProfile = this.meta?.caller_profile || null;
+    let callerName = safeStr(callerProfile?.display_name) || "";
+    if (callerName === "שאי") callerName = "שי";
+    const totalCalls = Number(callerProfile?.total_calls ?? 0);
+    const isReturning = totalCalls > 0;
+
+    try {
+      warmOpeningCache({
+        ssot: this.ssot,
+        callerName,
+        isReturning,
+        timeZone: env.TIME_ZONE || "Asia/Jerusalem",
+        ttlMs: Number(env.MB_OPENING_CACHE_TTL_MS || 600000),
+      });
+    } catch {}
+  }
+
   start() {
     if (this.ws) return;
 
+    this._primeOpeningCache();
     this.ws = new WebSocket(liveWsUrl());
 
     this.ws.on("open", async () => {
@@ -332,8 +362,8 @@ class GeminiLiveSession {
         language_locked: this._langState.lockedLanguage,
       });
 
-      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 40, 20, 600, 40);
-      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 120, 80, 1500, 120);
+      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 45, 20, 600, 45);
+      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 110, 70, 1500, 110);
 
       const setup = {
         setup: {
@@ -370,6 +400,7 @@ class GeminiLiveSession {
       try {
         this.ws.send(JSON.stringify(setup));
         this.ready = true;
+        this._sendProactiveOpening();
       } catch (e) {
         logger.error("Failed to send Gemini setup", {
           ...this.meta,
@@ -388,7 +419,7 @@ class GeminiLiveSession {
 
       if ((msg?.setupComplete || msg?.serverContent) && !this._greetingSent) {
         this._greetingSent = true;
-        this._sendProactiveOpening();
+        if (!this._openingAlreadySent) this._sendProactiveOpening();
       }
 
       try {
@@ -451,12 +482,20 @@ class GeminiLiveSession {
     });
   }
 
-  _scheduleFlush(who) {
+  _scheduleFlush(who, immediate = false) {
     const holder = this._trBuf[who];
     if (holder.timer) clearTimeout(holder.timer);
 
-    const delay = who === "user" ? 550 : 750;
+    const delay = immediate ? 120 : who === "user" ? 420 : 650;
     holder.timer = setTimeout(() => this._flushTranscript(who), delay);
+  }
+
+  _shouldFastFlushUser(chunk) {
+    const nlp = normalizeUtterance(chunk || "");
+    if (isShortSpeechToken(nlp.normalized)) return true;
+    if (isShortAffirmationAny(nlp.normalized)) return true;
+    if (isShortNegationAny(nlp.normalized)) return true;
+    return false;
   }
 
   _onTranscriptChunk(who, chunk) {
@@ -481,7 +520,34 @@ class GeminiLiveSession {
       holder.text = `${holder.text} ${c}`.replace(/\s{2,}/g, " ");
     }
 
+    if (who === "user" && this._shouldFastFlushUser(holder.text)) {
+      this._scheduleFlush(who, true);
+      return;
+    }
+
     this._scheduleFlush(who);
+  }
+
+  _isBinaryQuestion(text) {
+    const t = safeStr(text);
+    if (!t) return false;
+
+    return /(האם\s+לחזור|לחזור למספר|אפשר להשתמש במספר|זה המספר הנכון|נחזור למספר)/.test(
+      t
+    );
+  }
+
+  _classifyBotQuestion(text) {
+    const t = safeStr(text);
+    if (!t) return null;
+
+    if (this._isBinaryQuestion(t)) return "callback_confirmation";
+    if (/(אילו דוחות|איזה דוחות|אילו מסמכים|איזה מסמכים)/.test(t))
+      return "document_type";
+    if (/(לאיזו שנה|איזו תקופה|שנה או תקופה)/.test(t))
+      return "period";
+    if (/(עבור מי|איזה תיק)/.test(t)) return "owner";
+    return null;
   }
 
   _applyLanguageDecision(nlp) {
@@ -498,6 +564,23 @@ class GeminiLiveSession {
       nlp.lang !== "unknown" &&
       nlp.lang !== this._langState.lockedLanguage
     ) {
+      const shortOrNoisy =
+        isShortSpeechToken(nlp.normalized) || isLikelyNoiseLanguageFlip(nlp.raw);
+
+      if (shortOrNoisy) {
+        logger.info("LANGUAGE_DECISION", {
+          ...this.meta,
+          observed_lang: nlp.lang,
+          observed_confidence: nlp.lang_confidence,
+          explicit_switch: explicitSwitch,
+          locked_language: this._langState.lockedLanguage,
+          candidate_language: this._langState.candidateLanguage,
+          candidate_hits: this._langState.candidateHits,
+          ignored_short_or_noisy_language_flip: true,
+        });
+        return;
+      }
+
       if (nlp.lang === this._langState.candidateLanguage) {
         this._langState.candidateHits += 1;
       } else {
@@ -526,6 +609,24 @@ class GeminiLiveSession {
       candidate_language: this._langState.candidateLanguage,
       candidate_hits: this._langState.candidateHits,
     });
+  }
+
+  _handleShortConfirmationSignal(nlp) {
+    if (!this._dialogState.awaitingBinaryConfirmation) return false;
+
+    const t = nlp.normalized || "";
+    if (isShortAffirmationAny(t) || isShortNegationAny(t)) {
+      logger.info("SHORT_CONFIRMATION_DETECTED", {
+        ...this.meta,
+        text: t,
+        question_type: this._dialogState.lastBotQuestionType,
+        affirmative: isShortAffirmationAny(t),
+        negative: isShortNegationAny(t),
+      });
+      return true;
+    }
+
+    return false;
   }
 
   _flushTranscript(who) {
@@ -563,6 +664,7 @@ class GeminiLiveSession {
 
     if (who === "user") {
       this._applyLanguageDecision(nlp);
+      this._handleShortConfirmationSignal(nlp);
     }
 
     logger.info(`UTTERANCE ${who}`, {
@@ -635,6 +737,15 @@ class GeminiLiveSession {
       });
     }
 
+    if (who === "bot") {
+      this._dialogState.lastBotQuestionType = this._classifyBotQuestion(
+        nlp.normalized || nlp.raw
+      );
+      this._dialogState.awaitingBinaryConfirmation =
+        this._dialogState.lastBotQuestionType === "callback_confirmation";
+      this._dialogState.lastBotTurnAt = Date.now();
+    }
+
     if (
       who === "bot" &&
       env.FORCE_HANGUP_AFTER_CLOSE &&
@@ -675,6 +786,8 @@ class GeminiLiveSession {
 
   _sendProactiveOpening() {
     if (!this.ws || this.closed || !this.ready) return;
+    if (this._openingAlreadySent) return;
+    this._openingAlreadySent = true;
 
     const callerProfile = this.meta?.caller_profile || null;
     let callerName = safeStr(callerProfile?.display_name) || "";
@@ -688,7 +801,7 @@ class GeminiLiveSession {
       callerName,
       isReturning,
       timeZone: env.TIME_ZONE || "Asia/Jerusalem",
-      ttlMs: Number(env.MB_OPENING_CACHE_TTL_MS || 300000),
+      ttlMs: Number(env.MB_OPENING_CACHE_TTL_MS || 600000),
     });
 
     const opening = openingPack.opening;
