@@ -153,7 +153,6 @@ const PHRASE_FIXES = [
   ["ו הפ סד", "והפסד"],
   ["ו הפסד", "והפסד"],
   ["ע בור", "עבור"],
-  ["ע בורי", "עבורי"],
   ["תש לח", "תשלח"],
   ["ל ש נת", "לשנת "],
   ["ש נת", "שנת "],
@@ -164,16 +163,18 @@ const PHRASE_FIXES = [
   ["ש תח זור", "שתחזור"],
   ["תח זור", "תחזור"],
   ["ל ק בל", "לקבל"],
-  ["ל דבר", "לדבר"],
-  ["רוצ ה", "רוצה"],
-  ["ב בק שה", "בבקשה"],
+  ["ו הפ ס ד", "והפסד"],
+  ["ש יא", "שהיא"],
+  ["א פשר", "אפשר"],
 ];
 
 function joinSplitDigits(text) {
   let s = safeStr(text);
+
   s = s.replace(/(?<!\d)(\d)\s+(\d)\s+(\d)\s+(\d)(?!\d)/g, "$1$2$3$4");
   s = s.replace(/(?<!\d)(\d)\s+(\d)\s+(\d)(?!\d)/g, "$1$2$3");
   s = s.replace(/(?<!\d)(\d)\s+(\d)(?!\d)/g, "$1$2");
+
   return s;
 }
 
@@ -182,13 +183,16 @@ function joinCommonHebrewFragments(text) {
   if (!s || !HEBREW_CHAR_RE.test(s)) return s;
 
   s = applyPhraseMap(s, PHRASE_FIXES);
+
   s = s.replace(/\bש\s+נייה\b/gu, "שנייה");
   s = s.replace(/\bא\s+פשר\b/gu, "אפשר");
   s = s.replace(/\bב\s+בקשה\b/gu, "בבקשה");
+  s = s.replace(/\bש\s+נת\s*(\d{4})\b/gu, "שנת $1");
+  s = s.replace(/\bל\s+שנת\s*(\d{4})\b/gu, "לשנת $1");
+  s = s.replace(/\bל\s+שנ\s+ת\s*(\d{4})\b/gu, "לשנת $1");
   s = s.replace(/\bד\s+וחות\b/gu, "דוחות");
   s = s.replace(/\bר\s+ווח\b/gu, "רווח");
   s = s.replace(/\bהפ\s+סד\b/gu, "הפסד");
-  s = s.replace(/\bו\s+הפסד\b/gu, "והפסד");
   s = s.replace(/\bע\s+בור\b/gu, "עבור");
   s = s.replace(/\bשה\s+יא\b/gu, "שהיא");
   s = s.replace(/\bשוא\s+לת\b/gu, "שואלת");
@@ -197,27 +201,22 @@ function joinCommonHebrewFragments(text) {
   s = s.replace(/\bתש\s+לח\b/gu, "תשלח");
   s = s.replace(/\bתח\s+זור\b/gu, "תחזור");
   s = s.replace(/\bל\s+קבל\b/gu, "לקבל");
-  s = s.replace(/\bל\s+דבר\b/gu, "לדבר");
-  s = s.replace(/\bרוצ\s+ה\b/gu, "רוצה");
-  s = s.replace(/\bב\s+בק\s+שה\b/gu, "בבקשה");
-  s = s.replace(/\bדו"?חות?\b/gu, "דוחות");
-  s = s.replace(/\bדו"?ח\b/gu, 'דו"ח');
+  s = s.replace(/\bו\s+הפסד\b/gu, "והפסד");
 
   s = s.replace(/\b([א-ת])\s+([א-ת]{2,})\b/gu, "$1$2");
   s = s.replace(/\b([א-ת]{2,})\s+([א-ת])\b/gu, "$1$2");
 
   s = joinSplitDigits(s);
-  s = s.replace(/\b2\s*0\s*2\s*5\b/gu, "2025");
-  s = s.replace(/\b2\s*0\s*2\s*4\b/gu, "2024");
-  s = s.replace(/\b2\s*0\s*2\s*3\b/gu, "2023");
-  s = s.replace(/\b2\s*0\s*2\s*2\b/gu, "2022");
+
   s = s.replace(/\b20\s+25\b/gu, "2025");
   s = s.replace(/\b20\s+24\b/gu, "2024");
   s = s.replace(/\b20\s+23\b/gu, "2023");
   s = s.replace(/\b20\s+22\b/gu, "2022");
+
   s = s.replace(/\bלשנת\s*(\d{4})\b/gu, "לשנת $1");
   s = s.replace(/\bשנת\s*(\d{4})\b/gu, "שנת $1");
   s = s.replace(/\s{2,}/g, " ").trim();
+
   return s;
 }
 
@@ -250,15 +249,17 @@ function hebrewDigitWordsToDigits(text) {
 
 function normalizeUtterance(text) {
   const raw = safeStr(text);
+
   let normalized = basicNormalize(raw);
   normalized = joinCommonHebrewFragments(normalized);
   normalized = normalizeHebrewBusinessTerms(normalized);
   normalized = collapseWhitespace(normalized);
 
   const langInfo = detectLanguageDetailed(normalized);
-  const normalized_for_numbers = langInfo.lang === "he"
-    ? hebrewDigitWordsToDigits(normalized)
-    : normalized;
+  const normalized_for_numbers =
+    langInfo.lang === "he"
+      ? hebrewDigitWordsToDigits(normalized)
+      : normalized;
 
   return {
     raw,
@@ -275,21 +276,30 @@ function detectExplicitLanguageSwitch(text) {
   const t = basicNormalize(text).toLowerCase();
   if (!t) return null;
 
-  if (/(אפשר|תעבור|תדבר|דבר)\s+באנגלית|english please|speak english/.test(t)) {
+  if (
+    /(אפשר|תעבור|תדבר|דבר)\s+באנגלית|english please|speak english/.test(t)
+  ) {
     return "en";
   }
-  if (/(אפשר|תעבור|תדבר|דבר)\s+ברוסית|русский|говори по-русски/.test(t)) {
+
+  if (
+    /(אפשר|תעבור|תדבר|דבר)\s+ברוסית|русский|говори по-русски/.test(t)
+  ) {
     return "ru";
   }
+
   if (/(אפשר|תעבור|תדבר|דבר)\s+בעברית|speak hebrew/.test(t)) {
     return "he";
   }
+
   return null;
 }
 
 function isAffirmativeHebrew(text) {
   const t = basicNormalize(text);
-  return /^(כן|כן כן|בטח|ברור|בוודאי|ודאי|סבבה|אוקיי|אוקי|נכון|יאללה כן)([.!?, ]|$)/u.test(t);
+  return /^(כן|כן כן|בטח|ברור|בוודאי|ודאי|סבבה|אוקיי|אוקי|נכון|יאללה כן)([.!?, ]|$)/u.test(
+    t
+  );
 }
 
 function isNegativeHebrew(text) {
@@ -300,15 +310,21 @@ function isNegativeHebrew(text) {
 function isShortAffirmationAny(text) {
   const t = basicNormalize(text).toLowerCase();
   if (!t) return false;
+
   if (isAffirmativeHebrew(t)) return true;
-  return /^(yes|yep|yeah|ok|okay|bien|si|sí|oui|gen|geen|lo)([.!?, ]|$)/i.test(t);
+
+  return /^(yes|yep|yeah|ok|okay|bien|si|sí|geen|gen|lo|oui)([.!?, ]|$)/i.test(
+    t
+  );
 }
 
 function isShortNegationAny(text) {
   const t = basicNormalize(text).toLowerCase();
   if (!t) return false;
+
   if (isNegativeHebrew(t)) return true;
-  return /^(no|nope|nah|non|geen|gen|lo)([.!?, ]|$)/i.test(t);
+
+  return /^(no|nope|lo|geen|gen|nah|non)([.!?, ]|$)/i.test(t);
 }
 
 function isShortSpeechToken(text) {
@@ -321,10 +337,13 @@ function isShortSpeechToken(text) {
 function isLikelyNoiseLanguageFlip(text) {
   const t = basicNormalize(text);
   if (!t) return false;
-  if (HEBREW_CHAR_RE.test(t)) return false;
+
   const words = t.split(/\s+/).filter(Boolean);
   if (words.length > 2) return false;
-  return /^.{1,20}$/u.test(t);
+
+  if (HEBREW_CHAR_RE.test(t)) return false;
+
+  return /^[A-Za-z.,!?'" -]{1,20}$/.test(t);
 }
 
 function isClosingPhrase(text) {

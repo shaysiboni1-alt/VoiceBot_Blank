@@ -49,15 +49,20 @@ function computeGreetingHebrew(timeZone) {
   return "לילה טוב";
 }
 
-function buildOpeningKey({ settings, callerName, isReturning, greeting, fast }) {
+function buildOpeningKey({ settings, callerName, isReturning, greeting }) {
   return JSON.stringify({
     opening: safeStr(settings?.OPENING_SCRIPT),
     openingReturning: safeStr(settings?.OPENING_SCRIPT_RETURNING),
     businessName: safeStr(settings?.BUSINESS_NAME),
+    botName: safeStr(settings?.BOT_NAME),
+    mainPhone: safeStr(settings?.MAIN_PHONE),
+    email: safeStr(settings?.BUSINESS_EMAIL),
+    address: safeStr(settings?.BUSINESS_ADDRESS),
+    hours: safeStr(settings?.WORKING_HOURS),
+    website: safeStr(settings?.BUSINESS_WEBSITE_URL),
     callerName: safeStr(callerName),
     isReturning: !!isReturning,
     greeting: safeStr(greeting),
-    fast: !!fast,
   });
 }
 
@@ -96,15 +101,6 @@ function getOpeningScriptFromSSOT(ssot, vars) {
   return filled || "שלום! איך נוכל לעזור?";
 }
 
-function buildFastOpening({ greeting, callerName, isReturning }) {
-  const g = safeStr(greeting) || "שלום";
-  const name = safeStr(callerName);
-
-  if (name && isReturning) return `${g} ${name}, איך אפשר לעזור?`;
-  if (name) return `${g} ${name}, איך אפשר לעזור?`;
-  return `${g}, איך אפשר לעזור?`;
-}
-
 function warmOpeningCache({
   ssot,
   callerName,
@@ -112,22 +108,12 @@ function warmOpeningCache({
   timeZone,
   ttlMs = DEFAULT_TTL_MS,
 }) {
-  getCachedOpening({
-    ssot,
-    callerName,
-    isReturning,
-    timeZone,
-    ttlMs,
-    fast: false,
-  });
-
   return getCachedOpening({
     ssot,
     callerName,
     isReturning,
     timeZone,
     ttlMs,
-    fast: true,
   });
 }
 
@@ -137,7 +123,6 @@ function getCachedOpening({
   isReturning,
   timeZone,
   ttlMs = DEFAULT_TTL_MS,
-  fast = false,
 }) {
   const greeting = computeGreetingHebrew(timeZone);
   const key = buildOpeningKey({
@@ -145,7 +130,6 @@ function getCachedOpening({
     callerName,
     isReturning,
     greeting,
-    fast,
   });
 
   const cached = CACHE.get(key);
@@ -155,21 +139,18 @@ function getCachedOpening({
     return { ...cached.value, cache_hit: true };
   }
 
-  const opening = fast
-    ? buildFastOpening({ greeting, callerName, isReturning })
-    : getOpeningScriptFromSSOT(ssot, {
-        GREETING: greeting,
-        CALLER_NAME: safeStr(callerName),
-        DISPLAY_NAME: safeStr(callerName),
-        display_name: safeStr(callerName),
-        returning_caller: !!isReturning,
-        RETURNING_CALLER: !!isReturning,
-      });
+  const opening = getOpeningScriptFromSSOT(ssot, {
+    GREETING: greeting,
+    CALLER_NAME: safeStr(callerName),
+    DISPLAY_NAME: safeStr(callerName),
+    display_name: safeStr(callerName),
+    returning_caller: !!isReturning,
+    RETURNING_CALLER: !!isReturning,
+  });
 
   const value = {
     opening,
     greeting,
-    fast,
     cache_hit: false,
   };
 
