@@ -5,6 +5,7 @@ const {
   isAffirmativeHebrew,
   isClosingPhrase,
 } = require("./hebrewNlp");
+const { extractCallerName, sanitizeCandidate } = require("./nameExtractor");
 
 function nowIso() {
   return new Date().toISOString();
@@ -28,61 +29,6 @@ function normalizeCallerId(caller) {
   return { value: s, withheld: digits.length < 5 };
 }
 
-const NAME_STOP_WORDS = new Set([
-  "צריך",
-  "רוצה",
-  "בקשה",
-  "בעיה",
-  "דוח",
-  "דוחות",
-  "חשבונית",
-  "חשבוניות",
-  "מרגריטה",
-  "לחזור",
-  "אליי",
-  "אלי",
-  "בנוגע",
-  "רווח",
-  "הפסד",
-  "לשנת",
-  "עבורי",
-  "ממנה",
-  "שיחזרו",
-]);
-
-function looksLikeHumanName(text) {
-  const t = basicNormalize(text).replace(/[,.!?]/g, "").trim();
-  if (!t) return false;
-  if (/\d/.test(t)) return false;
-
-  const words = t.split(/\s+/).filter(Boolean);
-  if (words.length < 1 || words.length > 2) return false;
-
-  if (!/^[\p{Script=Hebrew}\p{Script=Latin}\s'"-]{2,40}$/u.test(t)) {
-    return false;
-  }
-
-  const lowered = words.map((w) => w.toLowerCase());
-  if (lowered.some((w) => NAME_STOP_WORDS.has(w))) return false;
-
-  return true;
-}
-
-function extractNameHe(text) {
-  const t = basicNormalize(text);
-  if (!t) return "";
-
-  const pattern = t.match(
-    /(?:קוראים לי|השם שלי(?: הוא| זה)?|שמי|אני)\s+([^\n,.!?]{1,40})/u
-  );
-  if (pattern && pattern[1]) {
-    const candidate = pattern[1].trim().replace(/\s+/g, " ");
-    if (looksLikeHumanName(candidate)) return candidate;
-  }
-
-  return "";
-}
-
 function extractPhone(text) {
   const digits = String(text || "").replace(/\D/g, "");
   if (!digits) return "";
@@ -94,6 +40,18 @@ function extractPhone(text) {
   return "";
 }
 
+function wasLastAssistantAskingForName(transcript) {
+  const rows = Array.isArray(transcript) ? transcript : [];
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row?.role !== "assistant") continue;
+    const text = String(row?.normalized || row?.text || "").trim();
+    if (!text) return false;
+    return /מה\s*השם|איך\s*קוראים|מי\s*מדבר|מי\s*מדברת|שמך|איך\s*קוראים\s*לכם|איך\s*קוראים\s*לך/u.test(text);
+  }
+  return false;
+}
+
 function createPassiveCallContext({
   callSid,
   streamSid,
@@ -103,6 +61,7 @@ function createPassiveCallContext({
   caller_profile,
 }) {
   const callerInfo = normalizeCallerId(caller);
+  const memoryName = sanitizeCandidate(caller_profile?.display_name || caller_profile?.full_name || "") || "";
 
   return {
     callSid: callSid || "",
@@ -114,7 +73,7 @@ function createPassiveCallContext({
     started_at: nowIso(),
     ended_at: null,
     returning_caller: !!caller_profile,
-    returning_name: caller_profile?.display_name || caller_profile?.full_name || "",
+    returning_name: memoryName,
     returning_last_subject: caller_profile?.last_subject || "",
     returning_last_ended_at: caller_profile?.last_ended_at || null,
     language_locked: "he",
@@ -122,6 +81,7 @@ function createPassiveCallContext({
     name: "",
     callback_number: callerInfo.withheld ? "" : callerInfo.value,
     affirmed_callback_number: false,
+    callback_requested: false,
     closing_detected: false,
     has_request: false,
     transcript: [],
@@ -148,11 +108,18 @@ function appendUtterance(ctx, u) {
 
   if (lang && lang !== "unknown") ctx.language_observed = lang;
 
-  const extractedName = extractNameHe(normalized);
-  if (extractedName) ctx.name = extractedName;
+  const found = extractCallerName({
+    userText: normalized,
+    lastBotUtterance: wasLastAssistantAskingForName(ctx.transcript) ? "איך קוראים לכם" : "",
+  });
+  if (found?.name) ctx.name = found.name;
 
   const phone = extractPhone(normalized);
   if (phone) ctx.callback_number = phone;
+
+  if (/לחזור\s+אליי|שיחזרו\s+אליי|תחזרו\s+אליי|בקשת\s+חזרה/u.test(normalized)) {
+    ctx.callback_requested = true;
+  }
 
   if (isAffirmativeHebrew(normalized)) ctx.affirmed_callback_number = true;
   if (isClosingPhrase(normalized)) ctx.closing_detected = true;
