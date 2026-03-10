@@ -68,7 +68,11 @@ function normalizeCallerId(caller) {
 
   if (!s) return { value: "", withheld: true };
 
-  if (["anonymous", "restricted", "unavailable", "unknown", "private", "withheld"].includes(low)) {
+  if (
+    ["anonymous", "restricted", "unavailable", "unknown", "private", "withheld"].includes(
+      low
+    )
+  ) {
     return { value: s, withheld: true };
   }
 
@@ -84,7 +88,7 @@ function isTruthyEnv(v) {
 function isClosingUtterance(text) {
   const t = safeStr(text);
   if (!t) return false;
-  if (/(תודה\s*ו?להתראות|להתראות|ביי|נתראה|ערב טוב|יום טוב)/.test(t)) return true;
+  if (/(תודה\s*ו?להתראות|להתראות|ביי|נתראה|יום טוב|המשך יום נעים|אשמח לעזור שוב)/.test(t)) return true;
   if (/(спасибо.*до свидания|до свидания|пока)/i.test(t)) return true;
   if (/(thank(s)?\b.*(bye|goodbye)|\bbye\b|\bgoodbye\b)/i.test(t)) return true;
   return false;
@@ -118,8 +122,14 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
   const prompts = ssot?.prompts || {};
   const intents = ssot?.intents || [];
 
-  const defaultLang = safeStr(runtimeMeta?.language_locked) || safeStr(settings.DEFAULT_LANGUAGE) || "he";
-  const callerName = safeStr(runtimeMeta?.caller_name) || safeStr(runtimeMeta?.display_name) || "";
+  const defaultLang =
+    safeStr(runtimeMeta?.language_locked) ||
+    safeStr(settings.DEFAULT_LANGUAGE) ||
+    "he";
+  const callerName =
+    safeStr(runtimeMeta?.caller_name) ||
+    safeStr(runtimeMeta?.display_name) ||
+    "";
   const callerWithheld = !!runtimeMeta?.caller_withheld;
 
   const sections = [];
@@ -153,6 +163,7 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
     "- If the caller says something like 'אני אישה' or 'אני בת', do NOT treat it as a name.",
     "- If the caller corrects gender/name confusion, acknowledge briefly and then ask for the name again only if needed for the request.",
     "- If the call is only for information, answer briefly and do not force lead capture.",
+    "- If the caller confirms callback to the identified number, immediately acknowledge, close politely, and end the flow.",
   ].join("\n"));
 
   if (callerName) {
@@ -173,14 +184,25 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
     ].join("\n"));
   }
 
-  if (prompts.MASTER_PROMPT) sections.push(`MASTER_PROMPT:\n${safeStr(prompts.MASTER_PROMPT)}`);
-  if (prompts.GUARDRAILS_PROMPT) sections.push(`GUARDRAILS_PROMPT:\n${safeStr(prompts.GUARDRAILS_PROMPT)}`);
-  if (prompts.KB_PROMPT) sections.push(`KB_PROMPT:\n${safeStr(prompts.KB_PROMPT)}`);
-  if (prompts.LEAD_CAPTURE_PROMPT) sections.push(`LEAD_CAPTURE_PROMPT:\n${safeStr(prompts.LEAD_CAPTURE_PROMPT)}`);
-  if (prompts.INTENT_ROUTER_PROMPT) sections.push(`INTENT_ROUTER_PROMPT:\n${safeStr(prompts.INTENT_ROUTER_PROMPT)}`);
+  if (prompts.MASTER_PROMPT) {
+    sections.push(`MASTER_PROMPT:\n${safeStr(prompts.MASTER_PROMPT)}`);
+  }
+  if (prompts.GUARDRAILS_PROMPT) {
+    sections.push(`GUARDRAILS_PROMPT:\n${safeStr(prompts.GUARDRAILS_PROMPT)}`);
+  }
+  if (prompts.KB_PROMPT) {
+    sections.push(`KB_PROMPT:\n${safeStr(prompts.KB_PROMPT)}`);
+  }
+  if (prompts.LEAD_CAPTURE_PROMPT) {
+    sections.push(`LEAD_CAPTURE_PROMPT:\n${safeStr(prompts.LEAD_CAPTURE_PROMPT)}`);
+  }
+  if (prompts.INTENT_ROUTER_PROMPT) {
+    sections.push(`INTENT_ROUTER_PROMPT:\n${safeStr(prompts.INTENT_ROUTER_PROMPT)}`);
+  }
 
   const settingsContext = buildSettingsContext(settings);
   if (settingsContext) sections.push(`SETTINGS_CONTEXT:\n${settingsContext}`);
+
   const intentsContext = buildIntentsContext(intents);
   if (intentsContext) sections.push(`INTENTS_TABLE:\n${intentsContext}`);
 
@@ -190,14 +212,29 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
 function looksLikeReasoningText(text) {
   const t = safeStr(text);
   if (!t) return false;
-  return /\*\*.+\*\*/.test(t) || /\b(Composing the Response|Confirming|Implementing|Addressing|Gathering|Finalizing|Prioritizing|Initiating|Acknowledge|Pinpointing|Reasoning|I(?:'| a)m now|I've|I have successfully|I will now|The user is asking|triggering the|based on the context|SETTINGS_CONTEXT|OPENING_SCRIPT|INTENT_ROUTER_PROMPT|LEAD_CAPTURE_PROMPT)\b/i.test(t);
+  return (
+    /\*\*.+\*\*/.test(t) ||
+    /\b(Composing the Response|Confirming|Implementing|Addressing|Gathering|Finalizing|Prioritizing|Initiating|Acknowledge|Pinpointing|Reasoning|I(?:'| a)m now|I've|I have successfully|I will now|The user is asking|triggering the|based on the context|SETTINGS_CONTEXT|OPENING_SCRIPT|INTENT_ROUTER_PROMPT|LEAD_CAPTURE_PROMPT)\b/i.test(
+      t
+    )
+  );
 }
 
 function scrubReasoningText(text) {
   if (!looksLikeReasoningText(text)) return safeStr(text);
   const quoted = safeStr(text).match(/["“](.+?)["”]/);
-  if (quoted && quoted[1] && !looksLikeReasoningText(quoted[1])) return quoted[1].trim();
+  if (quoted && quoted[1] && !looksLikeReasoningText(quoted[1])) {
+    return quoted[1].trim();
+  }
   return "";
+}
+
+function isAffirmativeUtterance(text) {
+  const t = safeStr(text);
+  if (!t) return false;
+  return /^(אה,\s*)?(כן([.!?,\s]|$)|נכון([.!?,\s]|$)|אוקיי([.!?,\s]|$)|אוקי([.!?,\s]|$)|בסדר([.!?,\s]|$)|בטח([.!?,\s]|$)|יאללה([.!?,\s]|$))+/u.test(
+    t
+  );
 }
 
 async function deliverWebhook(url, payload, label) {
@@ -227,12 +264,17 @@ class GeminiLiveSession {
     this.closed = false;
     this._greetingSent = false;
     this._hangupScheduled = false;
+    this._awaitingCallbackConfirmation = false;
+    this._closingSentAfterCallback = false;
 
     this._langState = {
       lockedLanguage: safeStr(env.MB_DEFAULT_LANGUAGE) || "he",
       candidateLanguage: null,
       candidateHits: 0,
-      minConsecutive: Math.max(2, Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 2)),
+      minConsecutive: Math.max(
+        2,
+        Number(env.MB_LANGUAGE_SWITCH_MIN_CONSECUTIVE_UTTERANCES || 2)
+      ),
     };
 
     this._trBuf = {
@@ -273,6 +315,7 @@ class GeminiLiveSession {
 
   start() {
     if (this.ws) return;
+
     this.ws = new WebSocket(liveWsUrl());
 
     this.ws.on("open", async () => {
@@ -282,7 +325,9 @@ class GeminiLiveSession {
         const r = await startCallRecording(this._call.callSid, logger);
         if (r?.ok && r.recordingSid) {
           this._call.recording_sid = String(r.recordingSid);
-          setRecordingForCall(this._call.callSid, { recordingSid: this._call.recording_sid });
+          setRecordingForCall(this._call.callSid, {
+            recordingSid: this._call.recording_sid,
+          });
           logger.info("Recording started + stored in registry", {
             callSid: this._call.callSid,
             recordingSid: this._call.recording_sid,
@@ -294,6 +339,7 @@ class GeminiLiveSession {
 
       const callerProfile = this.meta?.caller_profile || null;
       const callerName = safeStr(callerProfile?.display_name) || "";
+
       const systemText = buildSystemInstructionFromSSOT(this.ssot, {
         caller_name: callerName,
         display_name: callerName,
@@ -307,14 +353,19 @@ class GeminiLiveSession {
       const setup = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
-          systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
+          systemInstruction: systemText
+            ? { parts: [{ text: systemText }] }
+            : undefined,
           generationConfig: {
             responseModalities: ["AUDIO"],
             temperature: 0.1,
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
-                  voiceName: env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME) || "Kore",
+                  voiceName:
+                    env.VOICE_NAME_OVERRIDE ||
+                    safeStr(this.ssot?.settings?.VOICE_NAME) ||
+                    "Kore",
                 },
               },
             },
@@ -333,7 +384,10 @@ class GeminiLiveSession {
         this.ws.send(JSON.stringify(setup));
         this.ready = true;
       } catch (e) {
-        logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
+        logger.error("Failed to send Gemini setup", {
+          ...this.meta,
+          error: e.message,
+        });
       }
     });
 
@@ -351,28 +405,43 @@ class GeminiLiveSession {
       }
 
       try {
-        const parts = msg?.serverContent?.modelTurn?.parts || msg?.serverContent?.turn?.parts || msg?.serverContent?.parts || [];
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.serverContent?.turn?.parts ||
+          msg?.serverContent?.parts ||
+          [];
+
         for (const p of parts) {
           const inline = p?.inlineData;
-          if (inline?.data && String(inline?.mimeType || "").startsWith("audio/pcm")) {
+          if (
+            inline?.data &&
+            String(inline?.mimeType || "").startsWith("audio/pcm")
+          ) {
             const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
             if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
               this.onGeminiAudioUlaw8kBase64(ulawB64);
             }
           }
+
           if (p?.text) {
             const cleaned = scrubReasoningText(String(p.text));
             if (cleaned && this.onGeminiText) this.onGeminiText(cleaned);
-            if (cleaned && env.MB_LOG_TRANSCRIPTS) this._onTranscriptChunk("bot", cleaned);
+            if (cleaned && env.MB_LOG_TRANSCRIPTS) {
+              this._onTranscriptChunk("bot", cleaned);
+            }
           }
         }
       } catch (e) {
-        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
+        logger.debug("Gemini message parse error", {
+          ...this.meta,
+          error: e.message,
+        });
       }
 
       try {
         const inTr = msg?.serverContent?.inputTranscription?.text;
         if (inTr) this._onTranscriptChunk("user", String(inTr));
+
         const outTr = msg?.serverContent?.outputTranscription?.text;
         const cleanedOut = scrubReasoningText(String(outTr || ""));
         if (cleanedOut) this._onTranscriptChunk("bot", cleanedOut);
@@ -383,14 +452,20 @@ class GeminiLiveSession {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
       this.closed = true;
       this.ready = false;
+
       this._flushTranscript("user");
       this._flushTranscript("bot");
+
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
+
       await this._finalizeOnce("gemini_ws_close");
     });
 
     this.ws.on("error", (err) => {
-      logger.error("Gemini Live WS error", { ...this.meta, error: err.message });
+      logger.error("Gemini Live WS error", {
+        ...this.meta,
+        error: err.message,
+      });
     });
   }
 
@@ -402,17 +477,20 @@ class GeminiLiveSession {
 
   _onTranscriptChunk(who, chunk) {
     if (!env.MB_LOG_TRANSCRIPTS) return;
+
     const c = safeStr(chunk);
     if (!c) return;
     if (who === "bot" && looksLikeReasoningText(c)) return;
 
     const holder = this._trBuf[who];
     if (holder.lastChunk === c) return;
+
     holder.lastChunk = c;
     holder.lastTs = Date.now();
 
-    if (!holder.text) holder.text = c;
-    else if (holder.text.endsWith(c)) {
+    if (!holder.text) {
+      holder.text = c;
+    } else if (holder.text.endsWith(c)) {
       // noop
     } else if (c.startsWith(holder.text)) {
       holder.text = c;
@@ -424,17 +502,26 @@ class GeminiLiveSession {
   }
 
   _applyLanguageDecision(nlp) {
-    const explicitSwitch = detectExplicitLanguageSwitch(nlp.raw || nlp.normalized || "");
+    const explicitSwitch = detectExplicitLanguageSwitch(
+      nlp.raw || nlp.normalized || ""
+    );
+
     if (explicitSwitch) {
       this._langState.lockedLanguage = explicitSwitch;
       this._langState.candidateLanguage = null;
       this._langState.candidateHits = 0;
-    } else if (nlp.lang && nlp.lang !== "unknown" && nlp.lang !== this._langState.lockedLanguage) {
-      if (nlp.lang === this._langState.candidateLanguage) this._langState.candidateHits += 1;
-      else {
+    } else if (
+      nlp.lang &&
+      nlp.lang !== "unknown" &&
+      nlp.lang !== this._langState.lockedLanguage
+    ) {
+      if (nlp.lang === this._langState.candidateLanguage) {
+        this._langState.candidateHits += 1;
+      } else {
         this._langState.candidateLanguage = nlp.lang;
         this._langState.candidateHits = 1;
       }
+
       if (this._langState.candidateHits >= this._langState.minConsecutive) {
         this._langState.lockedLanguage = this._langState.candidateLanguage;
         this._langState.candidateLanguage = null;
@@ -456,22 +543,64 @@ class GeminiLiveSession {
     });
   }
 
+  _sendImmediateCallbackClosing() {
+    if (!this.ws || this.closed || !this.ready) return;
+    if (this._closingSentAfterCallback) return;
+
+    this._closingSentAfterCallback = true;
+
+    const msg = {
+      clientContent: {
+        turns: [
+          {
+            role: "user",
+            parts: [
+              {
+                text:
+                  "הלקוח אישר לחזור למספר. אמרי עכשיו משפט סיום קצר בעברית, אשרי שהפנייה נרשמה ושהמשרד יחזור, בלי שאלות נוספות ובלי שום טקסט נוסף.",
+              },
+            ],
+          },
+        ],
+        turnComplete: true,
+      },
+    };
+
+    try {
+      this.ws.send(JSON.stringify(msg));
+    } catch (e) {
+      logger.debug("Failed sending immediate callback closing", {
+        ...this.meta,
+        error: e.message,
+      });
+    }
+  }
+
   _flushTranscript(who) {
     if (!env.MB_LOG_TRANSCRIPTS) return;
+
     const holder = this._trBuf[who];
     if (holder.timer) {
       clearTimeout(holder.timer);
       holder.timer = null;
     }
+
     const text = safeStr(holder.text);
     holder.text = "";
     if (!text) return;
 
     const nlp = normalizeUtterance(text);
-    if (who === "bot" && looksLikeReasoningText(nlp.raw || nlp.normalized)) return;
+    if (who === "bot" && looksLikeReasoningText(nlp.raw || nlp.normalized)) {
+      return;
+    }
 
     const role = who === "user" ? "user" : "assistant";
-    this._call.conversationLog.push({ role, text: nlp.normalized || nlp.raw, ts: nowIso() });
+
+    this._call.conversationLog.push({
+      role,
+      text: nlp.normalized || nlp.raw,
+      ts: nowIso(),
+    });
 
     try {
       if (this._passiveCtx && passiveCallContext?.appendUtterance) {
@@ -484,7 +613,9 @@ class GeminiLiveSession {
       }
     } catch {}
 
-    if (who === "user") this._applyLanguageDecision(nlp);
+    if (who === "user") {
+      this._applyLanguageDecision(nlp);
+    }
 
     logger.info(`UTTERANCE ${who}`, {
       ...this.meta,
@@ -500,7 +631,10 @@ class GeminiLiveSession {
         const callerId = safeStr(this.meta?.caller) || "";
         if (callerId) {
           let lastBot = "";
-          const logArr = Array.isArray(this._call?.conversationLog) ? this._call.conversationLog : [];
+          const logArr = Array.isArray(this._call?.conversationLog)
+            ? this._call.conversationLog
+            : [];
+
           for (let i = logArr.length - 2; i >= 0; i -= 1) {
             const it = logArr[i];
             if (it?.role === "assistant" && it.text) {
@@ -509,14 +643,24 @@ class GeminiLiveSession {
             }
           }
 
-          const found = extractCallerName({ userText: nlp.normalized || nlp.raw, lastBotUtterance: lastBot });
+          const found = extractCallerName({
+            userText: nlp.normalized || nlp.raw,
+            lastBotUtterance: lastBot,
+          });
+
           if (found?.name) {
-            const normalizedName = String(found.name).trim() === "שאי" ? "שי" : String(found.name).trim();
+            const normalizedName =
+              String(found.name).trim() === "שאי"
+                ? "שי"
+                : String(found.name).trim();
+
             const existing = safeStr(this.meta?.caller_profile?.display_name) || "";
+
             if (!existing || existing !== normalizedName) {
               updateCallerDisplayName(callerId, normalizedName).catch(() => {});
               if (!this.meta.caller_profile) this.meta.caller_profile = {};
               this.meta.caller_profile.display_name = normalizedName;
+
               logger.info("CALLER_NAME_CAPTURED", {
                 ...this.meta,
                 caller: callerId,
@@ -529,7 +673,16 @@ class GeminiLiveSession {
         }
       } catch {}
 
-      const intent = detectIntent({ text: nlp.normalized || nlp.raw, intents: this.ssot?.intents || [] });
+      if (this._awaitingCallbackConfirmation && isAffirmativeUtterance(nlp.normalized || nlp.raw)) {
+        this._awaitingCallbackConfirmation = false;
+        this._sendImmediateCallbackClosing();
+      }
+
+      const intent = detectIntent({
+        text: nlp.normalized || nlp.raw,
+        intents: this.ssot?.intents || [],
+      });
+
       logger.info("INTENT_DETECTED", {
         ...this.meta,
         text: nlp.raw,
@@ -540,28 +693,62 @@ class GeminiLiveSession {
       });
     }
 
-    if (who === "bot" && env.FORCE_HANGUP_AFTER_CLOSE && !this._hangupScheduled && isClosingUtterance(nlp.raw)) {
-      const callSid = safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
-      if (callSid) {
-        this._hangupScheduled = true;
-        const graceMs = Math.max(15000, Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 15000));
-        setTimeout(() => {
-          hangupCall(callSid, logger).catch(() => {});
-        }, graceMs);
-        logger.info("Proactive hangup scheduled", { ...this.meta, callSid, delay_ms: graceMs });
+    if (who === "bot") {
+      const botText = nlp.normalized || nlp.raw;
+
+      if (
+        /(לחזור למספר|לחזור אל המספר|לחזור למספר המזוהה|האם לחזור למספר|שנחזור למספר)/u.test(
+          botText
+        )
+      ) {
+        this._awaitingCallbackConfirmation = true;
+      }
+
+      if (
+        env.FORCE_HANGUP_AFTER_CLOSE &&
+        !this._hangupScheduled &&
+        isClosingUtterance(botText)
+      ) {
+        const callSid =
+          safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
+
+        if (callSid) {
+          this._hangupScheduled = true;
+          const graceMs = Math.max(
+            15000,
+            Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 15000)
+          );
+
+          setTimeout(() => {
+            hangupCall(callSid, logger).catch(() => {});
+          }, graceMs);
+
+          logger.info("Proactive hangup scheduled", {
+            ...this.meta,
+            callSid,
+            delay_ms: graceMs,
+          });
+        }
       }
     }
 
     if (this.onTranscript) {
-      this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
+      this.onTranscript({
+        who,
+        text: nlp.raw,
+        normalized: nlp.normalized,
+        lang: nlp.lang,
+      });
     }
   }
 
   _sendProactiveOpening() {
     if (!this.ws || this.closed || !this.ready) return;
+
     const callerProfile = this.meta?.caller_profile || null;
     let callerName = safeStr(callerProfile?.display_name) || "";
     if (callerName === "שאי") callerName = "שי";
+
     const totalCalls = Number(callerProfile?.total_calls ?? 0);
     const isReturning = totalCalls > 0;
 
@@ -574,6 +761,7 @@ class GeminiLiveSession {
     });
 
     const opening = openingPack.opening;
+
     const userKickoff = [
       "ענה עכשיו רק במשפט הבא, בדיוק כפי שהוא, בלי הקדמה, בלי הסבר, בלי מחשבות בקול ובלי שום טקסט נוסף.",
       "אחרי המשפט עצור והמתן ללקוח.",
@@ -597,27 +785,41 @@ class GeminiLiveSession {
         opening_cache_hit: openingPack.cache_hit,
       });
     } catch (e) {
-      logger.debug("Failed sending proactive opening", { ...this.meta, error: e.message });
+      logger.debug("Failed sending proactive opening", {
+        ...this.meta,
+        error: e.message,
+      });
     }
   }
 
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
+
     const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
     const msg = {
       realtimeInput: {
-        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16kB64 }],
+        mediaChunks: [
+          {
+            mimeType: "audio/pcm;rate=16000",
+            data: pcm16kB64,
+          },
+        ],
       },
     };
+
     try {
       this.ws.send(JSON.stringify(msg));
     } catch (e) {
-      logger.debug("Failed sending audio to Gemini", { ...this.meta, error: e.message });
+      logger.debug("Failed sending audio to Gemini", {
+        ...this.meta,
+        error: e.message,
+      });
     }
   }
 
   endInput() {
     if (!this.ws || this.closed) return;
+
     try {
       this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
     } catch {}
@@ -626,9 +828,12 @@ class GeminiLiveSession {
   async _finalizeOnce(reason) {
     if (this._call.finalized) return;
     this._call.finalized = true;
+
     try {
       this._call.ended_at = nowIso();
-      const durationMs = Date.now() - new Date(this._call.started_at).getTime();
+      const durationMs =
+        Date.now() - new Date(this._call.started_at).getTime();
+
       const callMeta = {
         callSid: this._call.callSid,
         streamSid: this._call.streamSid,
@@ -645,29 +850,47 @@ class GeminiLiveSession {
 
       if (this._passiveCtx && passiveCallContext?.finalizeCtx) {
         try {
-          callMeta.passive_context = passiveCallContext.finalizeCtx(this._passiveCtx);
+          callMeta.passive_context = passiveCallContext.finalizeCtx(
+            this._passiveCtx
+          );
         } catch {}
       }
 
-      const snapshot = { call: callMeta, conversationLog: this._call.conversationLog || [] };
+      const snapshot = {
+        call: callMeta,
+        conversationLog: this._call.conversationLog || [],
+      };
+
       await finalizePipeline({
         snapshot,
         ssot: this.ssot,
         env,
         logger,
         senders: {
-          sendCallLog: (payload) => deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
-          sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
-          sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
+          sendCallLog: (payload) =>
+            deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
+          sendFinal: (payload) =>
+            deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
+          sendAbandoned: (payload) =>
+            deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
           resolveRecording: async () => {
             if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) {
-              return { recording_provider: null, recording_sid: null, recording_url_public: null };
+              return {
+                recording_provider: null,
+                recording_sid: null,
+                recording_url_public: null,
+              };
             }
+
             await waitForRecording(this._call.callSid, 12000);
+
             const rec = getRecordingForCall(this._call.callSid);
-            const sid = safeStr(rec?.recordingSid || this._call.recording_sid) || null;
+            const sid =
+              safeStr(rec?.recordingSid || this._call.recording_sid) || null;
             const url = sid ? publicRecordingUrl(sid) : null;
+
             if (sid) this._call.recording_sid = sid;
+
             return {
               recording_provider: sid ? "twilio" : null,
               recording_sid: sid,
@@ -684,6 +907,7 @@ class GeminiLiveSession {
   stop() {
     this._finalizeOnce("stop_called").catch(() => {});
     if (!this.ws) return;
+
     try {
       this.ws.close();
     } catch {}
