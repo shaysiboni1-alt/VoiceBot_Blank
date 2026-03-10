@@ -362,7 +362,7 @@ class GeminiLiveSession {
             },
           },
           ...(env.MB_LOG_TRANSCRIPTS
-            ? { inputAudioTranscription: {}, outputAudioTranscription: {} }
+            ? { inputAudioTranscription: {} }
             : {}),
         },
       };
@@ -410,8 +410,10 @@ class GeminiLiveSession {
             }
           }
 
-          if (p?.text && this.onGeminiText) {
-            this.onGeminiText(String(p.text));
+          if (p?.text) {
+            const textPart = String(p.text);
+            if (this.onGeminiText) this.onGeminiText(textPart);
+            if (env.MB_LOG_TRANSCRIPTS) this._onTranscriptChunk("bot", textPart);
           }
         }
       } catch (e) {
@@ -455,7 +457,7 @@ class GeminiLiveSession {
     const holder = this._trBuf[who];
     if (holder.timer) clearTimeout(holder.timer);
 
-    const delay = who === "user" ? 550 : 750;
+    const delay = who === "user" ? 220 : 260;
     holder.timer = setTimeout(() => this._flushTranscript(who), delay);
   }
 
@@ -693,11 +695,7 @@ class GeminiLiveSession {
 
     const opening = openingPack.opening;
 
-    const userKickoff = [
-      "אמרי עכשיו בדיוק את המשפט הבא בלבד, מילה במילה, בלי שום תוספת, בלי הקדמה ובלי מחשבות בקול.",
-      "אחרי המשפט עצרי והמתיני ללקוח.",
-      opening,
-    ].join("\n");
+    const userKickoff = `אמרי עכשיו בדיוק את המשפט הבא בלבד, מילה במילה, בלי שום תוספת. אחרי המשפט עצרי והמתיני ללקוח.\n${opening}`;
 
     const msg = {
       clientContent: {
