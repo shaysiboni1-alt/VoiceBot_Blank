@@ -137,6 +137,44 @@ function isInfoOnlyIntent(lead, ssot) {
   return safeStr(def?.intent_type) === "info";
 }
 
+function collapseHebrewLetterSpacing(text) {
+  let s = String(text || "");
+  for (let i = 0; i < 4; i += 1) {
+    s = s.replace(/([\u0590-\u05FF])\s+(?=[\u0590-\u05FF])/g, "$1");
+  }
+  return s.replace(/\s{2,}/g, " ").trim();
+}
+
+function deriveExplicitNameFromConversationLog(conversationLog) {
+  const rows = Array.isArray(conversationLog) ? conversationLog : [];
+  const userRows = rows.filter(
+    (r) => String(r?.role || "").toLowerCase() === "user"
+  );
+
+  for (const row of userRows) {
+    const raw = cleanText(row?.text || "");
+    if (!raw) continue;
+
+    const normalized = collapseHebrewLetterSpacing(raw);
+
+    const patterns = [
+      /(?:^|\b)קוראים\s+לי\s+(.+)$/u,
+      /(?:^|\b)שמי\s+(.+)$/u,
+      /(?:^|\b)השם\s+שלי\s+(.+)$/u,
+    ];
+
+    for (const re of patterns) {
+      const m = normalized.match(re);
+      if (!m || !m[1]) continue;
+
+      const cand = sanitizeCandidate(cleanText(m[1]));
+      if (cand) return cand;
+    }
+  }
+
+  return null;
+}
+
 function buildConversationSignals(conversationLog, call) {
   const rows = Array.isArray(conversationLog) ? conversationLog : [];
   const userTexts = rows
@@ -144,7 +182,7 @@ function buildConversationSignals(conversationLog, call) {
     .map((r) => cleanText(r?.text))
     .filter(Boolean);
 
-  const joined = userTexts.join(" \n ");
+  const joined = collapseHebrewLetterSpacing(userTexts.join(" \n "));
 
   const hasLeadKeywords =
     /(דוח|דו"ח|אישור|מסמך|מסמכים|פגישה|פנייה|להשאיר הודעה|מרגריטה|ריטה|החזר מס|מס הכנסה|רווח והפסד|מאזן|טופס|שיחזרו|לחזור אליי|תחזרו אליי|בקשת חזרה)/u.test(
@@ -218,6 +256,14 @@ function normalizeLead(
     if (candidateKnown && isPlausibleFullName(candidateKnown)) {
       out.full_name = candidateKnown;
       out._name_source = "memory";
+    }
+  }
+
+  if (!out.full_name) {
+    const derived = deriveExplicitNameFromConversationLog(conversationLog);
+    if (derived && isPlausibleFullName(derived)) {
+      out.full_name = derived;
+      out._name_source = "conversation_explicit";
     }
   }
 
@@ -308,7 +354,11 @@ function decideEvent(lead, ssot, call, signals) {
     return { event: "ABANDONED", decision_reason: "no_callback_number" };
   }
 
-  if (hasStrongSubject && (hasStrongName || hasCallbackPath)) {
+  if (!hasStrongName) {
+    return { event: "ABANDONED", decision_reason: "no_reliable_name" };
+  }
+
+  if (hasStrongSubject && hasStrongName && hasCallbackPath) {
     return {
       event: "FINAL",
       decision_reason: parsedLeadIntent
