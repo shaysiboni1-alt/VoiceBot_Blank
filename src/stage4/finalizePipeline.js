@@ -4,6 +4,33 @@ const { parseLeadPostcall } = require("./postcallLeadParser");
 const { upsertCallerProfile } = require("../memory/callerMemory");
 const { detectIntent } = require("../logic/intentRouter");
 const { downloadRecording } = require("../utils/twilioRecordings");
+const { sanitizeCandidate } = require("../logic/nameExtractor");
+
+const NON_LEAD_INTENT_IDS = new Set([
+  "other",
+  "meta_voice_question",
+  "caller_correction",
+  "ask_contact_info",
+]);
+
+const NON_LEAD_INTENT_TYPES = new Set(["info", "other"]);
+
+const SUBJECT_STOPWORDS_HE = new Set([
+  "כן",
+  "לא",
+  "אוקיי",
+  "אוקי",
+  "טוב",
+  "בסדר",
+  "הבנתי",
+  "שלום",
+  "הלו",
+  "רגע",
+  "תודה",
+  "אישה",
+  "בת",
+  "אני",
+]);
 
 function isTrue(v) {
   return v === true || String(v).toLowerCase() === "true";
@@ -26,57 +53,126 @@ function buildTranscript(conversationLog) {
     return `${role}: ${text}`;
   }).filter(Boolean).join("\n");
 }
-function deriveDisplayNameFromConversationLog(conversationLog) {
-  const rows = Array.isArray(conversationLog) ? conversationLog : [];
-  for (const r of rows) {
-    if (String(r?.role || "").toLowerCase() !== "user") continue;
-    let t = String(r?.text || "").trim();
-    if (!t) continue;
-    t = t.replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
-    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, "").trim();
-    if (!t || /[0-9]/.test(t) || t.length > 24 || t.length < 2) continue;
-    const words = t.split(/\s+/).filter(Boolean);
-    if (words.length === 0 || words.length > 3) continue;
-    if (!/\p{L}/u.test(t)) continue;
-    return words[0];
-  }
-  return null;
-}
-function deriveSubjectFromConversationLog(conversationLog) {
-  const rows = Array.isArray(conversationLog) ? conversationLog : [];
-  const userUtterances = rows.filter((r) => String(r?.role || "").toLowerCase() === "user").map((r) => String(r?.text || "").trim()).filter(Boolean);
-  if (!userUtterances.length) return null;
-  const last = userUtterances[userUtterances.length - 1];
-  return last.length > 180 ? last.slice(0, 180) : last;
-}
 function appearsInConversation(num, convLog) {
   const digits = (num || "").replace(/\D/g, "");
-  return convLog.some(({ text }) => text && text.replace(/\D/g, "").includes(digits));
+  if (!digits) return false;
+  return (Array.isArray(convLog) ? convLog : []).some(({ text }) => text && String(text).replace(/\D/g, "").includes(digits));
+}
+function cleanText(v) {
+  return String(v || "")
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+function normalizePhone(v) {
+  const s = cleanText(v);
+  if (!s) return null;
+  const plus = s.startsWith("+") ? "+" : "";
+  const digits = s.replace(/\D/g, "");
+  if (!digits || digits.length < 8 || digits.length > 16) return null;
+  return `${plus}${digits}`;
+}
+function isPlausibleFullName(name) {
+  const cleaned = cleanText(name);
+  if (!cleaned) return false;
+  const sanitized = sanitizeCandidate(cleaned);
+  if (!sanitized) return false;
+  if (sanitized !== cleaned) return false;
+  return /^[\p{Script=Hebrew}\p{Script=Latin}\p{Script=Cyrillic}\s]+$/u.test(cleaned);
+}
+function isWeakSubjectValue(subject) {
+  const s = cleanText(subject);
+  if (!s) return true;
+  if (s.length < 4 || s.length > 120) return true;
+  const words = s.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 12) return true;
+  if (words.length === 1 && SUBJECT_STOPWORDS_HE.has(words[0])) return true;
+  if (/^[\p{P}\p{S}\s]+$/u.test(s)) return true;
+  if (/^(כן|לא|אוקיי|אוקי|טוב|בסדר|תודה|שלום|הלו|רגע)$/u.test(s)) return true;
+  if (/^(אני\s+(אישה|בת|צריך|צריכה|רוצה)|זה\s+אני)$/u.test(s)) return true;
+  if (/(מבטא|קול|איך את נשמעת|למה את מדברת ככה|מי את|את בוט|את רובוט)/u.test(s)) return true;
+  if (/\?$/.test(s)) return true;
+  return false;
+}
+function getIntentDef(lead, ssot) {
+  const intentId = safeStr(lead?.intent);
+  if (!intentId) return null;
+  const intents = Array.isArray(ssot?.intents) ? ssot.intents : [];
+  return intents.find((it) => safeStr(it?.intent_id) === intentId) || null;
+}
+function isLeadIntent(lead, ssot) {
+  const intentId = safeStr(lead?.intent);
+  if (!intentId) return false;
+  if (NON_LEAD_INTENT_IDS.has(intentId)) return false;
+  const def = getIntentDef(lead, ssot);
+  const type = safeStr(def?.intent_type);
+  if (type && NON_LEAD_INTENT_TYPES.has(type)) return false;
+  return true;
 }
 function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog, ssot) {
-  const out = { intent: null, full_name: null, callback_to_number: null, subject: null, notes: null, brand: null, model: null };
+  const out = {
+    intent: null,
+    full_name: null,
+    callback_to_number: null,
+    subject: null,
+    notes: null,
+    brand: null,
+    model: null,
+    _name_source: null,
+    _phone_source: null,
+    _subject_source: null,
+  };
+
   if (parsed && typeof parsed === "object") {
-    for (const k of Object.keys(out)) {
+    for (const k of ["intent", "full_name", "callback_to_number", "subject", "notes", "brand", "model"]) {
       const v = parsed[k];
       if (v && typeof v === "string") out[k] = v.trim() || null;
     }
   }
+
+  if (isPlausibleFullName(out.full_name)) {
+    out._name_source = "parsed";
+  } else {
+    out.full_name = null;
+  }
+
   if (!out.full_name) {
-    let candidate = knownFullName ? safeStr(knownFullName) : null;
-    if (!candidate) {
-      const mem = safeStr(call?.passive_context?.returning_name);
-      if (mem) candidate = mem;
+    const candidateKnown = knownFullName ? safeStr(knownFullName) : null;
+    if (candidateKnown && isPlausibleFullName(candidateKnown)) {
+      out.full_name = candidateKnown;
+      out._name_source = "memory";
     }
-    if (!candidate) {
-      const derived = deriveDisplayNameFromConversationLog(conversationLog);
-      candidate = derived ? safeStr(derived) : null;
-    }
-    if (candidate && /^[\p{Script=Hebrew}\p{Script=Latin}\p{Script=Cyrillic}\s]{2,40}$/u.test(candidate)) out.full_name = candidate;
   }
+
+  const parsedPhone = normalizePhone(out.callback_to_number);
+  if (parsedPhone) {
+    out.callback_to_number = parsedPhone;
+    out._phone_source = appearsInConversation(parsedPhone, conversationLog)
+      ? "explicit"
+      : "explicit_unverified";
+  } else {
+    out.callback_to_number = null;
+  }
+
   if (!out.callback_to_number) {
-    if (knownPhone) out.callback_to_number = safeStr(knownPhone);
-    else if (safeStr(call?.caller) && !call?.caller_withheld) out.callback_to_number = safeStr(call.caller);
+    const candidateKnownPhone = normalizePhone(knownPhone);
+    if (candidateKnownPhone) {
+      out.callback_to_number = candidateKnownPhone;
+      out._phone_source = "memory";
+    } else if (safeStr(call?.caller) && !call?.caller_withheld) {
+      out.callback_to_number = normalizePhone(call.caller);
+      out._phone_source = "caller_id";
+    }
   }
+
+  const parsedSubject = safeStr(out.subject);
+  if (parsedSubject && !isWeakSubjectValue(parsedSubject)) {
+    out.subject = cleanText(parsedSubject);
+    out._subject_source = "parsed";
+  } else {
+    out.subject = null;
+  }
+
   if (!out.intent) {
     try {
       const transcript = buildTranscript(conversationLog);
@@ -84,19 +180,22 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
       out.intent = fallback?.intent_id || null;
     } catch {}
   }
+
   return out;
 }
-function decideEvent(lead) {
-  const nameVal = safeStr(lead?.full_name);
-  const phoneVal = safeStr(lead?.callback_to_number);
-  const subjVal = safeStr(lead?.subject);
-  const hasName = nameVal && nameVal.length >= 2 && /^[\p{Script=Hebrew}\p{Script=Latin}\p{Script=Cyrillic}\s]+$/u.test(nameVal);
-  const hasPhone = !!phoneVal;
-  const hasSubject = !!subjVal;
-  if (hasName && hasPhone && hasSubject) return { event: "FINAL", decision_reason: "ok" };
-  if (!hasName && hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_name" };
-  if (!hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_phone" };
-  if (hasPhone && !hasSubject) return { event: "ABANDONED", decision_reason: "no_subject" };
+function decideEvent(lead, ssot) {
+  const hasStrongName = isPlausibleFullName(lead?.full_name);
+  const hasStrongSubject = !isWeakSubjectValue(lead?.subject || "");
+  const hasLeadIntent = isLeadIntent(lead, ssot);
+  const hasConfirmedCallback = lead?._phone_source === "explicit";
+
+  if (hasStrongName && hasStrongSubject && hasLeadIntent && hasConfirmedCallback) {
+    return { event: "FINAL", decision_reason: "confirmed_lead" };
+  }
+  if (!hasLeadIntent) return { event: "ABANDONED", decision_reason: "non_lead_intent" };
+  if (!hasStrongName) return { event: "ABANDONED", decision_reason: "no_reliable_name" };
+  if (!hasStrongSubject) return { event: "ABANDONED", decision_reason: "no_reliable_subject" };
+  if (!hasConfirmedCallback) return { event: "ABANDONED", decision_reason: "no_callback_confirmation" };
   return { event: "ABANDONED", decision_reason: "partial" };
 }
 
@@ -148,15 +247,12 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     }
 
     const parsedLead = normalizeLead(parsed || {}, call, knownFullName, knownPhone, conversationLog, ssot);
-    if (!parsedLead.subject) {
-      const derived = deriveSubjectFromConversationLog(conversationLog);
-      if (derived) parsedLead.subject = derived;
-    }
     if (parsedLead.callback_to_number && parsedLead.callback_to_number !== call.caller && !appearsInConversation(parsedLead.callback_to_number, conversationLog)) {
-      parsedLead.callback_to_number = call.caller;
+      parsedLead.callback_to_number = normalizePhone(call.caller);
+      parsedLead._phone_source = parsedLead.callback_to_number ? "caller_id" : null;
     }
 
-    const { event, decision_reason } = decideEvent(parsedLead);
+    const { event, decision_reason } = decideEvent(parsedLead, ssot);
     if (env.MB_LOG_FINALIZE_DECISIONS) {
       log.info("FINALIZE_DECISION", {
         callSid: call.callSid,
@@ -211,7 +307,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     }
 
     try {
-      const displayName = safeStr(parsedLead.full_name) || deriveDisplayNameFromConversationLog(conversationLog) || null;
+      const displayName = safeStr(parsedLead.full_name) || (knownFullName && isPlausibleFullName(knownFullName) ? knownFullName : null) || null;
       await upsertCallerProfile({ caller: call?.caller, full_name: displayName, last_subject: safeStr(parsedLead.subject), last_notes: safeStr(parsedLead.notes), callSid: call?.callSid });
     } catch (e) {
       log.debug("Caller memory update failed", { message: e?.message || String(e), code: e?.code, detail: e?.detail, hint: e?.hint, where: e?.where });
